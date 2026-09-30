@@ -1,0 +1,19 @@
+{
+  "pull_request": "https://github.com/realfakenerd/mudcrab/pull/91",
+  "captures": "Original screenshots taken by @eclepso with player controls",
+  "scene": "Riverwood, same converted assets and local integration build",
+  "comparison": "Only terrain repeat count and anisotropic filtering differ between builds",
+  "before": {
+    "texture_repeats_per_cell": 8,
+    "anisotropy": 1
+  },
+  "after": {
+    "texture_repeats_per_cell": 24,
+    "anisotropy": 16
+  },
+  "camera": "Manually matched locations, with slightly different camera positions",
+  "resolution": [
+    2560,
+    1440
+  ]
+}
