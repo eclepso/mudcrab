@@ -48,7 +48,7 @@ guard checks that every declared placed transform reaches the common publication
 
 `audit` opens an immutable SQLite URI without journals or SHM writes. It rejects a nonempty WAL
 or rollback journal at entry and before returning the report. A legacy pack or mismatched producer
-identity is also rejected explicitly. An older pack can supply its exact
+identity is also rejected explicitly. A pack using an older field schema can supply its exact
 retained built-in `records-schema.json` through `--schema FILE`. For a pack without add-ons its
 bytes must match `record-reader.json` directly. For an add-on pack they participate in the original
 ordered bundle fingerprint described below. The same option inventories the selected built-in
@@ -56,10 +56,19 @@ schema with `schema`. Input and audit-binary
 hashes accompany the report. Keep the pack settled and immutable throughout the read; before/after
 file hashes detect drift but are not a filesystem snapshot or protection against concurrent writers.
 
+Selecting an older field schema does not admit an older identity generation. The current report
+requires the authenticated FormKey plugin table before reading source or canonical record payloads.
+
 The denominator is **winning preserved in-house payloads**. It excludes original record headers,
 GRUP framing, overridden/deleted/rejected versions and bytes never admitted to that table. It
 does not infer absent records from its own inputs. Both directions of source/canonical row absence
-are counted. Report version 3 adds `coverage`: matched, source-only and canonical-only row counts
+are counted. Report version 4 names every sample identity as six-digit `local:Plugin.esp`, including
+malformed-suffix and nested occurrence samples. It authenticates the pack's plugin table before
+reading record identities; an older identity generation must be converted again. Sample selection
+uses original full-owner order followed by light-owner order and local ID, independently of the
+pack's numeric plugin allocation. Report consumers must treat `form_id` as a string, not a number.
+
+The report retains version 3's `coverage`: matched, source-only and canonical-only row counts
 with an explicit status. A canonical row without retained source evidence fails the CLI. Two empty
 tables produce status `empty`, which proves no retention. Source-only rows remain observable because
 the producer can preserve an admitted source whose defensive runtime projection is rejected.
@@ -85,7 +94,7 @@ publication establishes scalar SQL publication, runtime reads or final behavior.
 
 ## Retained schema add-ons
 
-Storage report versions 2 and 3 reconstruct the pack's add-on declarations from the exact documents in
+Storage report version 4 retains reconstruction of the pack's add-on declarations from the exact documents in
 `inhouse_schema_addons`. It never reads the original configured paths. Ordinals must be contiguous
 from zero; names, exact-byte hashes, count/size limits and document validation must agree. The
 ordered identities and the selected built-in bytes must reproduce `record-reader.json`'s complete

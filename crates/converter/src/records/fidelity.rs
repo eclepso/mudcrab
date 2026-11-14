@@ -6,6 +6,7 @@ use crate::{cache::hash_bytes, esm::types::ArchivedRecordData};
 use color_eyre::{Result, eyre::ensure};
 use rusqlite::Connection;
 use serde::Serialize;
+use shared::{form_key::NamedFormKey, pack_identity::PackIdentity};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
@@ -201,12 +202,16 @@ pub fn baseline(schema: &Schema) -> Result<BTreeMap<String, BaselineEntry>> {
 
 #[derive(Debug, Serialize)]
 pub struct Sample {
-    pub form_id: u32,
+    /// Portable owner/local identity; pack-local integers never escape into report JSON.
+    pub form_id: NamedFormKey,
     /// Offset in the original decompressed payload, not the canonical rkyv buffer.
     pub payload_offset: usize,
     pub byte_length: usize,
     pub sha256: String,
 }
+
+/// Report v4 replaces numeric sample identities with named keys, including nested samples.
+pub const STORAGE_REPORT_VERSION: u32 = 4;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Occurrences {
@@ -373,6 +378,7 @@ fn audit_storage_with_extensions(
     schema: &Schema,
     extensions: &BTreeMap<[u8; 4], Vec<FieldSchema>>,
 ) -> Result<StorageAudit> {
+    let identity = PackIdentity::read_sql(conn)?;
     let declared = declared_signatures(schema, extensions)?;
     let mut result = StorageAudit {
         canonical_records_without_source: conn.query_row(
@@ -381,11 +387,12 @@ fn audit_storage_with_extensions(
         ..Default::default()
     };
     let mut query = conn.prepare(
-        "SELECT s.form_id,s.record_type,s.payload,r.data,r.record_type FROM inhouse_source_records s LEFT JOIN records r ON r.form_id=s.form_id ORDER BY s.form_id",
+        "SELECT s.form_id,s.record_type,s.payload,r.data,r.record_type FROM inhouse_source_records s LEFT JOIN records r ON r.form_id=s.form_id LEFT JOIN pack_plugins p ON p.id=(s.form_id >> 24) ORDER BY ((p.flags & 2) != 0),p.supplier_priority,(s.form_id & 16777215),s.form_id",
     )?;
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
-        let id: u32 = row.get(0)?;
+        let id: i64 = row.get(0)?;
+        let named_id = identity.table().named(identity.required_key(id)?)?;
         let record_type: String = row.get(1)?;
         let payload: Vec<u8> = row.get(2)?;
         let canonical: Option<Vec<u8>> = row.get(3)?;
@@ -419,7 +426,7 @@ fn audit_storage_with_extensions(
             result.unparsed_bytes += (payload.len() - offset) as u64;
             if result.malformed_samples.len() < 8 {
                 result.malformed_samples.push(Sample {
-                    form_id: id,
+                    form_id: named_id.clone(),
                     payload_offset: offset,
                     byte_length: payload.len() - offset,
                     sha256: hash_bytes(&payload[offset..]),
@@ -474,7 +481,7 @@ fn audit_storage_with_extensions(
             }
             if entry.samples.len() < 8 {
                 entry.samples.push(Sample {
-                    form_id: id,
+                    form_id: named_id.clone(),
                     payload_offset: field.offset,
                     byte_length: field.bytes.len(),
                     sha256: digest,

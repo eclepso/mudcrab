@@ -142,7 +142,7 @@ fn audit_before_final_check(
     // This boundary check is not an atomic snapshot or a concurrent-writer lock.
     require_settled_database(&database)?;
     Ok(json!({
-        "format_version": 3,
+        "format_version": fidelity::STORAGE_REPORT_VERSION,
         "scope": "winning_inhouse_source_payloads_to_canonical_subrecords",
         "database_sha256": before,
         "reader": reader,
@@ -253,13 +253,32 @@ mod tests {
     use super::*;
 
     fn pack(root: &Path, schema_bytes: &[u8]) -> std::path::PathBuf {
-        let path = root.join("pack # ? % ü");
+        // Keep URI-escaping coverage with filenames that the host can actually create.
+        let component = if cfg!(windows) {
+            "pack # % \u{fc}"
+        } else {
+            "pack # ? % \u{fc}"
+        };
+        let path = root.join(component);
         std::fs::create_dir(&path).unwrap();
-        let conn = Connection::open(path.join("skyrim_world.db")).unwrap();
+        let mut conn = Connection::open(path.join("skyrim_world.db")).unwrap();
         conn.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,data BLOB);
             CREATE TABLE inhouse_source_records(form_id INTEGER PRIMARY KEY,record_type TEXT,payload BLOB);
             CREATE TABLE inhouse_schema_addons(ordinal INTEGER,name TEXT,sha256 TEXT,schema_json BLOB);
             CREATE TABLE plugins(id INTEGER,name TEXT,priority INTEGER,checksum BLOB);").unwrap();
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x19; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let id = table.id("Fixture.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![id]).unwrap();
+        let transaction = conn.transaction().unwrap();
+        identity.write_sql(&transaction).unwrap();
+        transaction.commit().unwrap();
         drop(conn);
         std::fs::write(
             path.join("record-reader.json"),
@@ -404,10 +423,11 @@ mod tests {
         let path = pack(root.path(), SCHEMA_BYTES);
         let schema = Schema::parse(SCHEMA_BYTES).unwrap();
         let report = audit(&path, &schema, SCHEMA_BYTES).unwrap();
+        assert_eq!(report["format_version"], 4);
         assert_eq!(report["coverage"]["status"], "empty");
         assert_eq!(report["coverage"]["matched_records"], 0);
         let conn = Connection::open(path.join("skyrim_world.db")).unwrap();
-        conn.execute("INSERT INTO records VALUES(1,'KYWD',X'')", [])
+        conn.execute("INSERT INTO records VALUES(16777217,'KYWD',X'')", [])
             .unwrap();
         drop(conn);
         let before = hash_file(&path.join("skyrim_world.db")).unwrap();

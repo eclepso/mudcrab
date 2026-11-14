@@ -1,5 +1,10 @@
 use super::*;
 use crate::esm::types::ArchivedSubRecord;
+use shared::{
+    form_key::{FormKey, PluginId},
+    pack_identity::PackIdentity,
+    plugin_table::{PluginEntry, PluginFacts, PluginTable},
+};
 
 fn schema() -> Schema {
     Schema::parse(super::super::SCHEMA_BYTES).unwrap()
@@ -104,15 +109,156 @@ fn source_framing_keeps_duplicate_zero_extended_and_malformed_occurrences() {
 }
 
 fn database() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let table = PluginTable::fresh(vec![(
+        "Fixture.esm".into(),
+        PluginFacts {
+            content_hash: Some([0x19; 32]),
+            ..Default::default()
+        },
+    )])
+    .unwrap();
+    let id = table.id("Fixture.esm").unwrap();
+    let identity = PackIdentity::new(table, vec![id]).unwrap();
+    database_with_identity(identity)
+}
+
+fn database_with_identity(identity: PackIdentity) -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE inhouse_source_records(form_id INTEGER PRIMARY KEY,record_type TEXT,payload BLOB); CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,data BLOB);").unwrap();
+    let transaction = conn.transaction().unwrap();
+    identity.write_sql(&transaction).unwrap();
+    transaction.commit().unwrap();
     conn
+}
+
+#[test]
+fn portable_samples_name_both_malformed_suffixes_and_field_occurrences() {
+    let conn = database();
+    source(
+        &conn,
+        42,
+        &[sub(b"EDID", b"Named\0"), b"bad".to_vec()].concat(),
+    );
+    let report = serde_json::to_value(audit_storage(&conn, &schema()).unwrap()).unwrap();
+    assert_eq!(
+        report["malformed_samples"][0]["form_id"],
+        "00002A:Fixture.esm"
+    );
+    assert_eq!(
+        report["occurrences"]["4B595744/45444944"]["samples"][0]["form_id"],
+        "00002A:Fixture.esm"
+    );
+}
+
+#[test]
+fn fidelity_rejects_older_identity_generation_before_reading_content() {
+    let conn = Connection::open_in_memory().unwrap();
+    // No content tables: reaching a content query would produce a different failure.
+    let error = audit_storage(&conn, &schema()).unwrap_err().to_string();
+    assert!(
+        error.contains("out of date") && error.contains("converted again"),
+        "{error}"
+    );
+}
+
+#[test]
+fn fidelity_rejects_table_proof_before_decoding_payloads() {
+    let conn = database();
+    source(&conn, 1, &[]);
+    conn.execute_batch("INSERT INTO records VALUES(16777217,'KYWD',x'11223344'); UPDATE pack_identity SET digest=zeroblob(32)").unwrap();
+    let error = audit_storage(&conn, &schema()).unwrap_err().to_string();
+    assert!(error.contains("identity proof"), "{error}");
+}
+
+#[test]
+fn sample_keys_above_u32_and_json_exact_integer_range_remain_named() {
+    let owner = PluginId::new(u32::MAX).unwrap();
+    let table = PluginTable::from_entries(vec![PluginEntry {
+        id: owner,
+        display_name: "High.esm".into(),
+        normalized_name: "high.esm".into(),
+        loaded: true,
+        facts: PluginFacts {
+            content_hash: Some([0x3D; 32]),
+            ..Default::default()
+        },
+    }])
+    .unwrap();
+    let conn = database_with_identity(PackIdentity::new(table, vec![owner]).unwrap());
+    let key = FormKey::new(owner, 0xABCDEF).unwrap();
+    assert_eq!(key.to_packed(), 0x00FF_FFFF_FFAB_CDEF);
+    conn.execute(
+        "INSERT INTO inhouse_source_records VALUES(?1,'KYWD',?2)",
+        rusqlite::params![key.to_sql_i64(), sub(b"EDID", b"High\0")],
+    )
+    .unwrap();
+    let report = serde_json::to_value(audit_storage(&conn, &schema()).unwrap()).unwrap();
+    assert_eq!(
+        report["occurrences"]["4B595744/45444944"]["samples"][0]["form_id"],
+        "ABCDEF:High.esm"
+    );
+}
+
+#[test]
+fn bounded_sample_selection_retains_full_then_light_original_owner_order() {
+    let facts = |light| PluginFacts {
+        flags: shared::plugin_table::PluginFlags {
+            light,
+            ..Default::default()
+        },
+        content_hash: Some([0x51; 32]),
+        ..Default::default()
+    };
+    let table = PluginTable::fresh(vec![
+        ("Alpha.esm".into(), facts(false)),
+        ("Early.esl".into(), facts(true)),
+        ("Zulu.esm".into(), facts(false)),
+    ])
+    .unwrap();
+    let order = ["Early.esl", "Zulu.esm", "Alpha.esm"].map(|name| table.id(name).unwrap());
+    let conn = database_with_identity(PackIdentity::new(table, order.to_vec()).unwrap());
+    for owner in order {
+        for local in 1..=4 {
+            let key = FormKey::new(owner, local).unwrap();
+            conn.execute(
+                "INSERT INTO inhouse_source_records VALUES(?1,'KYWD',?2)",
+                rusqlite::params![key.to_sql_i64(), sub(b"EDID", b"sample\0")],
+            )
+            .unwrap();
+        }
+    }
+    let report = serde_json::to_value(audit_storage(&conn, &schema()).unwrap()).unwrap();
+    let names: Vec<_> = report["occurrences"]["4B595744/45444944"]["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|sample| sample["form_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "000001:Zulu.esm",
+            "000002:Zulu.esm",
+            "000003:Zulu.esm",
+            "000004:Zulu.esm",
+            "000001:Alpha.esm",
+            "000002:Alpha.esm",
+            "000003:Alpha.esm",
+            "000004:Alpha.esm"
+        ]
+    );
+}
+
+fn packed(local: u32) -> i64 {
+    FormKey::new(PluginId::new(1).unwrap(), local)
+        .unwrap()
+        .to_sql_i64()
 }
 
 fn source(conn: &Connection, id: u32, payload: &[u8]) {
     conn.execute(
         "INSERT INTO inhouse_source_records VALUES(?1,'KYWD',?2)",
-        rusqlite::params![id, payload],
+        rusqlite::params![packed(id), payload],
     )
     .unwrap();
 }
@@ -130,7 +276,7 @@ fn canonical(conn: &Connection, id: u32, fields: &[([u8; 4], &[u8])]) {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&record).unwrap();
     conn.execute(
         "INSERT INTO records VALUES(?1,'KYWD',?2)",
-        rusqlite::params![id, bytes.as_slice()],
+        rusqlite::params![packed(id), bytes.as_slice()],
     )
     .unwrap();
 }
