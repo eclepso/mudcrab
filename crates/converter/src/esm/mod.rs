@@ -21,6 +21,7 @@ mod environment;
 pub mod exporter;
 pub mod extractors;
 pub mod form_key_merge;
+pub mod form_key_store;
 pub mod form_keys;
 pub mod inhouse;
 mod inhouse_script_properties;
@@ -855,6 +856,7 @@ fn remap_record_form_ids(
 
 /// Adapt resolved identities to the unchanged four-byte projection fields.
 /// Caller errors reject only this candidate; optional link failures clear only that link.
+#[cfg(test)]
 fn remap_record_using(
     record: &mut RawRecord,
     plugin_name: &str,
@@ -881,10 +883,29 @@ fn remap_record_using_optional(
     remap_optional: impl Fn(u32, bool) -> Result<u32>,
     strict: bool,
 ) -> Result<()> {
+    remap_record_at_sites(
+        record,
+        plugin_name,
+        warnings,
+        remap_with_validation,
+        |_, _, _, word, strict| remap_optional(word, strict),
+        strict,
+    )
+}
+
+/// Share the handwritten layouts with native storage without inferring sites from equal words.
+/// Site coordinates are the original subrecord ordinal and payload-relative byte offset.
+fn remap_record_at_sites(
+    record: &mut RawRecord,
+    plugin_name: &str,
+    warnings: &RemapWarnings,
+    remap_with_validation: impl Fn(u32, bool) -> Result<u32>,
+    remap_optional: impl Fn(usize, &[u8], usize, u32, bool) -> Result<u32>,
+    strict: bool,
+) -> Result<()> {
     let record_type = record.record_type;
     let remap = |form_id| remap_with_validation(form_id, strict);
     let remap_group = |form_id| remap_with_validation(form_id, true);
-    let remap_link = |form_id| remap_optional(form_id, true);
     let source_id = record.form_id;
     record.form_id = remap(record.form_id)?;
     if record.is_deleted() {
@@ -898,6 +919,7 @@ fn remap_record_using_optional(
     record.worldspace_form_id = record.worldspace_form_id.map(&remap_group).transpose()?;
     let mut malformed_subrecords = Vec::new();
     for (index, (tag, data)) in record.subrecords.iter_mut().enumerate() {
+        let remap_link = |offset, form_id| remap_optional(index, tag, offset, form_id, true);
         if record.record_type == *b"GRAS" && tag.as_slice() == b"MODS" {
             color_eyre::eyre::ensure!(data.len() >= 4, "truncated GRAS alternate textures");
             let count = u32::from_le_bytes(data[..4].try_into().unwrap());
@@ -916,7 +938,7 @@ fn remap_record_using_optional(
                 );
                 offset += length;
                 let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                data[offset..offset + 4].copy_from_slice(&remap_link(value)?.to_le_bytes());
+                data[offset..offset + 4].copy_from_slice(&remap_link(offset, value)?.to_le_bytes());
                 offset += 8;
             }
             color_eyre::eyre::ensure!(offset == data.len(), "trailing bytes in GRAS MODS");
@@ -925,7 +947,7 @@ fn remap_record_using_optional(
         if record.record_type == *b"LAND" && matches!(tag.as_slice(), b"BTXT" | b"ATXT") {
             color_eyre::eyre::ensure!(data.len() == 8, "invalid LAND texture reference length");
             let value = u32::from_le_bytes(data[..4].try_into().unwrap());
-            data[..4].copy_from_slice(&remap_link(value)?.to_le_bytes());
+            data[..4].copy_from_slice(&remap_link(0, value)?.to_le_bytes());
             continue;
         }
         if record.record_type == *b"LAND" && tag.as_slice() == b"VTEX" {
@@ -933,16 +955,16 @@ fn remap_record_using_optional(
             // NULL), unlike the 8-byte BTXT/ATXT layer structures above:
             // https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.5/Core/wbDefinitionsTES5.pas
             color_eyre::eyre::ensure!(data.len().is_multiple_of(4), "invalid LAND VTEX length");
-            for value in data.as_chunks_mut::<4>().0 {
-                *value = remap_link(u32::from_le_bytes(*value))?.to_le_bytes();
+            for (element, value) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *value = remap_link(element * 4, u32::from_le_bytes(*value))?.to_le_bytes();
             }
             continue;
         }
         if tag.as_slice() == b"VMAD" {
             // Object links use the same supplier-self selector rule as every field.
             // The existing record-kind light-width policy and framing recovery are retained.
-            records::record_type::vmad::remap_primary_form_ids(data, |id| {
-                remap_optional(id, strict)
+            records::record_type::vmad::remap_primary_form_ids_at(data, |offset, id| {
+                remap_optional(index, tag, offset, id, strict)
             })
             .wrap_err("VMAD references")?;
             continue;
@@ -1004,7 +1026,7 @@ fn remap_record_using_optional(
                 let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                 // Keep valid payload bytes, but publish null for an invalid FormID rather
                 // than retaining a plugin-local value or guessing its owner.
-                let resolved = match remap_link(value) {
+                let resolved = match remap_link(offset, value) {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         warnings.skipped_optional(
@@ -1030,7 +1052,7 @@ fn remap_record_using_optional(
             );
             let value = u32::from_le_bytes(data[..4].try_into().unwrap());
             data[..4].copy_from_slice(
-                &remap_link(value)
+                &remap_link(0, value)
                     .wrap_err_with(|| format!("{} reference", String::from_utf8_lossy(tag)))?
                     .to_le_bytes(),
             );

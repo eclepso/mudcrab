@@ -4,6 +4,7 @@ use color_eyre::{
     Result,
     eyre::{ensure, eyre},
 };
+use sha2::{Digest, Sha256};
 use shared::{
     form_key::{FormKey, PluginId},
     legacy_id_view::LegacyIdView,
@@ -196,7 +197,7 @@ impl FormKeyOrder {
                     },
                     header_version,
                     masters: metadata.masters,
-                    content_hash: None,
+                    content_hash: Some(Sha256::digest(bytes).into()),
                 },
             ));
         }
@@ -250,6 +251,11 @@ impl FormKeyOrder {
             full_count,
             light_count,
         })
+    }
+
+    /// Freeze source facts, content proofs and supplying order for persisted pack members.
+    pub fn pack_identity(&self) -> Result<shared::pack_identity::PackIdentity> {
+        shared::pack_identity::PackIdentity::new(self.table.clone(), self.order.clone())
     }
 
     /// Resolve before packing. Every selector at or beyond MAST count selects self.

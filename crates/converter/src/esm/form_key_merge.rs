@@ -2,19 +2,20 @@
 //! FormKey follows Mutagen's owner/local identity; source payload words remain source-local.
 use super::{
     EsmParser, GameSettingIdentities, RemapWarnings, binary::parse_plugin_file_with_warnings,
-    form_keys::FormKeyOrder, records::RawRecord, remap_record_using,
+    form_keys::FormKeyOrder, records::RawRecord, remap_record_at_sites,
 };
 use color_eyre::Result;
 use shared::{form_key::FormKey, source_form_id::ZeroPolicy};
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    path::PathBuf,
-};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf};
 
 /// A recognized native link resolved without any runtime slot allocation.
 #[derive(Debug, Clone)]
 pub struct ResolvedLink {
+    /// Original physical subrecord ordinal, including opaque/unrecognized occurrences.
+    pub subrecord: usize,
+    pub signature: [u8; 4],
+    /// Byte offset within that subrecord's payload; never an offset in a rewritten BLOB.
+    pub byte_offset: usize,
     pub source_word: u32,
     pub key: Option<FormKey>,
 }
@@ -109,9 +110,8 @@ impl EsmParser {
                     }
                 };
                 let links = RefCell::new(Vec::new());
-                let first_word = Cell::new(true);
                 let mut checked = source.clone();
-                let admission = remap_record_using(
+                let admission = remap_record_at_sites(
                     &mut checked,
                     name,
                     &warnings,
@@ -124,13 +124,21 @@ impl EsmParser {
                         if resolved.is_some() {
                             order.note_projection(priority, word);
                         }
-                        if !first_word.replace(false) {
-                            links.borrow_mut().push(ResolvedLink {
-                                source_word: word,
-                                key: resolved,
-                            });
-                        }
                         // Validate framing and link ownership without packing or changing native words.
+                        Ok(word)
+                    },
+                    |subrecord, signature, byte_offset, word, _| {
+                        let resolved = order.resolve(priority, word, ZeroPolicy::Null)?;
+                        if resolved.is_some() {
+                            order.note_projection(priority, word);
+                        }
+                        links.borrow_mut().push(ResolvedLink {
+                            subrecord,
+                            signature: signature.try_into().expect("native four-byte signature"),
+                            byte_offset,
+                            source_word: word,
+                            key: resolved,
+                        });
                         Ok(word)
                     },
                     false,

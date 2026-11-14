@@ -598,6 +598,15 @@ pub fn remap_primary_form_ids(
     data: &mut [u8],
     mut remap: impl FnMut(u32) -> color_eyre::Result<u32>,
 ) -> color_eyre::Result<()> {
+    remap_primary_form_ids_at(data, |_, word| remap(word))
+}
+
+/// Visit each primary-script object at its exact byte offset within the VMAD payload.
+/// Alias IDs, padding and fragment bytes are never interpreted as record identities.
+pub fn remap_primary_form_ids_at(
+    data: &mut [u8],
+    mut remap: impl FnMut(usize, u32) -> color_eyre::Result<u32>,
+) -> color_eyre::Result<()> {
     let mut cursor = 0usize;
     let version = read_i16(data, &mut cursor)?;
     let object_format = read_i16(data, &mut cursor)?;
@@ -665,12 +674,13 @@ fn remap_object(
     data: &mut [u8],
     cursor: &mut usize,
     object_format: i16,
-    remap: &mut impl FnMut(u32) -> color_eyre::Result<u32>,
+    remap: &mut impl FnMut(usize, u32) -> color_eyre::Result<u32>,
 ) -> color_eyre::Result<()> {
+    let start = *cursor;
     let object = take_mut(data, cursor, 8)?;
     let offset = if object_format == 1 { 0 } else { 4 };
     let form_id = u32::from_le_bytes(object[offset..offset + 4].try_into().unwrap());
-    object[offset..offset + 4].copy_from_slice(&remap(form_id)?.to_le_bytes());
+    object[offset..offset + 4].copy_from_slice(&remap(start + offset, form_id)?.to_le_bytes());
     Ok(())
 }
 
