@@ -140,6 +140,27 @@ pub enum NamedFormKey {
     Null,
     Key(NamedIdentity),
 }
+
+impl serde::Serialize for NamedFormKey {
+    /// Portable JSON uses owner/local text or JSON null, never pack-local integers.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_none(),
+            Self::Key(_) => serializer.serialize_str(&self.to_string()),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NamedFormKey {
+    /// Reject numeric legacy or packed values instead of guessing their namespace.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+        match value {
+            None => Ok(Self::Null),
+            Some(value) => value.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
 /// Validated portable payload; only checked NamedFormKey construction can create it.
 #[derive(Debug, Clone)]
 pub struct NamedIdentity {

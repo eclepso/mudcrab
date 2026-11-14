@@ -10,6 +10,7 @@ pub mod legacy_id_view;
 pub mod lod;
 pub mod plugin_selection;
 pub mod plugin_table;
+pub mod pack_identity;
 pub mod records;
 pub mod source_form_id;
 pub mod streaming_costs;

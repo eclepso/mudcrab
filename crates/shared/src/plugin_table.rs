@@ -1,4 +1,4 @@
-//! Pure pack-scoped plugin allocation. No persistence, filesystem reads or load ordering.
+//! Pack-scoped plugin allocation, independent of filesystem reads and load ordering.
 use crate::{
     form_key::{FormKey, IdentityError, NamedFormKey, PluginId, validate_plugin_name},
     plugin_selection::normalize_plugin_name,
@@ -44,6 +44,7 @@ pub enum TableError {
     Exhausted,
     UnknownPlugin(String),
     UnknownId(PluginId),
+    InvalidStoredEntry(String),
 }
 impl fmt::Display for TableError {
     /// Keep allocation and lookup errors explicit for callers' counted diagnostics.
@@ -59,6 +60,27 @@ pub struct PluginTable {
     names: BTreeMap<String, PluginId>,
 }
 impl PluginTable {
+    /// Restore an authenticated allocation without reassigning IDs or losing tombstones.
+    /// The enclosing pack contract authenticates content and load order separately.
+    pub fn from_entries(entries: Vec<PluginEntry>) -> Result<Self, TableError> {
+        let mut names = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            validate_plugin_name(&entry.display_name).map_err(TableError::InvalidName)?;
+            if u64::from(entry.id.get()) != index as u64 + 1
+                || entry.normalized_name != normalize_plugin_name(&entry.display_name)
+            {
+                return Err(TableError::InvalidStoredEntry(entry.display_name.clone()));
+            }
+            if names
+                .insert(entry.normalized_name.clone(), entry.id)
+                .is_some()
+            {
+                return Err(TableError::DuplicateName(entry.normalized_name.clone()));
+            }
+        }
+        Ok(Self { entries, names })
+    }
+
     /// Allocate sorted normalized unique names deterministically, starting at one.
     pub fn fresh(plugins: Vec<(String, PluginFacts)>) -> Result<Self, TableError> {
         Self::default().retained(plugins)
