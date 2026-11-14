@@ -52,6 +52,15 @@ fn sql_round_trip_retains_all_facts_and_validates_keys() {
     transaction.commit().unwrap();
     let actual = PackIdentity::read_sql(&connection).unwrap();
     assert_eq!(actual.digest(), expected.digest());
+    // Independently encoded by the Python reference from literal fixture facts.
+    assert_eq!(
+        actual.digest(),
+        [
+            0xa7, 0x02, 0x83, 0x7a, 0x74, 0xd7, 0x49, 0x4b, 0x0b, 0x58, 0xfb, 0xc3, 0x81, 0xfc,
+            0x3b, 0x52, 0x6a, 0x5f, 0x14, 0xbf, 0x49, 0xe2, 0xe3, 0x45, 0x1d, 0x6d, 0xa4, 0x84,
+            0x50, 0xf9, 0xe2, 0xf1,
+        ]
+    );
     assert_eq!(
         actual.order().iter().map(|id| id.get()).collect::<Vec<_>>(),
         [2, 1]
@@ -242,4 +251,51 @@ fn missing_proofs_and_incomplete_orders_are_rejected_without_allocation_changes(
     let mut entries = scope.table().entries().to_vec();
     entries[0].normalized_name = "not-normalized".into();
     assert!(PluginTable::from_entries(entries).is_err());
+}
+
+/// The stored contract has no full/light slot ceiling and keeps keys wider than u32 intact.
+#[test]
+fn aggregate_past_both_legacy_limits_round_trips_without_runtime_slots() {
+    let mut plugins = Vec::new();
+    for (count, light, prefix, extension) in [(255, false, "F", "esm"), (4097, true, "L", "esl")] {
+        for index in 0..count {
+            plugins.push((
+                format!("{prefix}{index:04}.{extension}"),
+                PluginFacts {
+                    flags: PluginFlags {
+                        light,
+                        ..Default::default()
+                    },
+                    header_version: Some(1.71),
+                    content_hash: Some([index as u8; 32]),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    let table = PluginTable::fresh(plugins).unwrap();
+    let order = table.entries().iter().rev().map(|entry| entry.id).collect();
+    let scope = PackIdentity::new(table, order).unwrap();
+    let mut connection = Connection::open_in_memory().unwrap();
+    let transaction = connection.transaction().unwrap();
+    scope.write_sql(&transaction).unwrap();
+    // The generation writes its registry before any key-bearing record rows.
+    transaction.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY); INSERT INTO records VALUES (73014446780)").unwrap();
+    transaction.commit().unwrap();
+    let restored = PackIdentity::read_sql(&connection).unwrap();
+    assert_eq!(restored.table().entries().len(), 4352);
+    let word: i64 = connection
+        .query_row("SELECT form_id FROM records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(word, 0x0011_0000_0abc);
+    let key = restored.required_key(word).unwrap();
+    assert_eq!(key.plugin().get(), 4352);
+    assert_eq!(key.local(), 0xabc);
+    assert_eq!(
+        restored.table().named(key).unwrap().to_string(),
+        "000ABC:L4096.esl"
+    );
+    assert_eq!(restored.order().first().unwrap().get(), 4352);
+    assert_eq!(restored.order().last().unwrap().get(), 1);
+    assert_eq!(restored.digest(), scope.digest());
 }
