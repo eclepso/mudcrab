@@ -143,6 +143,28 @@ fn write_refuses_relabel_and_snapshot_failure_rolls_back() {
     );
 }
 
+/// Adding a table proof to already-populated legacy rows would falsely authenticate their IDs.
+#[test]
+fn old_rows_cannot_be_stamped_as_new_identities() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY, data BLOB); INSERT INTO records VALUES (4660,x'11223344')").unwrap();
+    let transaction = connection.transaction().unwrap();
+    let error = identity(7).write_sql(&transaction).unwrap_err().to_string();
+    assert!(error.contains("out of date") && error.contains("converted again"));
+    transaction.commit().unwrap();
+    assert!(PackIdentity::read_sql(&connection).is_err());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT hex(data) FROM records WHERE form_id=4660",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "11223344"
+    );
+}
+
 /// A fixed envelope rejects old roots, wrong formats, cross-pack integers and altered bytes.
 #[test]
 fn envelope_round_trip_checks_discriminator_before_payload() {

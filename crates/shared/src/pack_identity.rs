@@ -107,6 +107,19 @@ impl PackIdentity {
             );
             return Ok(());
         }
+        let has_records: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='records')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_records {
+            let count: i64 =
+                transaction.query_row("SELECT count(*) FROM records", [], |row| row.get(0))?;
+            ensure!(
+                count == 0,
+                "world is out of date; it must be converted again into a fresh world generation"
+            );
+        }
         transaction.execute_batch(
             "CREATE TABLE pack_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL, digest BLOB NOT NULL CHECK(length(digest)=32));
              CREATE TABLE pack_plugins (id INTEGER PRIMARY KEY CHECK(id>0), normalized_name TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, loaded INTEGER NOT NULL CHECK(loaded IN (0,1)), flags INTEGER NOT NULL CHECK(flags BETWEEN 0 AND 7), header_version_bits INTEGER, masters_json TEXT NOT NULL, content_hash BLOB, supplier_priority INTEGER UNIQUE);"
