@@ -286,6 +286,12 @@ fn archive_refuses_old_world_and_rolls_back_invalid_internal_sites() {
     )
     .unwrap();
     assert!(
+        SourceArchive::read(&old)
+            .unwrap_err()
+            .to_string()
+            .contains("convert again")
+    );
+    assert!(
         converted
             .write_source_archive(&mut old)
             .unwrap_err()
@@ -324,6 +330,18 @@ fn archive_reader_refuses_unknown_table_and_bad_physical_coordinates() {
     );
     let mut connection = Connection::open_in_memory().unwrap();
     EsmParser::export_form_key_source_archive(&[root.path().join("A.esm")], &mut connection)
+        .unwrap();
+    connection
+        .execute_batch("UPDATE source_archive SET version=0")
+        .unwrap();
+    assert!(
+        SourceArchive::read(&connection)
+            .unwrap_err()
+            .to_string()
+            .contains("convert again")
+    );
+    connection
+        .execute_batch("UPDATE source_archive SET version=1")
         .unwrap();
     connection
         .execute_batch("UPDATE source_links SET byte_offset=1")

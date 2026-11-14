@@ -3,7 +3,10 @@
 //! This is a diagnostic source archive, not a runtime world database. Native payloads retain
 //! four-byte file-relative words. Only the separately authenticated keys are semantic identities.
 use super::{EsmParser, form_key_merge::FormKeyConversion, records::RawRecord};
-use color_eyre::{Result, eyre::ensure};
+use color_eyre::{
+    Result,
+    eyre::{WrapErr, ensure},
+};
 use rusqlite::{Connection, params};
 use shared::{
     form_key::{FormKey, PluginId},
@@ -180,11 +183,13 @@ fn validate_link_context(
 impl SourceArchive {
     /// Authenticate plugin context and archive version before exposing any source rows or keys.
     pub fn read(connection: &Connection) -> Result<Self> {
-        let (version, scope): (u32, String) = connection.query_row(
-            "SELECT version,scope FROM source_archive WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (version, scope): (u32, String) = connection
+            .query_row(
+                "SELECT version,scope FROM source_archive WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .wrap_err("source archive is missing its format contract; convert again")?;
         ensure!(
             version == SOURCE_ARCHIVE_VERSION && scope == "diagnostic_source_only",
             "unsupported source archive; convert again"
