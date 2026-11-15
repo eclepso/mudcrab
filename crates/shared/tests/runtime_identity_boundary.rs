@@ -29,6 +29,15 @@ fn fixture() -> (Connection, PackIdentity) {
     let order = names.iter().map(|name| table.id(name).unwrap()).collect();
     let identity = PackIdentity::new(table, order).unwrap();
     let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("CREATE TABLE schema_info(version INTEGER)")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )
+        .unwrap();
     let transaction = connection.transaction().unwrap();
     identity.write_sql(&transaction).unwrap();
     transaction.commit().unwrap();

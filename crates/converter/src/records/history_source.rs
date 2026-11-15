@@ -46,7 +46,12 @@ pub struct RawSourceMaterial {
 /// Exact raw access does not establish typed decoding or executable wide-ID support.
 #[derive(Debug, Serialize)]
 pub struct SourceVersion {
+    /// Checked transient compatibility view for existing in-process diagnostic callers.
+    #[serde(skip_serializing)]
     pub runtime_form_id: Option<u32>,
+    /// Portable semantic identity; native output never exports a pack-local number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form_id: Option<shared::form_key::NamedFormKey>,
     pub plugin_id: u32,
     pub supplying_plugin: String,
     pub source_form_id: u32,
@@ -337,6 +342,7 @@ pub fn visit_source_history(
         let admitted_latest = latest(&conn, &identity, &sources, true)?;
         let mut version = SourceVersion {
             runtime_form_id: row.get(0)?,
+            form_id: None,
             plugin_id: plugin,
             supplying_plugin: order.names[plugin as usize].clone(),
             source_form_id,
@@ -366,6 +372,212 @@ pub fn visit_source_history(
             .runtime_form_id
             .filter(|_| version.status == "accepted")
         {
+            version.accepted_source_winner = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM inhouse_source_records WHERE form_id=?1 AND load_order=?2 AND source_form_id=?3 AND record_type=?4 AND flags=?5)",
+                params![id, plugin, source_form_id, version.record_type, version.flags], |r| r.get(0))?;
+            version.runtime_record_present = version.accepted_source_winner
+                && conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE form_id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )?;
+            version.runtime_fallback_before_latest_source = version.runtime_record_present
+                && source_latest.is_some()
+                && source_latest != Some(candidate);
+        }
+        let (source_name, stored_path, checksum) = &sources[plugin as usize];
+        let path: PathBuf = data
+            // Preserve the authenticated original filename spelling on case-sensitive hosts.
+            .map(|root| root.join(source_name))
+            .unwrap_or_else(|| stored_path.clone());
+        match guarded_raw(&path, checksum, &version) {
+            Ok(raw) => {
+                if raw.stored_payload.is_some() {
+                    summary.raw_complete += 1;
+                } else {
+                    summary.header_only += 1;
+                }
+                version.raw = Some(raw);
+            }
+            Err(error) => {
+                summary.unavailable += 1;
+                version.raw_access_failure = Some(error.to_string());
+            }
+        }
+        receive(version)?;
+    }
+    summary.fully_raw_available =
+        summary.versions > 0 && summary.unavailable == 0 && summary.header_only == 0;
+    Ok(summary)
+}
+
+/// Authenticate native allocation/content before exposing physical source versions.
+/// Source words/offsets remain raw facts; the semantic root is portable owner/local text.
+pub fn visit_native_source_history(
+    pack: &Path,
+    data: Option<&Path>,
+    query: SourceQuery,
+    mut receive: impl FnMut(SourceVersion) -> Result<()>,
+) -> Result<SourceSummary> {
+    let database = if pack.is_file() {
+        pack.to_path_buf()
+    } else {
+        pack.join("skyrim_world.db")
+    };
+    let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let pack_identity = shared::pack_identity::PackIdentity::read_sql(&conn)?;
+    let mut sources = Vec::with_capacity(pack_identity.order().len());
+    for (priority, &plugin) in pack_identity.order().iter().enumerate() {
+        let entry = pack_identity
+            .table()
+            .entry(plugin)
+            .expect("authenticated supplier");
+        let path: String = conn.query_row("SELECT source_path FROM record_overrides WHERE plugin_id=?1 AND record_type='TES4' AND source_record_offset=0", [priority as u64], |row| row.get(0))?;
+        sources.push((
+            entry.display_name.clone(),
+            PathBuf::from(path),
+            entry
+                .facts
+                .content_hash
+                .expect("authenticated content proof")
+                .to_vec(),
+        ));
+    }
+    let mut summary = SourceSummary {
+        query: query.clone(),
+        versions: 0,
+        raw_complete: 0,
+        header_only: 0,
+        unavailable: 0,
+        fully_raw_available: false,
+        typed_runtime_decoding_attempted: false,
+    };
+    let select = "SELECT form_id,plugin_id,source_form_id,record_type,flags,source_record_offset,source_record_size,status,reason,source_cell_form_id,source_worldspace_form_id,source_topic_form_id,topic_group_offset,original_owner,full_local,source_identity_state,source_group_end,frame_complete,record_signature FROM record_overrides";
+    let (sql, values): (String, Vec<rusqlite::types::Value>) = match &query {
+        SourceQuery::Physical {
+            plugin_id,
+            source_record_offset,
+        } => {
+            ensure!(
+                *source_record_offset <= i64::MAX as u64,
+                "offset is outside SQL range"
+            );
+            (
+                format!("{select} WHERE plugin_id=?1 AND source_record_offset=?2"),
+                vec![
+                    i64::from(*plugin_id).into(),
+                    (*source_record_offset as i64).into(),
+                ],
+            )
+        }
+        SourceQuery::Source {
+            original_owner,
+            full_local,
+        } => {
+            ensure!(
+                !original_owner.is_empty()
+                    && original_owner.len() <= 1024
+                    && original_owner
+                        .chars()
+                        .all(|c| c != '/' && c != '\\' && c != '\0')
+                    && *full_local <= 0xffffff,
+                "source query requires a bounded original basename/full local"
+            );
+            let owner = crate::esm::load_order::normalize_plugin_name(original_owner);
+            let legacy_owner = legacy_owner_key(&owner, &sources);
+            (
+                format!(
+                    "{select} WHERE original_owner IN (?1,?3) AND full_local=?2 AND source_identity_state='resolved' ORDER BY plugin_id,source_record_offset LIMIT {}",
+                    QUERY_VERSION_BOUND + 1
+                ),
+                vec![
+                    owner.into(),
+                    i64::from(*full_local).into(),
+                    legacy_owner.into(),
+                ],
+            )
+        }
+    };
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(values))?;
+    while let Some(row) = rows.next()? {
+        summary.versions += 1;
+        ensure!(
+            summary.versions <= QUERY_VERSION_BOUND,
+            "source history query exceeds bounded version count"
+        );
+        let plugin: u32 = row.get(1)?;
+        let source_form_id: u32 = row.get(2)?;
+        let record_type: String = row.get(3)?;
+        let signature: [u8; 4] = row
+            .get::<_, Vec<u8>>(18)?
+            .try_into()
+            .map_err(|_| color_eyre::eyre::eyre!("invalid stored signature"))?;
+        ensure!(
+            (plugin as usize) < pack_identity.order().len(),
+            "absent stored supplying plugin"
+        );
+        let identity = source_identity::resolve_native(
+            &signature,
+            source_form_id,
+            plugin as usize,
+            &pack_identity,
+        );
+        let owner: Option<String> = row.get(13)?;
+        let local: Option<u32> = row.get(14)?;
+        let state: String = row.get(15)?;
+        ensure!(
+            owner
+                .as_deref()
+                .map(crate::esm::load_order::normalize_plugin_name)
+                == identity.original_owner
+                && local == identity.full_local
+                && state == identity.state.as_str(),
+            "stored source identity differs from master authority"
+        );
+        let offset: u64 = row.get(5)?;
+        let candidate = (plugin, offset);
+        let source_latest = latest(&conn, &identity, &sources, false)?;
+        let admitted_latest = latest(&conn, &identity, &sources, true)?;
+        let stored_id: Option<i64> = row.get(0)?;
+        let key = pack_identity.optional_key(stored_id)?;
+        let runtime_form_id = key
+            .map(|key| pack_identity.runtime_id_if_available(key))
+            .transpose()?
+            .flatten();
+        let form_id = key
+            .map(|key| pack_identity.table().named(key))
+            .transpose()?
+            .unwrap_or(shared::form_key::NamedFormKey::Null);
+        let mut version = SourceVersion {
+            runtime_form_id,
+            form_id: Some(form_id),
+            plugin_id: plugin,
+            supplying_plugin: sources[plugin as usize].0.clone(),
+            source_form_id,
+            record_type,
+            record_signature: signature,
+            flags: row.get(4)?,
+            source_record_offset: offset,
+            source_record_size: row.get(6)?,
+            source_group_end: row.get(16)?,
+            frame_complete: row.get(17)?,
+            identity,
+            status: row.get(7)?,
+            rejection_reason: row.get(8)?,
+            source_cell_form_id: row.get(9)?,
+            source_worldspace_form_id: row.get(10)?,
+            source_topic_form_id: row.get(11)?,
+            topic_group_offset: row.get(12)?,
+            latest_source_candidate: source_latest == Some(candidate),
+            latest_reader_admitted_candidate: admitted_latest == Some(candidate),
+            accepted_source_winner: false,
+            runtime_record_present: false,
+            runtime_fallback_before_latest_source: false,
+            raw: None,
+            raw_access_failure: None,
+        };
+        if let Some(id) = stored_id.filter(|_| version.status == "accepted") {
             version.accepted_source_winner = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM inhouse_source_records WHERE form_id=?1 AND load_order=?2 AND source_form_id=?3 AND record_type=?4 AND flags=?5)",
                 params![id, plugin, source_form_id, version.record_type, version.flags], |r| r.get(0))?;

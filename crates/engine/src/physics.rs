@@ -108,9 +108,10 @@ impl MovementTuning {
     /// Legacy packages lack `movement_types`. A package with the table must
     /// contain a valid selected profile; otherwise it cannot claim record speeds.
     pub fn from_world_database(path: &Path) -> Result<Self> {
+        shared::world_assets::validate_world_database(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .wrap_err_with(|| format!("opening movement records in {}", path.display()))?;
-        shared::world_assets::install_runtime_identity_functions(&conn)?;
+        let identity = shared::world_assets::install_runtime_identity_functions(&conn)?;
         let has_table: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='movement_types')",
             [], |row| row.get(0),
@@ -198,7 +199,14 @@ impl MovementTuning {
                     [values[4], values[5]],
                     [values[6], values[7]],
                 ],
-                source: format!("MOVT 0003580D NPC_Default_MT ({plugin})"),
+                source: format!(
+                    "MOVT {} NPC_Default_MT ({plugin})",
+                    identity.table().named(
+                        identity
+                            .runtime_key(NPC_DEFAULT_MOVT_FORM_ID)?
+                            .expect("selected non-null MOVT")
+                    )?
+                ),
             }),
             ..Self::default()
         })
@@ -852,30 +860,31 @@ mod tests {
     }
 
     #[test]
-    fn packaged_movement_profile_resolves_and_legacy_package_falls_back() {
+    fn packaged_movement_profile_resolves_and_unprojected_current_world_uses_defaults() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("skyrim_world.db");
-        let conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        let identity = crate::world::test_support::install(&mut conn);
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
         let legacy = MovementTuning::from_world_database(&path).unwrap();
         assert_eq!(legacy.run_speed, 300.0);
         assert!(legacy.record_speeds.is_none());
         conn.execute_batch(
             "CREATE TABLE npcs(id INTEGER PRIMARY KEY, race_id INTEGER);
-            CREATE TABLE records(form_id INTEGER PRIMARY KEY, record_type TEXT);
             CREATE TABLE plugins(id INTEGER PRIMARY KEY, name TEXT);
             CREATE TABLE race_movement_links(id INTEGER PRIMARY KEY, walk_movt_id INTEGER, run_movt_id INTEGER);
             CREATE TABLE movement_types(id INTEGER PRIMARY KEY, editor_id TEXT,
                 left_walk REAL, left_run REAL, right_walk REAL, right_run REAL,
                 forward_walk REAL, forward_run REAL, back_walk REAL, back_run REAL,
                 load_order INTEGER);
-            INSERT INTO npcs VALUES(7, 79686);
-            INSERT INTO records VALUES(79686, 'RACE');
-            INSERT INTO race_movement_links VALUES(79686, NULL, NULL);
+            INSERT INTO npcs VALUES(stored_key(7),stored_key(79686));
+            INSERT INTO race_movement_links VALUES(stored_key(79686),NULL,NULL);
             INSERT INTO plugins VALUES(0, 'Skyrim.esm');
-            INSERT INTO movement_types VALUES(219149, 'NPC_Default_MT',
+            INSERT INTO movement_types VALUES(stored_key(219149),'NPC_Default_MT',
                 80.09, 370, 79.75, 370, 80.1, 370, 71.93, 205.25, 0);",
         )
         .unwrap();
+        crate::world::test_support::insert(&conn, &identity, 79686, "RACE", 0, Vec::new());
         let tuning = MovementTuning::from_world_database(&path).unwrap();
         assert_eq!(tuning.walk_speed, 80.1);
         assert_eq!(tuning.run_speed, 370.0);
@@ -897,7 +906,7 @@ mod tests {
         );
         assert!(tuning.record_speeds.unwrap().source.contains("Skyrim.esm"));
         conn.execute(
-            "UPDATE records SET record_type='STAT' WHERE form_id=79686",
+            "UPDATE records SET record_type='STAT' WHERE form_id=stored_key(79686)",
             [],
         )
         .unwrap();
@@ -908,12 +917,12 @@ mod tests {
                 .contains("expected RACE")
         );
         conn.execute(
-            "UPDATE records SET record_type='RACE' WHERE form_id=79686",
+            "UPDATE records SET record_type='RACE' WHERE form_id=stored_key(79686)",
             [],
         )
         .unwrap();
         conn.execute(
-            "UPDATE race_movement_links SET walk_movt_id=219149 WHERE id=79686",
+            "UPDATE race_movement_links SET walk_movt_id=stored_key(219149) WHERE id=stored_key(79686)",
             [],
         )
         .unwrap();
@@ -924,7 +933,7 @@ mod tests {
                 .contains("supports only unset race links")
         );
         conn.execute(
-            "UPDATE race_movement_links SET walk_movt_id=NULL WHERE id=79686",
+            "UPDATE race_movement_links SET walk_movt_id=NULL WHERE id=stored_key(79686)",
             [],
         )
         .unwrap();

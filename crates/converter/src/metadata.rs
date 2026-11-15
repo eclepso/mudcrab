@@ -300,15 +300,12 @@ impl AssetPipeline {
     }
 }
 
-/// Original packages predate reader stamps and were produced by the legacy frontend.
+/// Current generation packages carry an explicit reader proof; absence is never guessed.
 fn source_reader_identity(source: &Path) -> Result<serde_json::Value> {
-    let path = source.join("record-reader.json");
-    if path.is_file() {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
-    } else {
-        // Absence is the historical unversioned contract, never the current projection.
-        Ok(serde_json::json!({"mode": "legacy"}))
-    }
+    let bytes = fs::read(source.join("record-reader.json"))
+        .wrap_err("metadata source has no reader proof; convert again")?;
+    Ok(serde_json::from_slice(&bytes)
+        .wrap_err("metadata source reader proof is invalid; convert again")?)
 }
 
 /// Retained bytes keep their producer identity across repeated metadata rebuilds.
@@ -2005,6 +2002,17 @@ mod metadata_schema_controls {
         let original = serde_json::json!({"mode": "legacy"});
         let current = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
         assert_ne!(current, original);
+        assert!(
+            source_reader_identity(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("convert again")
+        );
+        fs::write(
+            temp.path().join("record-reader.json"),
+            serde_json::to_vec(&original).unwrap(),
+        )
+        .unwrap();
         assert_eq!(source_reader_identity(temp.path()).unwrap(), original);
         assert_eq!(
             retained_reader_identity(temp.path(), &original).unwrap(),

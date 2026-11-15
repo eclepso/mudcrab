@@ -1008,6 +1008,19 @@ pub(crate) mod tests {
     pub(crate) fn complete_output(name: &str) -> PathBuf {
         let output = tiny_output(name, false);
         write_world_database(&output, shared::WORLD_DATABASE_SCHEMA_VERSION);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+        manifest["plugin_table_digest"] = serde_json::json!(
+            shared::pack_identity::PackIdentity::read_sql(&connection)
+                .unwrap()
+                .digest_hex()
+        );
+        std::fs::write(
+            output.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
         write_integration_report(&output, true);
         output
     }
@@ -1033,8 +1046,9 @@ pub(crate) mod tests {
             .unwrap();
             let owner = table.id("Fixture.esm").unwrap();
             let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+            database.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB)").unwrap();
             let transaction = database.unchecked_transaction().unwrap();
-            identity.write_sql(&transaction).unwrap();
+            shared::records::create_record_context(&transaction, &identity).unwrap();
             transaction.commit().unwrap();
             let cache = shared::CellCache {
                 version: shared::CELL_CACHE_VERSION,
@@ -1060,10 +1074,17 @@ pub(crate) mod tests {
     /// these converter and world database schemas.
     fn set_schemas(output: &Path, converter_schema: u32, database_schema: u32) {
         write_world_database(output, database_schema);
-        let manifest = format!(
-            r#"{{"schema_version": {converter_schema}, "complete": true, "entries": {{}}}}"#
-        );
-        std::fs::write(output.join(MANIFEST_FILE), manifest).unwrap();
+        let mut manifest =
+            serde_json::json!({"schema_version":converter_schema,"complete":true,"entries":{}});
+        let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+        if let Ok(identity) = shared::pack_identity::PackIdentity::read_sql(&database) {
+            manifest["plugin_table_digest"] = serde_json::json!(identity.digest_hex());
+        }
+        std::fs::write(
+            output.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
         let report = format!(r#"{{"passed": true, "schema_version": {database_schema}}}"#);
         std::fs::write(output.join("integration-report.json"), report).unwrap();
     }

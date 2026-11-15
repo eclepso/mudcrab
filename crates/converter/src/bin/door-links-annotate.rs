@@ -21,13 +21,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| std::path::Path::new("."));
     let _lock = shared::asset_lock::AssetLock::acquire_exclusive(root)
         .wrap_err("close asset readers before rebuilding door links")?;
+    shared::world_assets::validate_world_database(&path)?;
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .wrap_err_with(|| format!("opening {}", path.display()))?;
-    let version: u32 = conn.query_row("SELECT version FROM schema_info", [], |row| row.get(0))?;
-    ensure!(
-        (4..=shared::WORLD_DATABASE_SCHEMA_VERSION).contains(&version),
-        "database schema {version} is unsupported"
-    );
     let count = converter::esm::doors::rebuild_door_links(&conn)?;
     println!(
         "projected {count} door links from winning records in {}",

@@ -462,7 +462,31 @@ fn native_provenance_sql_round_trips_physical_metadata_and_named_diagnostic_sour
             "cleared".into()
         )
     );
+    connection.execute_batch("CREATE TABLE inhouse_source_records(form_id INTEGER,load_order INTEGER,source_form_id INTEGER,record_type TEXT,flags INTEGER); CREATE TABLE records(form_id INTEGER);
+        INSERT INTO inhouse_source_records VALUES(4294969361,255,2065,'TEST',0); INSERT INTO records VALUES(4294969361);").unwrap();
     drop(connection);
+    let summary = super::super::history_source::visit_native_source_history(
+        &database,
+        None,
+        super::super::history_source::SourceQuery::Source {
+            original_owner: "Owner255.esm".into(),
+            full_local: 0x811,
+        },
+        |version| {
+            assert_eq!(
+                version.form_id.as_ref().map(ToString::to_string).as_deref(),
+                Some("000811:Owner255.esm")
+            );
+            assert_eq!(version.runtime_form_id, None);
+            assert!(version.accepted_source_winner && version.runtime_record_present);
+            let wire = serde_json::to_value(&version)?;
+            assert_eq!(wire["form_id"], "000811:Owner255.esm");
+            assert!(wire.get("runtime_form_id").is_none());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(summary.fully_raw_available);
     let named = NamedFormKey::new("Owner255.esm", 0x811).unwrap();
     let chain = super::super::history::read_native_chain(&database, &named).unwrap();
     assert_eq!(chain.form_id.to_string(), "000811:Owner255.esm");
@@ -519,4 +543,18 @@ fn native_typed_storage_retains_255_full_and_4097_light_owners() {
         .unwrap();
     let portable: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(portable["form_id"], "000ABC:Light4096.esl");
+}
+
+#[test]
+fn native_notices_do_not_filter_on_plugin_filename_text() {
+    let mut result = NativeReadResult::default();
+    let mut diagnostic = PluginDiagnostics::default();
+    diagnostic.compatibility_headers = 1;
+    diagnostic
+        .first_by_category
+        .insert("compatibility".into(), "source header".into());
+    result
+        .diagnostics
+        .insert("cleared owner.esp".into(), diagnostic);
+    assert_eq!(result.notices().len(), 1);
 }

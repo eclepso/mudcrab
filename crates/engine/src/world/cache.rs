@@ -47,6 +47,7 @@ impl CellCache {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("skyrim_world.db");
+        shared::world_assets::validate_world_database(&database)?;
         let connection = rusqlite::Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -202,6 +203,15 @@ mod tests {
         let identity = PackIdentity::new(table, vec![owner]).unwrap();
         let mut connection =
             rusqlite::Connection::open(path.parent().unwrap().join("skyrim_world.db")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_info SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM schema_info)",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
         let tx = connection.transaction().unwrap();
         identity.write_sql(&tx).unwrap();
         tx.commit().unwrap();
@@ -368,5 +378,30 @@ mod tests {
             .err()
             .expect("unenveloped cache was accepted");
         assert!(error.to_string().contains("converted again"), "{error}");
+    }
+
+    #[test]
+    fn old_world_stamp_refuses_even_a_current_bound_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cell_cache.rkyv");
+        write_fixture(
+            &path,
+            shared::CellCache {
+                version: shared::CELL_CACHE_VERSION,
+                cells: vec![],
+            },
+        );
+        let database =
+            rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        database
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION - 1],
+            )
+            .unwrap();
+        let error = CellCache::open(&path)
+            .err()
+            .expect("old world must be converted again");
+        assert!(format!("{error:#}").contains("convert again"), "{error:#}");
     }
 }

@@ -1006,6 +1006,10 @@ impl StreamingFixtureDirectory {
             CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
             CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);"#,
         )?;
+        connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB)")?;
+        let context_transaction = connection.unchecked_transaction()?;
+        shared::records::create_record_context(&context_transaction, &identity)?;
+        context_transaction.commit()?;
         connection.execute(
             "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES(?1,'Fixture',NULL,0,?2,?3)",
             params![stored(worldspace_id)?, start_grid.0, start_grid.1],
@@ -4090,16 +4094,34 @@ mod tests {
         ));
     }
 
-    fn write_runtime_asset_database(path: &std::path::Path) {
-        let connection = Connection::open(path).unwrap();
+    fn write_runtime_asset_database(path: &Path) {
+        let mut connection = Connection::open(path).unwrap();
         connection
-            .execute_batch(&format!(
-                "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES({});
-                 CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY);",
-                shared::WORLD_DATABASE_SCHEMA_VERSION
-            ))
+            .execute_batch("CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY)")
             .unwrap();
+        let identity = crate::world::test_support::install(&mut connection);
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: Vec::new(),
+        };
+        std::fs::write(
+            path.parent().unwrap().join("cell_cache.rkyv"),
+            shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Fresh fixture publication always names the same authenticated world allocation.
+    fn write_runtime_manifest(root: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+        let mut manifest: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
+        let connection = Connection::open(root.join("skyrim_world.db")).unwrap();
+        if let Ok(identity) = shared::pack_identity::PackIdentity::read_sql(&connection) {
+            manifest["plugin_table_digest"] = serde_json::json!(identity.digest_hex());
+        }
+        std::fs::write(
+            root.join("conversion-manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
     }
 
     #[test]
@@ -4714,8 +4736,10 @@ mod tests {
     fn live_start_pose_seeds_streaming_and_camera_without_selecting_shots_mode() {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("pose.json");
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
         std::fs::write(&file, r#"{"width":1920,"height":1080,"shots":[{"name":"inn","worldspace_id":60,"position":[21750,-44530,140],"yaw":90,"pitch":-3,"hfov":80}]}"#).unwrap();
         let mut config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
             start_shot: Some(file),
             ..default()
         };
@@ -4759,6 +4783,13 @@ mod tests {
             panic!("expected an interactive run")
         };
         let mut config = *config;
+        if let Some(path) = &config.start_shot {
+            config.assets_dir = path.parent().unwrap().to_owned();
+            let database = config.assets_dir.join("skyrim_world.db");
+            if !database.exists() {
+                write_runtime_asset_database(&database);
+            }
+        }
         let mut preferences =
             crate::settings::prepare_settings_at(&mut config, Some(settings_path.to_owned()));
         let pose = prepare_start_camera(&mut config, Some(&mut preferences)).unwrap();
@@ -4978,13 +5009,8 @@ mod tests {
     /// Runs the real gate against a temporary asset set and returns its error.
     fn runtime_asset_error(manifest: &str, report: &str) -> String {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
-        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
-        std::fs::write(
-            directory.path().join("conversion-manifest.json"),
-            manifest.as_bytes(),
-        )
-        .unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
+        write_runtime_manifest(directory.path(), manifest.as_bytes()).unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
             report.as_bytes(),
@@ -5001,12 +5027,8 @@ mod tests {
     fn rejects_stale_or_incomplete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
         write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
-        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
-        std::fs::write(
-            directory.path().join("conversion-manifest.json"),
-            br#"{"schema_version":3,"complete":true}"#,
-        )
-        .unwrap();
+        write_runtime_manifest(directory.path(), br#"{"schema_version":3,"complete":true}"#)
+            .unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
             br#"{"schema_version":3,"passed":true}"#,
@@ -5197,9 +5219,8 @@ mod tests {
     fn accepts_current_complete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
         write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
-        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
-        std::fs::write(
-            directory.path().join("conversion-manifest.json"),
+        write_runtime_manifest(
+            directory.path(),
             format!(
                 r#"{{"schema_version":{},"complete":true}}"#,
                 converter_schema_version()
@@ -5239,15 +5260,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_schema_15_assets_with_matching_legacy_reports() {
+    fn refuses_schema_15_assets_with_matching_legacy_reports() {
         // Cover both legacy world schemas and retain the report/database mismatch gate.
         for schema in [3, 4] {
             let directory = tempfile::tempdir().unwrap();
             let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
             database.execute_batch(&format!("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES({schema});")).unwrap();
             std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
-            std::fs::write(
-                directory.path().join("conversion-manifest.json"),
+            write_runtime_manifest(
+                directory.path(),
                 br#"{"schema_version":15,"complete":true}"#,
             )
             .unwrap();
@@ -5261,7 +5282,12 @@ mod tests {
                 assets_dir: directory.path().to_owned(),
                 ..default()
             };
-            validate_runtime_assets(&config).unwrap();
+            assert!(
+                validate_runtime_assets(&config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("convert again")
+            );
             let wrong = schema + 1;
             std::fs::write(
                 &report,
@@ -5272,13 +5298,13 @@ mod tests {
                 validate_runtime_assets(&config)
                     .unwrap_err()
                     .to_string()
-                    .contains(&format!("does not match integration report schema {wrong}"))
+                    .contains("convert again")
             );
         }
     }
 
     #[test]
-    fn v7_accepts_unchanged_schema_16_and_new_emission_schema_17() {
+    fn refuses_pre_formkey_producers_even_with_matching_legacy_reports() {
         assert_eq!(
             converter_schema_version(),
             converter::cache::CONVERTER_SCHEMA_VERSION
@@ -5298,12 +5324,17 @@ mod tests {
             ..default()
         };
         for schema in [16, 17, 18, 19, 20, 21, 22, 23, 24] {
-            std::fs::write(
-                directory.path().join("conversion-manifest.json"),
+            write_runtime_manifest(
+                directory.path(),
                 format!(r#"{{"schema_version":{schema},"complete":true}}"#),
             )
             .unwrap();
-            validate_runtime_assets(&config).unwrap();
+            assert!(
+                validate_runtime_assets(&config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("convert again")
+            );
         }
     }
 
@@ -5312,9 +5343,8 @@ mod tests {
         for truncated_file in ["conversion-manifest.json", "integration-report.json"] {
             let directory = tempfile::tempdir().unwrap();
             write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
-            std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
-            std::fs::write(
-                directory.path().join("conversion-manifest.json"),
+            write_runtime_manifest(
+                directory.path(),
                 format!(
                     r#"{{"schema_version":{},"complete":true}}"#,
                     converter_schema_version()
@@ -5341,27 +5371,31 @@ mod tests {
         }
     }
 
+    fn ground_fixture_database(path: &Path) -> shared::pack_identity::PackIdentity {
+        let mut connection = Connection::open(path).unwrap();
+        let identity = crate::world::test_support::install(&mut connection);
+        connection.execute_batch("CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER); CREATE TABLE land(cell_id INTEGER PRIMARY KEY)").unwrap();
+        let cell = crate::world::test_support::key(&identity, 42);
+        let world = crate::world::test_support::key(&identity, 7);
+        connection
+            .execute("INSERT INTO cells VALUES(?1,?2,0,0)", params![cell, world])
+            .unwrap();
+        connection
+            .execute("INSERT INTO land VALUES(?1)", [cell])
+            .unwrap();
+        identity
+    }
+
     #[test]
     fn ground_height_query_reads_the_right_cell() {
         let database_directory = tempfile::tempdir().unwrap();
         let database_path = database_directory.path().join("skyrim_world.db");
-        let connection = Connection::open(&database_path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
-                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
-                 INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(42,7,0,0);
-                 INSERT INTO land(cell_id) VALUES(42);",
-            )
-            .unwrap();
-        drop(connection);
-
-        let cache_directory = tempfile::tempdir().unwrap();
-        let cache_path = cache_directory.path().join("cell_cache.rkyv");
+        let identity = ground_fixture_database(&database_path);
+        let cache_path = database_directory.path().join("cell_cache.rkyv");
         let source = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
             cells: vec![shared::CachedLand {
-                cell_id: 42,
+                cell_id: u64::try_from(crate::world::test_support::key(&identity, 42)).unwrap(),
                 width: 2,
                 height: 2,
                 heights: vec![1.0, 2.0, 3.0, 4.0],
@@ -5372,7 +5406,7 @@ mod tests {
                 water_type_form_id: None,
             }],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&source).unwrap();
+        let bytes = shared::cache_identity::encode_cell_cache(&identity, &source, false).unwrap();
         std::fs::write(&cache_path, bytes).unwrap();
         let cache = CellCache::open(&cache_path).unwrap();
 
@@ -5390,36 +5424,29 @@ mod tests {
     fn walk_spawn_ground_query_interpolates_at_authored_shot_xy() {
         let database_directory = tempfile::tempdir().unwrap();
         let database_path = database_directory.path().join("skyrim_world.db");
-        let connection = Connection::open(&database_path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
-                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
-                 INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(42,7,0,0);
-                 INSERT INTO land(cell_id) VALUES(42);",
-            )
-            .unwrap();
-        drop(connection);
-
-        let cache_directory = tempfile::tempdir().unwrap();
-        let cache_path = cache_directory.path().join("cell_cache.rkyv");
+        let identity = ground_fixture_database(&database_path);
+        let cache_path = database_directory.path().join("cell_cache.rkyv");
         let heights = (0..33)
             .flat_map(|y| (0..33).map(move |x| (x + y) as f32))
             .collect();
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
-            version: shared::CELL_CACHE_VERSION,
-            cells: vec![shared::CachedLand {
-                cell_id: 42,
-                width: 33,
-                height: 33,
-                heights,
-                normals: vec![0; 33 * 33 * 3],
-                vertex_colors: vec![255; 33 * 33 * 3],
-                layers: vec![],
-                water_height: None,
-                water_type_form_id: None,
-            }],
-        })
+        let bytes = shared::cache_identity::encode_cell_cache(
+            &identity,
+            &shared::CellCache {
+                version: shared::CELL_CACHE_VERSION,
+                cells: vec![shared::CachedLand {
+                    cell_id: u64::try_from(crate::world::test_support::key(&identity, 42)).unwrap(),
+                    width: 33,
+                    height: 33,
+                    heights,
+                    normals: vec![0; 33 * 33 * 3],
+                    vertex_colors: vec![255; 33 * 33 * 3],
+                    layers: vec![],
+                    water_height: None,
+                    water_type_form_id: None,
+                }],
+            },
+            false,
+        )
         .unwrap();
         std::fs::write(&cache_path, bytes).unwrap();
         let cache = CellCache::open(&cache_path).unwrap();
@@ -5464,10 +5491,15 @@ mod tests {
 
         let cache_directory = tempfile::tempdir().unwrap();
         let cache_path = cache_directory.path().join("cell_cache.rkyv");
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
-            version: shared::CELL_CACHE_VERSION,
-            cells: vec![],
-        })
+        let identity = ground_fixture_database(&cache_directory.path().join("skyrim_world.db"));
+        let bytes = shared::cache_identity::encode_cell_cache(
+            &identity,
+            &shared::CellCache {
+                version: shared::CELL_CACHE_VERSION,
+                cells: vec![],
+            },
+            false,
+        )
         .unwrap();
         std::fs::write(&cache_path, bytes).unwrap();
         let cache = CellCache::open(&cache_path).unwrap();

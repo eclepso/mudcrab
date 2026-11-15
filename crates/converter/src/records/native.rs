@@ -109,15 +109,12 @@ impl NativeReadResult {
 
     /// Successful supplier-self admission remains separate from data-loss warnings.
     pub fn notices(&self) -> Vec<String> {
-        self.diagnostics
-            .iter()
-            .flat_map(|(name, diagnostics)| {
-                diagnostics
-                    .notice_summary_lines(name)
-                    .into_iter()
-                    .filter(|line| !line.contains("cleared "))
-            })
-            .collect()
+        self.diagnostics.iter().filter_map(|(name, diagnostics)| {
+            let example = diagnostics.first_by_category.get("compatibility")?;
+            (diagnostics.compatibility_headers != 0).then(|| format!(
+                "notice: {name}: used supplier-self native compatibility for {} headers (original owners unresolved; first: {example})",
+                diagnostics.compatibility_headers))
+        }).collect()
     }
 }
 

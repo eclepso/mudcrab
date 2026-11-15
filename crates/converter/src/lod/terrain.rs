@@ -1230,6 +1230,14 @@ pub fn exterior_terrain_cells(
     connection: &Connection,
     worldspace_id: u64,
 ) -> Result<Vec<(i32, i32, u64)>> {
+    let version: u32 =
+        connection.query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
+            row.get(0)
+        })?;
+    ensure!(
+        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "terrain database is out of date; convert again"
+    );
     let identity = shared::pack_identity::PackIdentity::read_sql(connection)?;
     let world = shared::cache_identity::required(&identity, worldspace_id)?;
     let mut statement=connection.prepare("SELECT c.grid_x,c.grid_y,c.id FROM cells c JOIN land l ON l.cell_id=c.id WHERE c.worldspace_id=?1 AND c.grid_x IS NOT NULL AND c.grid_y IS NOT NULL ORDER BY c.grid_y,c.grid_x")?;
@@ -1265,6 +1273,12 @@ pub(crate) struct TerrainCellCache {
 }
 impl TerrainCellCache {
     pub fn read(cache_path: &Path) -> Result<Self> {
+        shared::world_assets::validate_world_database(
+            &cache_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("skyrim_world.db"),
+        )?;
         use std::io::Read;
         let mut file = std::fs::File::open(cache_path)
             .wrap_err_with(|| format!("failed to read {}", cache_path.display()))?;
@@ -1469,6 +1483,15 @@ mod tests {
         let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
         let mut database =
             rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        database
+            .execute_batch("CREATE TABLE schema_info(version INTEGER)")
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO schema_info VALUES(?1)",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
         let tx = database.transaction().unwrap();
         identity.write_sql(&tx).unwrap();
         tx.commit().unwrap();

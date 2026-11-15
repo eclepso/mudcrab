@@ -560,9 +560,46 @@ mod tests {
             PRIMARY KEY (npc_id, slot)
         );";
 
+    fn fixture_scope(connection: &Connection) -> shared::pack_identity::PackIdentity {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='pack_identity')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !exists {
+            connection
+                .execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER)")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_info SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM schema_info)",
+                    [shared::WORLD_DATABASE_SCHEMA_VERSION],
+                )
+                .unwrap();
+            let table = shared::plugin_table::PluginTable::fresh(vec![(
+                "Base.esm".into(),
+                shared::plugin_table::PluginFacts {
+                    content_hash: Some([1; 32]),
+                    ..Default::default()
+                },
+            )])
+            .unwrap();
+            let owner = table.id("Base.esm").unwrap();
+            let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB)").unwrap();
+            let transaction = connection.unchecked_transaction().unwrap();
+            shared::records::create_record_context(&transaction, &identity).unwrap();
+            transaction.commit().unwrap();
+        }
+        (*shared::world_assets::install_runtime_identity_functions(connection).unwrap()).clone()
+    }
+
     fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(DDL).unwrap();
+        fixture_scope(&connection);
         connection
     }
 
@@ -575,6 +612,9 @@ mod tests {
         head_model: Option<&str>,
         head_source: Option<&str>,
     ) {
+        let identity = fixture_scope(connection);
+        let id = crate::world::test_support::key(&identity, id);
+        let race = crate::world::test_support::key(&identity, race);
         connection
             .execute(
                 "INSERT INTO actor_models(id, race_id, sex, head_model, head_source, resolution) \
@@ -585,6 +625,8 @@ mod tests {
     }
 
     fn insert_part(connection: &Connection, npc: u32, slot: &str, path: &str) {
+        let identity = fixture_scope(connection);
+        let npc = crate::world::test_support::key(&identity, npc);
         connection
             .execute(
                 "INSERT INTO actor_model_parts(npc_id, slot, model_path) VALUES (?1, ?2, ?3)",
@@ -599,7 +641,7 @@ mod tests {
         let connection = connection();
         insert_actor(&connection, 77, 13, "female", "body", None, None);
         insert_part(&connection, 77, "body", "Actors/Custom/body.nif");
-        connection.execute_batch("CREATE TABLE race_animation_sources(race_id INTEGER,sex TEXT,skeleton_nif TEXT,project_hkx TEXT); INSERT INTO race_animation_sources VALUES (13,'female','meshes/custom/skeleton.nif','meshes/custom/project.hkx');").unwrap();
+        connection.execute_batch("CREATE TABLE race_animation_sources(race_id INTEGER,sex TEXT,skeleton_nif TEXT,project_hkx TEXT); INSERT INTO race_animation_sources VALUES (stored_key(13),'female','meshes/custom/skeleton.nif','meshes/custom/project.hkx');").unwrap();
         let directory = tempfile::tempdir().unwrap();
         let clip = "meshes/actor-idles/clips/idle.glb";
         std::fs::create_dir_all(directory.path().join("meshes/actor-idles/clips")).unwrap();
@@ -639,7 +681,7 @@ mod tests {
         };
         std::fs::write(
             directory.path().join(PATH),
-            serde_json::to_vec(&catalog).unwrap(),
+            serde_json::to_vec(&catalog.to_file(&fixture_scope(&connection)).unwrap()).unwrap(),
         )
         .unwrap();
         let read = || ActorCatalog::from_connection_with_assets_root(&connection, directory.path());
@@ -654,7 +696,7 @@ mod tests {
         ] {
             connection
                 .execute(
-                    "UPDATE actor_model_parts SET model_path=?1 WHERE npc_id=77 AND slot='body'",
+                    "UPDATE actor_model_parts SET model_path=?1 WHERE npc_id=stored_key(77) AND slot='body'",
                     [authored],
                 )
                 .unwrap();
@@ -779,7 +821,7 @@ mod tests {
         alvor(&connection);
         connection
             .execute(
-                "UPDATE actor_models SET skin_tone_r=?1, skin_tone_g=?2, skin_tone_b=?3 WHERE id=0x13475",
+                "UPDATE actor_models SET skin_tone_r=?1, skin_tone_g=?2, skin_tone_b=?3 WHERE id=stored_key(0x13475)",
                 params![198.0 / 255.0, 176.0 / 255.0, 168.0 / 255.0],
             )
             .unwrap();
@@ -806,7 +848,10 @@ mod tests {
         insert_actor(&connection, 0x13476, 79686, "female", "body", None, None);
         insert_part(&connection, 0x13476, "body", "FemaleBody_1.NIF");
         connection
-            .execute("UPDATE actor_models SET weight=20.0 WHERE id=0x13475", [])
+            .execute(
+                "UPDATE actor_models SET weight=20.0 WHERE id=stored_key(0x13475)",
+                [],
+            )
             .unwrap();
         let catalog = ActorCatalog::from_connection(&connection);
 
@@ -921,7 +966,11 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO actor_model_parts(npc_id, slot, model_path) VALUES (?1, ?2, ?3)",
-                params![0x1_u32, 42_i64, "malformed-slot"],
+                params![
+                    crate::world::test_support::key(&fixture_scope(&connection), 0x1),
+                    42_i64,
+                    "malformed-slot"
+                ],
             )
             .unwrap();
 
@@ -1042,10 +1091,47 @@ mod tests {
         );
     }
 
-    fn write_outfit_catalog(directory: &Path, catalog: &shared::actor_outfits::ActorOutfitCatalog) {
+    fn write_outfit_catalog(
+        connection: &Connection,
+        directory: &Path,
+        catalog: &shared::actor_outfits::ActorOutfitCatalog,
+    ) {
+        use shared::actor_outfits::{ActorOutfitCatalogFile, ActorOutfitFile, OutfitPartFile};
+        let identity = fixture_scope(connection);
+        let named = |value| {
+            identity
+                .table()
+                .named(identity.runtime_key(value).unwrap().unwrap())
+                .unwrap()
+        };
+        // Intentionally malformed metadata remains constructible for reader refusal tests.
+        let file = ActorOutfitCatalogFile {
+            version: catalog.version,
+            pack_identity: identity.digest_hex(),
+            skipped: catalog.skipped.clone(),
+            outfits: catalog
+                .outfits
+                .iter()
+                .map(|row| ActorOutfitFile {
+                    npc_id: named(row.npc_id),
+                    outfit_id: named(row.outfit_id),
+                    parts: row
+                        .parts
+                        .iter()
+                        .map(|part| OutfitPartFile {
+                            armo_id: named(part.armo_id),
+                            armature_id: named(part.armature_id),
+                            armature_race_id: named(part.armature_race_id),
+                            biped_mask: part.biped_mask,
+                            scene: part.scene.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
         std::fs::write(
             directory.join(shared::actor_outfits::PATH),
-            serde_json::to_vec(catalog).unwrap(),
+            serde_json::to_vec(&file).unwrap(),
         )
         .unwrap();
     }
@@ -1080,7 +1166,7 @@ mod tests {
         alvor(&connection);
         let directory = tempfile::tempdir().unwrap();
         composed_male_body(directory.path());
-        write_outfit_catalog(directory.path(), &blacksmith_outfit(0x13475));
+        write_outfit_catalog(&connection, directory.path(), &blacksmith_outfit(0x13475));
         let catalog = ActorCatalog::from_connection_with_assets_root(&connection, directory.path());
 
         let plan = catalog.spawn_plan(catalog.get(0x13475).unwrap()).unwrap();
@@ -1094,7 +1180,7 @@ mod tests {
         let connection = connection();
         alvor(&connection);
         let directory = tempfile::tempdir().unwrap();
-        write_outfit_catalog(directory.path(), &blacksmith_outfit(0x13475));
+        write_outfit_catalog(&connection, directory.path(), &blacksmith_outfit(0x13475));
         // No composed body: the actor draws its catalog body part, which the outfit does not fit.
         let catalog = ActorCatalog::from_connection_with_assets_root(&connection, directory.path());
         let plan = catalog.spawn_plan(catalog.get(0x13475).unwrap()).unwrap();
@@ -1102,7 +1188,7 @@ mod tests {
 
         // A composed body but a different actor in the catalog: no row, no outfit.
         composed_male_body(directory.path());
-        write_outfit_catalog(directory.path(), &blacksmith_outfit(0x999));
+        write_outfit_catalog(&connection, directory.path(), &blacksmith_outfit(0x999));
         let catalog = ActorCatalog::from_connection_with_assets_root(&connection, directory.path());
         let plan = catalog.spawn_plan(catalog.get(0x13475).unwrap()).unwrap();
         assert!(plan.outfit.is_none());
@@ -1138,7 +1224,7 @@ mod tests {
 
         let mut invalid = blacksmith_outfit(0x13475);
         invalid.outfits[0].parts[0].scene = "Meshes/../escape.glb".into();
-        write_outfit_catalog(directory.path(), &invalid);
+        write_outfit_catalog(&connection, directory.path(), &invalid);
         assert!(
             plan_outfit(directory.path()).is_none(),
             "invalid catalog is rejected whole"

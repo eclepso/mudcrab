@@ -90,18 +90,15 @@ fn main() -> Result<()> {
         return source_history(&args[1..], true);
     }
     if args.first().is_some_and(|arg| arg == "history") {
-        // Per-version data failures are represented in the report, and a bad pack
-        // receives a diagnostic without making this inspection command fail as a whole.
-        match history(&args[1..]) {
-            Ok(()) => {}
-            Err(error) => println!("history unavailable: {error}"),
-        }
-        return Ok(());
+        return history(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "diagnostics") {
+        return native_diagnostics(&args[1..]);
     }
     args.retain(|arg| arg != "--no-lod"); // This diagnostic exporter never compiles LOD.
     ensure!(
         args.len() >= 3,
-        "usage: inhouse-records <Skyrim Data> <plugins.txt> <new output directory> --no-lod [--typed-signatures WEAP,NPC_,SPEL] [--database-work-dir <new directory>] [--record-archive-only]; or history <pack> <hex FormID> [--data DIR] [--json]"
+        "usage: inhouse-records <Skyrim Data> <plugins.txt> <new output directory> --no-lod [--typed-signatures WEAP,NPC_,SPEL] [--database-work-dir <new directory>] [--record-archive-only]; or history <pack> <000123:Owner.esm> [--json]"
     );
     let data = PathBuf::from(&args[0]);
     let plugins = PathBuf::from(&args[1]);
@@ -129,16 +126,18 @@ fn main() -> Result<()> {
 /// A partial/unavailable raw result is retained in output and returns an error status.
 fn source_history(args: &[std::ffi::OsString], physical: bool) -> Result<()> {
     use converter::records::history_source::{
-        SourceQuery, SourceSummary, SourceVersion, visit_source_history,
+        SourceQuery, SourceSummary, SourceVersion, visit_native_source_history,
     };
     use std::io::Write;
     #[derive(serde::Serialize)]
     struct VersionLine<'a> {
+        schema_version: u32,
         kind: &'static str,
         version: &'a SourceVersion,
     }
     #[derive(serde::Serialize)]
     struct SummaryLine<'a> {
+        schema_version: u32,
         kind: &'static str,
         summary: &'a SourceSummary,
     }
@@ -170,10 +169,11 @@ fn source_history(args: &[std::ffi::OsString], physical: bool) -> Result<()> {
     };
     let stdout = std::io::stdout();
     let mut writer = std::io::BufWriter::new(stdout.lock());
-    let summary = visit_source_history(&pack, data.as_deref(), query, |version| {
+    let summary = visit_native_source_history(&pack, data.as_deref(), query, |version| {
         serde_json::to_writer(
             &mut writer,
             &VersionLine {
+                schema_version: 2,
                 kind: "source_version",
                 version: &version,
             },
@@ -184,6 +184,7 @@ fn source_history(args: &[std::ffi::OsString], physical: bool) -> Result<()> {
     serde_json::to_writer(
         &mut writer,
         &SummaryLine {
+            schema_version: 2,
             kind: "source_summary",
             summary: &summary,
         },
@@ -201,30 +202,74 @@ fn source_history(args: &[std::ffi::OsString], physical: bool) -> Result<()> {
 fn history(args: &[std::ffi::OsString]) -> Result<()> {
     ensure!(
         args.len() >= 2,
-        "usage: inhouse-records history <pack> <hex FormID> [--data DIR] [--json]"
+        "usage: inhouse-records history <pack> <000123:Owner.esm> [--json]"
     );
     let pack = PathBuf::from(&args[0]);
-    let id = args[1].to_string_lossy();
-    let id = u32::from_str_radix(id.trim_start_matches("0x").trim_start_matches("0X"), 16)?;
-    let mut data = None;
-    let mut json = false;
-    let mut cursor = 2;
-    while cursor < args.len() {
-        if args[cursor] == "--json" {
-            json = true;
-            cursor += 1;
-        } else if args[cursor] == "--data" && cursor + 1 < args.len() {
-            data = Some(PathBuf::from(&args[cursor + 1]));
-            cursor += 2;
-        } else {
-            color_eyre::eyre::bail!("unknown or incomplete history option");
+    let id = args[1]
+        .to_string_lossy()
+        .parse::<shared::form_key::NamedFormKey>()?;
+    let json = args[2..].iter().any(|arg| arg == "--json");
+    ensure!(
+        args[2..].iter().all(|arg| arg == "--json"),
+        "native history accepts --json; use history-source for original payload access"
+    );
+    let database = if pack.is_file() {
+        pack
+    } else {
+        pack.join("skyrim_world.db")
+    };
+    let report = converter::records::history::read_native_chain(&database, &id)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"schema_version":2,"history":report})
+            )?
+        );
+    } else {
+        println!(
+            "Record {} ({} versions{})",
+            report.form_id,
+            report.total_versions,
+            if report.truncated { "; truncated" } else { "" }
+        );
+        for version in report.versions {
+            println!(
+                "{}: {} source_word={:08X} offset={} {}{}{}",
+                version.chain_position,
+                version.plugin,
+                version.source_form_id,
+                version.source_record_offset,
+                version.status,
+                if version.deleted { " deleted" } else { "" },
+                if version.winner { " winner" } else { "" }
+            );
         }
     }
-    let report = converter::records::history::read_history(&pack, data.as_deref(), id)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Portable recovery events are paired with the same authenticated record history scope.
+fn native_diagnostics(args: &[std::ffi::OsString]) -> Result<()> {
+    ensure!(
+        args.len() == 2,
+        "usage: inhouse-records diagnostics <pack> <000123:Owner.esm>"
+    );
+    let pack = PathBuf::from(&args[0]);
+    let database = if pack.is_file() {
+        pack
     } else {
-        print!("{}", converter::records::history::display(&report));
-    }
+        pack.join("skyrim_world.db")
+    };
+    let named = args[1]
+        .to_string_lossy()
+        .parse::<shared::form_key::NamedFormKey>()?;
+    let report = converter::records::diagnostics::read_native_for_form(&database, &named)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &serde_json::json!({"schema_version":2,"diagnostics":report})
+        )?
+    );
     Ok(())
 }

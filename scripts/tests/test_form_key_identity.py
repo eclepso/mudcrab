@@ -44,8 +44,10 @@ class IdentityTests(unittest.TestCase):
                     IDENTITY.PackIdentity(database)
 
     def test_old_world_and_numeric_documents_require_regeneration(self):
+        database = sqlite3.connect(":memory:")
+        self.addCleanup(database.close)
         with self.assertRaisesRegex(ValueError, "convert again"):
-            IDENTITY.PackIdentity(sqlite3.connect(":memory:"))
+            IDENTITY.PackIdentity(database)
         for value in (60, 73014446780, "73014446780", "3c:../Skyrim.esm"):
             with self.assertRaises(ValueError):
                 IDENTITY.named(value)

@@ -127,6 +127,7 @@ pub struct RecordDiff {
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
+    pub schema_version: u32,
     /// Explicit limits on what this output establishes.
     pub diagnostic_notice: String,
     pub tables: BTreeMap<String, TableDiff>,
@@ -156,9 +157,28 @@ pub fn compare(legacy_path: &Path, inhouse_path: &Path, options: &Options) -> Re
     };
     let legacy = open(legacy_path)?;
     let inhouse = open(inhouse_path)?;
+    #[cfg(not(test))]
+    let native = true;
+    #[cfg(test)]
+    let native: bool = legacy.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='pack_identity')",
+        [],
+        |row| row.get(0),
+    )?;
+    if native {
+        shared::world_assets::install_runtime_identity_functions(&legacy)?;
+        shared::world_assets::install_runtime_identity_functions(&inhouse)?;
+    }
+    let legacy_context = native
+        .then(|| shared::records::RecordContextReader::new(&legacy))
+        .transpose()?;
+    let inhouse_context = native
+        .then(|| shared::records::RecordContextReader::new(&inhouse))
+        .transpose()?;
     let legacy_tables = tables(&legacy)?;
     let inhouse_tables = tables(&inhouse)?;
     let mut report = Report {
+        schema_version: 2,
         diagnostic_notice: DIAGNOSTIC_NOTICE.to_owned(),
         tables_only_legacy: legacy_tables.difference(&inhouse_tables).cloned().collect(),
         tables_only_inhouse: inhouse_tables.difference(&legacy_tables).cloned().collect(),
@@ -167,10 +187,18 @@ pub fn compare(legacy_path: &Path, inhouse_path: &Path, options: &Options) -> Re
     for table in legacy_tables.intersection(&inhouse_tables) {
         report.tables.insert(
             table.clone(),
-            compare_table(&legacy, &inhouse, table, options)?,
+            compare_table(&legacy, &inhouse, table, options, native)?,
         );
     }
-    report.records = compare_records(&legacy, legacy_path, &inhouse, inhouse_path, options)?;
+    report.records = compare_records(
+        &legacy,
+        legacy_path,
+        &inhouse,
+        inhouse_path,
+        options,
+        legacy_context.as_ref(),
+        inhouse_context.as_ref(),
+    )?;
     Ok(report)
 }
 
@@ -279,11 +307,17 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn identity_column(table: &str, column: &str) -> bool {
+    crate::esm::form_key_world::identity_column(table, column)
+        || matches!(column, "record_key" | "target_key")
+}
+
 fn compare_table(
     legacy: &Connection,
     inhouse: &Connection,
     table: &str,
     options: &Options,
+    native: bool,
 ) -> Result<TableDiff> {
     let (legacy_columns, legacy_key) = columns(legacy, table)?;
     let (inhouse_columns, inhouse_key) = columns(inhouse, table)?;
@@ -333,7 +367,14 @@ fn compare_table(
     let select = key
         .iter()
         .chain(&compared)
-        .map(|name| quote(name))
+        .map(|name| {
+            let quoted = quote(name);
+            if native && identity_column(table, name) {
+                format!("lower(named_key({quoted})) AS {quoted}")
+            } else {
+                quoted
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let order = key
@@ -421,21 +462,57 @@ fn push(samples: &mut Vec<String>, options: &Options, sample: impl FnOnce() -> S
 
 /// One canonical record row.
 struct RecordRow {
-    form_id: u32,
+    form_id: String,
     record_type: String,
-    cell_id: Option<u32>,
-    worldspace_id: Option<u32>,
-    load_order: u32,
+    cell_id: Option<String>,
+    worldspace_id: Option<String>,
+    load_order: String,
     subrecords: Vec<([u8; 4], Vec<u8>)>,
 }
 
-fn record_rows(conn: &Connection) -> Result<rusqlite::Statement<'_>> {
-    Ok(conn.prepare(
-        "SELECT form_id, record_type, cell_id, worldspace_id, load_order, data FROM records ORDER BY form_id",
-    )?)
+fn record_rows(conn: &Connection, native: bool) -> Result<rusqlite::Statement<'_>> {
+    let sql = if native {
+        "SELECT lower(named_key(form_id)),record_type,lower(named_key(cell_id)),lower(named_key(worldspace_id)),(SELECT normalized_name FROM pack_plugins WHERE supplier_priority=records.load_order),form_id FROM records ORDER BY lower(named_key(form_id))"
+    } else {
+        "SELECT form_id,record_type,cell_id,worldspace_id,load_order,data FROM records ORDER BY form_id"
+    };
+    Ok(conn.prepare(sql)?)
 }
 
-fn decode_row(row: &rusqlite::Row<'_>, path: &Path) -> rusqlite::Result<RecordRow> {
+fn decode_row(
+    row: &rusqlite::Row<'_>,
+    path: &Path,
+    context: Option<&shared::records::RecordContextReader<'_>>,
+) -> rusqlite::Result<RecordRow> {
+    if let Some(context) = context {
+        let value: i64 = row.get(5)?;
+        let record = context
+            .identity()
+            .required_key(value)
+            .and_then(|key| context.record(key))
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!(
+                        "{}: invalid paired records.data: {error}",
+                        path.display()
+                    ))),
+                )
+            })?;
+        return Ok(RecordRow {
+            form_id: row.get(0)?,
+            record_type: row.get(1)?,
+            cell_id: row.get(2)?,
+            worldspace_id: row.get(3)?,
+            load_order: row.get(4)?,
+            subrecords: record
+                .subrecords
+                .into_iter()
+                .map(|field| (field.tag, field.data))
+                .collect(),
+        });
+    }
     let form_id: u32 = row.get(0)?;
     let data: Vec<u8> = row.get(5)?;
     let subrecords = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&data)
@@ -443,28 +520,29 @@ fn decode_row(row: &rusqlite::Row<'_>, path: &Path) -> rusqlite::Result<RecordRo
             record
                 .subrecords
                 .into_iter()
-                .map(|sub| (sub.tag, sub.data))
+                .map(|field| (field.tag, field.data))
                 .collect()
         })
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 5,
                 rusqlite::types::Type::Blob,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "{}: record {form_id:08X} has invalid records.data archive: {error}",
-                        path.display()
-                    ),
-                )),
+                Box::new(std::io::Error::other(format!(
+                    "{}: record {form_id:08X} has invalid records.data archive: {error}",
+                    path.display()
+                ))),
             )
         })?;
     Ok(RecordRow {
-        form_id,
+        form_id: format!("{form_id:08X}"),
         record_type: row.get(1)?,
-        cell_id: row.get(2)?,
-        worldspace_id: row.get(3)?,
-        load_order: row.get(4)?,
+        cell_id: row
+            .get::<_, Option<u32>>(2)?
+            .map(|word| format!("{word:08X}")),
+        worldspace_id: row
+            .get::<_, Option<u32>>(3)?
+            .map(|word| format!("{word:08X}")),
+        load_order: row.get::<_, u32>(4)?.to_string(),
         subrecords,
     })
 }
@@ -487,12 +565,16 @@ fn compare_records(
     inhouse: &Connection,
     inhouse_path: &Path,
     options: &Options,
+    legacy_context: Option<&shared::records::RecordContextReader<'_>>,
+    inhouse_context: Option<&shared::records::RecordContextReader<'_>>,
 ) -> Result<RecordDiff> {
     let mut diff = RecordDiff::default();
-    let mut legacy_statement = record_rows(legacy)?;
-    let mut inhouse_statement = record_rows(inhouse)?;
-    let mut legacy_rows = legacy_statement.query_map([], |row| decode_row(row, legacy_path))?;
-    let mut inhouse_rows = inhouse_statement.query_map([], |row| decode_row(row, inhouse_path))?;
+    let mut legacy_statement = record_rows(legacy, legacy_context.is_some())?;
+    let mut inhouse_statement = record_rows(inhouse, inhouse_context.is_some())?;
+    let mut legacy_rows =
+        legacy_statement.query_map([], |row| decode_row(row, legacy_path, legacy_context))?;
+    let mut inhouse_rows =
+        inhouse_statement.query_map([], |row| decode_row(row, inhouse_path, inhouse_context))?;
     let mut left = legacy_rows.next().transpose()?;
     let mut right = inhouse_rows.next().transpose()?;
     let record = |diff: &mut RecordDiff,
@@ -504,7 +586,7 @@ fn compare_records(
         bucket.count += 1;
         if bucket.samples.len() < options.samples {
             bucket.samples.push(Sample {
-                key: format!("{:08X}", row.form_id),
+                key: row.form_id.clone(),
                 legacy,
                 inhouse,
             });
@@ -554,7 +636,7 @@ fn compare_records(
                         format!("plugin {}", a.load_order),
                         format!("plugin {}", b.load_order),
                     );
-                } else if (a.cell_id, a.worldspace_id) != (b.cell_id, b.worldspace_id) {
+                } else if (&a.cell_id, &a.worldspace_id) != (&b.cell_id, &b.worldspace_id) {
                     record(
                         &mut diff,
                         RecordClass::CellOrWorldspace,
@@ -583,7 +665,7 @@ fn compare_records(
                         bucket.count += 1;
                         if bucket.samples.len() < options.samples {
                             bucket.samples.push(Sample {
-                                key: format!("{:08X}", a.form_id),
+                                key: a.form_id.clone(),
                                 legacy: legacy_bytes.map_or("-".into(), |bytes| show_field(&bytes)),
                                 inhouse: inhouse_bytes
                                     .map_or("-".into(), |bytes| show_field(&bytes)),
@@ -747,6 +829,91 @@ pub fn summary(report: &Report) -> String {
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    /// Authored allocations differ while supplier order and source record identity agree.
+    fn native_database(path: &Path, reverse: bool) {
+        use shared::{
+            form_key::PluginId,
+            plugin_table::{PluginEntry, PluginFacts, PluginTable},
+        };
+        let owners = if reverse {
+            ["Zulu.esm", "Alpha.esm"]
+        } else {
+            ["Alpha.esm", "Zulu.esm"]
+        };
+        let table = PluginTable::from_entries(
+            owners
+                .iter()
+                .enumerate()
+                .map(|(index, name)| PluginEntry {
+                    id: PluginId::new(index as u32 + 1).unwrap(),
+                    normalized_name: name.to_lowercase(),
+                    display_name: (*name).into(),
+                    loaded: true,
+                    facts: PluginFacts {
+                        content_hash: Some([7; 32]),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+        )
+        .unwrap();
+        let zulu = table.id("Zulu.esm").unwrap();
+        let alpha = table.id("Alpha.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![zulu, alpha]).unwrap();
+        let key = shared::form_key::FormKey::new(zulu, 0x1234).unwrap();
+        let mut conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB);").unwrap();
+        let tx = conn.transaction().unwrap();
+        shared::records::create_record_context(&tx, &identity).unwrap();
+        tx.execute(
+            "INSERT INTO records VALUES(?1,'STAT',NULL,NULL,0,?2)",
+            params![key.to_sql_i64(), empty_record_archive()],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO record_context VALUES(?1,?2,4660,NULL,NULL,0)",
+            params![key.to_sql_i64(), zulu.get()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn current_diff_compares_names_across_distinct_allocations() {
+        let root = tempfile::tempdir().unwrap();
+        let left = root.path().join("left.db");
+        let right = root.path().join("right.db");
+        native_database(&left, false);
+        native_database(&right, true);
+        let report = compare(&left, &right, &Options::default()).unwrap();
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.records.identical, 1);
+        assert_eq!(report.tables["records"].only_legacy, 0);
+        assert_eq!(report.tables["records"].differing_rows, 0);
+        let conn = Connection::open(&right).unwrap();
+        conn.execute("UPDATE records SET record_type='MISC'", [])
+            .unwrap();
+        let report = compare(&left, &right, &Options::default()).unwrap();
+        let sample = &report.records.records["record_type"]["STAT"].samples[0];
+        assert_eq!(sample.key, "001234:zulu.esm");
+    }
+
+    #[test]
+    fn current_diff_refuses_unpaired_canonical_blobs() {
+        let root = tempfile::tempdir().unwrap();
+        let left = root.path().join("left.db");
+        let right = root.path().join("right.db");
+        native_database(&left, false);
+        native_database(&right, false);
+        let conn = Connection::open(&right).unwrap();
+        conn.execute(
+            "UPDATE canonical_record_contract SET identity_digest=zeroblob(32)",
+            [],
+        )
+        .unwrap();
+        assert!(compare(&left, &right, &Options::default()).is_err());
+    }
 
     fn fields(list: &[(&[u8; 4], &[u8])]) -> Vec<([u8; 4], Vec<u8>)> {
         list.iter()

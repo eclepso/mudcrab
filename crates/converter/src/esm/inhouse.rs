@@ -1,10 +1,10 @@
 //! Adapt schema-decoded fields to the established runtime projections.
 //! Source payloads remain separate from resolved canonical projection fields.
 
+use crate::{config::RecordReader, esm::RecordConversion, records};
+#[cfg(test)]
 use crate::{
-    config::RecordReader,
     esm::{
-        RecordConversion,
         cell_cache::validate_inhouse_land,
         exporter::{
             create_tables, export_inhouse_record_archive_to_db, export_inhouse_to_db,
@@ -13,15 +13,21 @@ use crate::{
         load_order::LoadOrder,
         records::RawRecord,
     },
-    records::{self, Value},
+    records::Value,
 };
 use color_eyre::Result;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
+#[cfg(test)]
+use rusqlite::params;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
+};
+
+#[cfg(test)]
+use std::{
+    io::{BufWriter, Write},
     time::Instant,
 };
 
@@ -161,6 +167,7 @@ impl DatabaseProfile {
         }
     }
 
+    #[cfg(test)]
     fn elapsed(&mut self, phase: &str, started: Instant) {
         self.elapsed_seconds
             .insert(phase.to_owned(), started.elapsed().as_secs_f64());
@@ -314,7 +321,8 @@ pub fn export_record_bundle_typed_with_options(
             "database work directory must be separate from the record bundle output"
         );
     }
-    let plugins = crate::esm::read_plugins_txt(plugins_file, data)?;
+    let plugins =
+        super::plugins_txt::read_form_key_plugins_with_options(plugins_file, data, None, None)?;
     fs::create_dir(output)?;
     if mode == RecordBundleMode::RecordArchiveOnly {
         write_record_archive_scope(output, false, signatures)?;
@@ -555,6 +563,7 @@ pub(crate) fn localized_string_paths(plugins: &[PathBuf], language: &str) -> BTr
 
 /// Bounded summaries accompany disk-backed details for every adapter observation.
 #[derive(Default)]
+#[cfg(test)]
 struct Warnings {
     summary: BTreeMap<String, (u64, String)>,
     summary_keys: BTreeMap<String, records::DiagnosticSummaryKey>,
@@ -563,6 +572,7 @@ struct Warnings {
     logs: BTreeMap<String, records::diagnostics::EventLog>,
 }
 
+#[cfg(test)]
 impl Warnings {
     /// Journal each issue and retain the smallest bounded provenance example per plugin.
     fn skipped(
@@ -632,6 +642,7 @@ impl Warnings {
 }
 
 /// Identify an adapter observation without retaining another payload or typed record.
+#[cfg(test)]
 fn adapter_context(
     record: &records::DecodedRecord,
     stage: &'static str,
@@ -651,6 +662,7 @@ fn adapter_context(
 }
 
 /// A localized occurrence keeps its original key separately from safe runtime text.
+#[cfg(test)]
 struct LocalizedField {
     form_id: u32,
     field_index: usize,
@@ -673,6 +685,7 @@ pub(crate) fn terrain_source_offsets(db_path: &Path) -> Result<HashMap<u32, u64>
 }
 
 /// Read every normalized native layer and remapped source key, including excess runtime layers.
+#[cfg(test)]
 pub(crate) fn terrain_preserved_layers(
     db_path: &Path,
 ) -> Result<HashMap<u32, Vec<shared::TerrainLayer>>> {
@@ -694,6 +707,7 @@ pub(crate) fn terrain_preserved_layers(
 
 /// Clear unresolved texture keys without dropping their layers or blend weights.
 /// The runtime cache writer applies its capacity after receiving this complete projection.
+#[cfg(test)]
 pub(crate) fn terrain_runtime_layers(
     db_path: &Path,
     preserved: &HashMap<u32, Vec<shared::TerrainLayer>>,
@@ -745,6 +759,7 @@ pub(crate) fn write_database_profile(
 }
 
 /// Share source-order and layer preservation across conversion, diagnostics and metadata rebuild.
+#[cfg(test)]
 pub(crate) fn write_terrain_caches(
     records: &HashMap<u32, RawRecord>,
     db_path: &Path,
@@ -820,6 +835,7 @@ pub(crate) fn convert_plugins_with_string_sources_report(
 }
 
 /// Diagnostic export shares the exact decoder, winner and text lookup paths with publication.
+#[cfg(test)]
 fn convert_plugins_with_dump(
     plugin_paths: &[PathBuf],
     db_path: &Path,
@@ -831,6 +847,7 @@ fn convert_plugins_with_dump(
 }
 
 /// Preserve legacy entry points while threading one schema snapshot through all passes.
+#[cfg(test)]
 fn convert_plugins_with_dump_and_schemas(
     plugin_paths: &[PathBuf],
     db_path: &Path,
@@ -852,6 +869,7 @@ fn convert_plugins_with_dump_and_schemas(
 }
 
 /// Keep synthetic schema selection private to tests of the real publication path.
+#[cfg(test)]
 fn convert_plugins_with_dump_impl(
     plugin_paths: &[PathBuf],
     db_path: &Path,
@@ -874,6 +892,7 @@ fn convert_plugins_with_dump_impl(
 }
 
 /// Preserve map-returning diagnostic/test entry points while sharing warning collection.
+#[cfg(test)]
 fn convert_plugins_with_text_sources_impl(
     plugin_paths: &[PathBuf],
     db_path: &Path,
@@ -899,6 +918,7 @@ fn convert_plugins_with_text_sources_impl(
 /// Return published records and summaries by severity without changing recovery semantics.
 /// Auxiliary SQL maps use unsigned legacy owner identity order; authored layer lists
 /// and the winning supplier metadata retain their original order and meaning.
+#[cfg(test)]
 fn convert_plugins_with_text_sources_report_impl(
     plugin_paths: &[PathBuf],
     db_path: &Path,
@@ -1369,6 +1389,7 @@ fn convert_plugins_with_text_sources_report_impl(
 
 /// Free reader-only header/override lookups after winners and observation are finalized.
 /// Physical history, raw winning payloads and diagnostics remain for their SQL pass.
+#[cfg(test)]
 fn release_reader_metadata(decoded: &mut records::ReadResult) {
     drop(std::mem::take(&mut decoded.headers));
     drop(std::mem::take(&mut decoded.overrides));
@@ -1394,6 +1415,7 @@ fn validate_candidate(
 
 /// Validate the same runtime text and opaque selection before merge replaces a predecessor.
 /// Localization failures retain the established empty-text policy and remain record-local.
+#[cfg(test)]
 fn validate_candidate_with_string_sources(
     record: &records::DecodedRecord,
     prepared: &records::PreparedSchemas,
@@ -1459,6 +1481,7 @@ fn validate_candidate_with_string_sources(
 }
 
 /// Keep candidate admission and the final defensive check on one validator contract.
+#[cfg(test)]
 fn validate_runtime_record(record: &RawRecord) -> std::result::Result<(), String> {
     validate_inhouse_record(record).map_err(|error| error.to_string())?;
     if record.record_type == *b"LAND" {
@@ -1469,6 +1492,7 @@ fn validate_runtime_record(record: &RawRecord) -> std::result::Result<(), String
 
 /// Publish every accepted reader source, including any exceptional final projection rejection.
 /// History uses these rows for its winner catalogue; each payload can then be dropped.
+#[cfg(test)]
 fn write_source_records(
     conn: &Connection,
     records: &mut HashMap<u32, records::DecodedRecord>,
@@ -1486,6 +1510,7 @@ fn write_source_records(
 }
 
 /// One temporarily hidden occurrence retains its original position and exact owned buffers.
+#[cfg(test)]
 struct OmittedSubrecord {
     index: usize,
     signature: Vec<u8>,
@@ -1493,12 +1518,14 @@ struct OmittedSubrecord {
 }
 
 /// Move only tuple ownership for validation; restoration also runs during unwinding.
+#[cfg(test)]
 struct RuntimeFieldSelection<'a> {
     record: &'a mut RawRecord,
     omitted: Vec<OmittedSubrecord>,
     original_len: usize,
 }
 
+#[cfg(test)]
 impl<'a> RuntimeFieldSelection<'a> {
     /// Preserve selected byte allocations while temporarily hiding opaque occurrences.
     fn new(record: &'a mut RawRecord, omitted: &BTreeSet<usize>) -> Self {
@@ -1525,6 +1552,7 @@ impl<'a> RuntimeFieldSelection<'a> {
     }
 }
 
+#[cfg(test)]
 impl Drop for RuntimeFieldSelection<'_> {
     /// Restore the canonical occurrence order without copying any signature or payload.
     fn drop(&mut self) {
@@ -1544,6 +1572,7 @@ impl Drop for RuntimeFieldSelection<'_> {
 }
 
 /// Validate a runtime selection and restore canonical ownership before any result escapes.
+#[cfg(test)]
 fn with_filtered_record<T>(
     record: &mut RawRecord,
     omitted: Option<&BTreeSet<usize>>,
@@ -1560,6 +1589,7 @@ fn with_filtered_record<T>(
 
 /// Move canonical buffers only after selected typed serialization has completed.
 /// Source payload, identity, provenance and rejection metadata survive for the existing SQL pass.
+#[cfg(test)]
 fn take_canonical_record(record: &mut records::DecodedRecord) -> RawRecord {
     let fields = std::mem::take(&mut record.fields);
     RawRecord {
@@ -1578,6 +1608,7 @@ fn take_canonical_record(record: &mut records::DecodedRecord) -> RawRecord {
 
 /// One lazily loaded string bank shared by candidate admission and final publication.
 /// Deferred warning publication avoids reporting banks from discarded candidates twice.
+#[cfg(test)]
 struct RuntimeTextTable {
     values: HashMap<u32, String>,
     error: Option<String>,
@@ -1592,6 +1623,7 @@ pub(crate) struct ParsedTextTable {
 }
 
 /// Load the same authoritative loose/VFS snapshot once; an unreadable bank remains unresolved.
+#[cfg(test)]
 fn runtime_text_table<'a>(
     tables: &'a mut HashMap<(usize, String), RuntimeTextTable>,
     priority: usize,
@@ -1622,6 +1654,7 @@ fn runtime_text_table<'a>(
 }
 
 /// Share authoritative localized-bank selection across admission and publication.
+#[cfg(test)]
 fn localized_bank(
     prepared: &records::PreparedSchemas,
     record_type: [u8; 4],
@@ -1641,6 +1674,7 @@ fn localized_bank(
 }
 
 /// A zero localized key stays null even when an invalid table gives it a value.
+#[cfg(test)]
 pub(crate) fn localized_text(id: u32, table: &HashMap<u32, String>) -> Option<&str> {
     if id == 0 {
         None
@@ -1651,6 +1685,7 @@ pub(crate) fn localized_text(id: u32, table: &HashMap<u32, String>) -> Option<&s
 
 /// Use the same decoded inline text in candidate validation and final publication.
 /// Field indices follow both raw projections; localized keys use the shared bank lookup.
+#[cfg(test)]
 fn decoded_text_updates(record: &records::DecodedRecord) -> Vec<(usize, Vec<u8>)> {
     record
         .fields
@@ -1668,6 +1703,7 @@ fn decoded_text_updates(record: &records::DecodedRecord) -> Vec<(usize, Vec<u8>)
 /// Encode decoded text for the shared runtime extractor without changing original source bytes.
 /// Typed Windows-1252 decoding owns ordinary text; runtime bytes are UTF-8 with one NUL.
 /// A fixed-width ASCII code stored without a terminator keeps its exact source width.
+#[cfg(test)]
 fn runtime_text(text: &str, source: &[u8]) -> Option<Vec<u8>> {
     (!(text.is_ascii() && source == text.as_bytes())).then(|| runtime_string(text))
 }

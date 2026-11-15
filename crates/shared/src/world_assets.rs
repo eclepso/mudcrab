@@ -10,6 +10,13 @@ pub fn install_runtime_identity_functions(
     connection: &Connection,
 ) -> Result<std::sync::Arc<crate::pack_identity::PackIdentity>> {
     use rusqlite::functions::FunctionFlags;
+    let version: u32 = connection
+        .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
+        .wrap_err("world database has no valid schema version; convert again")?;
+    color_eyre::eyre::ensure!(
+        crate::supports_runtime_world_database_schema(version),
+        "world database schema {version} is unsupported; convert again"
+    );
     let identity = std::sync::Arc::new(
         crate::pack_identity::PackIdentity::read_sql(connection)
             .wrap_err("world identity is unavailable; convert again")?,
@@ -83,6 +90,7 @@ pub fn install_runtime_identity_functions_sql(
 
 /// Authenticate a runtime cache's envelope and wire keys using its adjacent world allocation.
 pub fn validate_runtime_cell_cache(assets_dir: &Path) -> Result<()> {
+    validate_world_database(&assets_dir.join("skyrim_world.db"))?;
     let connection = Connection::open_with_flags(
         assets_dir.join("skyrim_world.db"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,

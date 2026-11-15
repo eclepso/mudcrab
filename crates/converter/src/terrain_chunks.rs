@@ -175,6 +175,7 @@ pub fn write_terrain_chunks(
     output_root: &Path,
     cells: Vec<PlacedCellMesh>,
 ) -> Result<ChunkWriteReport> {
+    shared::world_assets::validate_world_database(&output_root.join("skyrim_world.db"))?;
     let database = rusqlite::Connection::open_with_flags(
         output_root.join("skyrim_world.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -298,6 +299,7 @@ pub fn read_terrain_chunk(path: &Path) -> Result<TerrainChunkFile> {
         .ancestors()
         .find(|root| root.join("skyrim_world.db").is_file())
         .ok_or_else(|| eyre!("terrain chunk has no world allocation; convert again"))?;
+    shared::world_assets::validate_world_database(&root.join("skyrim_world.db"))?;
     let database = rusqlite::Connection::open_with_flags(
         root.join("skyrim_world.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -399,6 +401,13 @@ mod tests {
         let owner = table.id("Fixture.esm").unwrap();
         let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
         let mut db = rusqlite::Connection::open(root.join("skyrim_world.db")).unwrap();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO schema_info SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM schema_info)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )
+        .unwrap();
         let tx = db.transaction().unwrap();
         identity.write_sql(&tx).unwrap();
         tx.commit().unwrap();

@@ -51,9 +51,7 @@ fn first_link(record: &ContextualRecord, tag: [u8; 4]) -> Result<Option<FormKey>
 
 /// Decode the bounded native text prefix without interpreting any identity bytes as text.
 fn text(record: &ContextualRecord, tag: [u8; 4]) -> Option<String> {
-    let bytes = record.bytes(tag)?;
-    let bytes = bytes.split(|byte| *byte == 0).next()?;
-    (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned())
+    record.text(tag).filter(|text| !text.is_empty())
 }
 
 /// Follow only admitted NPC templates, preserving the existing Use Inventory cycle policy.

@@ -403,6 +403,8 @@ impl TerrainMerge {
 
 /// Authenticate the world's immutable allocation for identity-bearing terrain members.
 fn world_identity(root: &Path) -> Result<shared::pack_identity::PackIdentity, String> {
+    shared::world_assets::validate_world_database(&root.join("skyrim_world.db"))
+        .map_err(|error| format!("{error:#}"))?;
     let database = rusqlite::Connection::open_with_flags(
         root.join("skyrim_world.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -870,6 +872,15 @@ mod tests {
         let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
         if let Some(root) = root {
             let mut connection = rusqlite::Connection::open(root.join("skyrim_world.db")).unwrap();
+            connection
+                .execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER)")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_info SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM schema_info)",
+                    [shared::WORLD_DATABASE_SCHEMA_VERSION],
+                )
+                .unwrap();
             let tx = connection.transaction().unwrap();
             identity.write_sql(&tx).unwrap();
             tx.commit().unwrap();

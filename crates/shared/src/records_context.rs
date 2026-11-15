@@ -22,7 +22,7 @@ pub fn create_record_context(tx: &Transaction<'_>, identity: &PackIdentity) -> R
         CREATE TABLE record_field_origins(record_key INTEGER NOT NULL REFERENCES records(form_id),canonical_ordinal INTEGER NOT NULL,source_ordinal INTEGER NOT NULL,signature BLOB NOT NULL CHECK(length(signature)=4),runtime_usable INTEGER NOT NULL CHECK(runtime_usable IN (0,1)),PRIMARY KEY(record_key,canonical_ordinal),UNIQUE(record_key,source_ordinal));
         CREATE TABLE record_source_fields(record_key INTEGER NOT NULL REFERENCES records(form_id),source_ordinal INTEGER NOT NULL,signature BLOB NOT NULL CHECK(length(signature)=4),data BLOB NOT NULL,PRIMARY KEY(record_key,source_ordinal));
         CREATE TABLE resolved_links(record_key INTEGER NOT NULL,source_ordinal INTEGER NOT NULL,byte_offset INTEGER NOT NULL,source_word INTEGER NOT NULL,target_key INTEGER,outcome TEXT NOT NULL CHECK(outcome IN ('resolved','null','cleared')),PRIMARY KEY(record_key,source_ordinal,byte_offset),FOREIGN KEY(record_key,source_ordinal) REFERENCES record_source_fields(record_key,source_ordinal));")?;
-    tx.execute_batch("CREATE TABLE record_text(record_key INTEGER NOT NULL REFERENCES records(form_id),source_ordinal INTEGER NOT NULL,text TEXT,PRIMARY KEY(record_key,source_ordinal));")?;
+    tx.execute_batch("CREATE TABLE land_context(cell_key INTEGER PRIMARY KEY,record_key INTEGER NOT NULL REFERENCES records(form_id)); CREATE TABLE record_text(record_key INTEGER NOT NULL REFERENCES records(form_id),source_ordinal INTEGER NOT NULL,text TEXT,PRIMARY KEY(record_key,source_ordinal));")?;
     tx.execute(
         "INSERT INTO canonical_record_contract VALUES(1,?1,?2)",
         params![RECORD_CONTEXT_VERSION, identity.digest().as_slice()],
@@ -144,6 +144,17 @@ impl<'a> RecordContextReader<'a> {
     pub fn identity(&self) -> &PackIdentity {
         &self.identity
     }
+    /// Resolve the winning LAND context before interpreting its native VTEX bytes.
+    pub fn land(&self, cell: FormKey) -> Result<ContextualRecord> {
+        self.identity.required_key(cell.to_sql_i64())?;
+        let land: i64 = self.connection.query_row(
+            "SELECT record_key FROM land_context WHERE cell_key=?1",
+            [cell.to_sql_i64()],
+            |row| row.get(0),
+        )?;
+        self.record(self.identity.required_key(land)?)
+    }
+
     /// Restore native bytes, source origins and explicitly resolved semantic outcomes together.
     pub fn record(&self, key: FormKey) -> Result<ContextualRecord> {
         self.identity.required_key(key.to_sql_i64())?;

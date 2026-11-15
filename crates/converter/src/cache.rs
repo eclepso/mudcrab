@@ -14,8 +14,8 @@ use std::{
 #[path = "cache/rv_b_tests.rs"]
 mod rv_b_tests;
 
-// Combined native-BC, lighting, LOD, TXST and XESP producer. Earlier numeric identities
-// alone do not establish compatible output semantics.
+// Paired FormKey world and sidecar producer. Earlier numeric identities alone cannot
+// establish compatible output semantics.
 pub const CONVERTER_SCHEMA_VERSION: u32 = shared::LOD_CONVERTER_SCHEMA_VERSION;
 
 /// Provenance journal the converter keeps inside a staging directory.

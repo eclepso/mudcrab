@@ -99,7 +99,7 @@ pub struct FormKeyConversion {
     pub notices: Vec<String>,
 }
 
-/// Explicit result of requesting the unchanged u32 writer after cap-free native resolution.
+/// Historical API result name. Publication now always uses the contextual native writer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LegacyWriterOutcome {
     Published,
@@ -120,24 +120,33 @@ impl EsmParser {
         Self::convert_form_key_plugins(&paths, database)
     }
 
-    /// Run native FormKey resolution and request the legacy writer only when all owners fit.
-    /// Extended orders retain their complete native winner set and leave the destination untouched.
+    /// Publish the complete native contextual generation without any legacy slot-cap gate.
     pub fn convert_form_key_plugins(
         paths: &[PathBuf],
         database: &std::path::Path,
     ) -> Result<(FormKeyConversion, LegacyWriterOutcome)> {
-        let conversion = Self::merge_plugins_form_keys(paths)?;
-        if let Some(notice) = conversion.order.notice() {
-            eprintln!("notice: {notice}");
-            return Ok((conversion, LegacyWriterOutcome::Unavailable { notice }));
-        }
-        Self::convert_plugins(paths, database)?;
+        let root = database
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut converted = super::form_key_world::convert(
+            paths,
+            database,
+            crate::config::RecordReader::Legacy,
+            super::inhouse::StringSources::default_language(
+                super::inhouse::StringRoots::PluginLooseFirst(root),
+            ),
+            None,
+        )?;
+        let conversion = converted
+            .native
+            .take()
+            .ok_or_else(|| color_eyre::eyre::eyre!("native writer lost its FormKey context"))?;
         Ok((conversion, LegacyWriterOutcome::Published))
     }
 
     /// Resolve native records before packing, retaining every accepted plugin beyond legacy limits.
     /// Inputs must be in their recovered load order; this API neither selects nor reorders plugins.
-    /// The old writer remains a separate checked boundary; no stand-in numbers are allocated.
+    /// Source words stay native; no runtime or stand-in numbers are allocated.
     pub fn merge_plugins_form_keys(paths: &[PathBuf]) -> Result<FormKeyConversion> {
         let (accepted_paths, name_warnings) = super::form_keys::recover_plugin_paths(paths)?;
         let paths = accepted_paths.as_slice();

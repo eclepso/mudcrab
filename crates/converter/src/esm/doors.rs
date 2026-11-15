@@ -5,9 +5,104 @@ use rusqlite::{Connection, Result, params};
 
 /// Rebuild door links from this database's canonical winning records, atomically.
 /// Meshes, terrain, provenance and producer identities are unchanged.
-pub fn rebuild_door_links(conn: &Connection) -> Result<usize> {
+pub fn rebuild_door_links(conn: &Connection) -> color_eyre::Result<usize> {
+    use color_eyre::eyre::{WrapErr, ensure};
+    let version: u32 = conn
+        .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
+        .wrap_err("world schema is unavailable; convert again")?;
+    ensure!(
+        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "old world schema {version}; convert again"
+    );
     let tx = conn.unchecked_transaction()?;
-    let count = project_door_links(&tx)?;
+    let reader = shared::records::RecordContextReader::new(&tx)
+        .wrap_err("world native context is unavailable; convert again")?;
+    let identity = reader.identity();
+    ensure_table(&tx)?;
+    clear(&tx)?;
+    let mut sources=tx.prepare("SELECT r.id FROM \"references\" r JOIN records base ON base.form_id=r.base_form_id AND base.record_type='DOOR' JOIN records raw ON raw.form_id=r.id AND raw.record_type='REFR' ORDER BY r.id")?;
+    let mut destination=tx.prepare("SELECT c.id,c.worldspace_id,c.interior_name,w.editor_id FROM \"references\" r JOIN records base ON base.form_id=r.base_form_id AND base.record_type='DOOR' JOIN cells c ON c.id=r.cell_id LEFT JOIN worldspaces w ON w.id=c.worldspace_id WHERE r.id=?1 AND (c.worldspace_id IS NULL OR (c.grid_x IS NOT NULL AND c.grid_y IS NOT NULL))")?;
+    let mut insert=tx.prepare("INSERT INTO door_links(ref_id,destination_ref_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,destination_cell_id,destination_worldspace_id,destination_name) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
+    let mut count = 0usize;
+    let mut omitted = 0usize;
+    let mut first = None;
+    for row in sources.query_map([], |row| row.get::<_, i64>(0))? {
+        let key = identity.required_key(row?)?;
+        // Invalid persisted context is a format failure; native field omissions remain local.
+        let record = reader.record(key)?;
+        let projected = (|| -> color_eyre::Result<bool> {
+            let Some(bytes) = record.bytes(*b"XTEL") else {
+                return Ok(false);
+            };
+            ensure!(bytes.len() == 32, "invalid XTEL arrival layout");
+            let Some(target) = record.first_link(*b"XTEL", 0)? else {
+                return Ok(false);
+            };
+            let mut arrival = [0f32; 6];
+            for (value, word) in arrival.iter_mut().zip(bytes[4..28].chunks_exact(4)) {
+                *value = f32::from_le_bytes(word.try_into()?);
+            }
+            ensure!(
+                arrival.iter().all(|value| value.is_finite()),
+                "nonfinite XTEL arrival frame"
+            );
+            let mut targets = destination.query([target.to_sql_i64()])?;
+            let Some(target_row) = targets.next()? else {
+                return Ok(false);
+            };
+            let cell = identity.required_key(target_row.get(0)?)?;
+            let world = identity.optional_key(target_row.get(1)?)?;
+            let editor_name: Option<String> = target_row.get(2)?;
+            let world_name: Option<String> = target_row.get(3)?;
+            let name = if world.is_some() {
+                world_name
+            } else {
+                reader
+                    .record(cell)
+                    .ok()
+                    .and_then(|record| record.text(*b"FULL"))
+                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                    .or(editor_name)
+            };
+            insert.execute(params![
+                key.to_sql_i64(),
+                target.to_sql_i64(),
+                arrival[0],
+                arrival[1],
+                arrival[2],
+                arrival[3],
+                arrival[4],
+                arrival[5],
+                cell.to_sql_i64(),
+                world.map(shared::form_key::FormKey::to_sql_i64),
+                name
+            ])?;
+            Ok(true)
+        })();
+        match projected {
+            Ok(true) => count += 1,
+            Ok(false) => {}
+            Err(error) => {
+                omitted += 1;
+                first.get_or_insert_with(|| {
+                    format!(
+                        "{}: {error:#}",
+                        identity.table().named(key).expect("authenticated owner")
+                    )
+                });
+            }
+        }
+    }
+    if omitted != 0 {
+        log::warn!(
+            "door projection omitted {omitted} unusable records; first {}",
+            first.as_deref().unwrap_or("unknown")
+        );
+    }
+    drop(insert);
+    drop(destination);
+    drop(sources);
+    drop(reader);
     tx.commit()?;
     Ok(count)
 }

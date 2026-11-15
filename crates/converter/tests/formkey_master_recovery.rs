@@ -280,9 +280,9 @@ fn typed_light_width_projection_retains_old_diagnostics_and_neighbors() {
     );
 }
 
-/// The native path admits every full/light owner and refuses only legacy publication.
+/// Native publication retains every full/light owner beyond both runtime slot capacities.
 #[test]
-fn extended_native_conversion_preserves_all_owners_and_unrelated_output() {
+fn extended_native_conversion_publishes_all_owners_and_preserves_unrelated_output() {
     use converter::esm::form_key_merge::LegacyWriterOutcome;
     let root = tempfile::tempdir().unwrap();
     let mut paths = Vec::new();
@@ -315,12 +315,17 @@ fn extended_native_conversion_preserves_all_owners_and_unrelated_output() {
             .unwrap();
     assert_eq!(converted.records.len(), 4352);
     assert!(converted.warnings.is_empty(), "{:?}", converted.warnings);
-    assert!(
-        matches!(outcome, LegacyWriterOutcome::Unavailable { ref notice }
-        if notice.contains("255 full / 4097 light") && notice.contains("FormKey identities remain available"))
+    assert_eq!(outcome, LegacyWriterOutcome::Published);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
+    assert_eq!(identity.order().len(), 4352);
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM records", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        4352
     );
-    assert_eq!(converted.notices.len(), 1);
-    assert!(!database.exists());
     assert_eq!(fs::read(unrelated).unwrap(), b"retained unrelated output");
     let full = converted.order.table().id("P0254.esm").unwrap();
     let light = converted.order.table().id("P4096.esl").unwrap();

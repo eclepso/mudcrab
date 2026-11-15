@@ -23,7 +23,7 @@ pub mod world_assets;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-/// Current combined database contract: corrected TXST roles and one-byte XESP flags.
+/// FormKey world generation: checked eight-byte owner/local keys and contextual native payloads.
 pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 10;
 
 /// Current Papyrus script emission ABI: case-insensitive identifiers and permissive initial states.
@@ -35,21 +35,16 @@ pub const PAPYRUS_SCRIPT_ABI_VERSION: u32 = 3;
 /// levels use exact `lcm(texel block bytes, 4)` alignment; supercompressed levels
 /// are contiguous (KTX 2.0 sections 3.7 and 3.9.7). Producer-27
 /// texture bytes keep the largest-first, 16-byte-padded layout and must be regenerated.
-/// GLB bytes are unchanged, so producer-27 meshes stay reusable.
+/// GLB bytes are unchanged, so producer-27 meshes stay reusable at producer 28.
+/// 29: paired FormKey SQL, contextual native archives, caches and portable named catalogs.
 pub const LOD_CONVERTER_SCHEMA_VERSION: u32 = 29;
 pub const WORLD_DATABASE_LOD_SCHEMA_VERSION: u32 = 6;
 
-/// The oldest world database schema the runtime (the engine and `world-inspect`) still reads, and
-/// so the oldest the launcher calls ready. Schemas 4, 5 and 8 only added tables and columns
-/// (`lights`, `references.radius_override`, the movement tables, water fresnel columns, grass tables,
-/// `references.emittance_id` and `emittance`), and every runtime query probes for them, so a schema
-/// 3 database still loads.
+/// The runtime and launcher accept the authenticated FormKey generation only.
+/// Earlier converted worlds must be converted again from their original inputs.
 pub const MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION: u32 = 10;
 
-/// The oldest converter manifest schema the runtime still loads, and so the oldest the launcher
-/// calls ready. Converter schema 15 wrote world database schema 3, which the runtime reads (see
-/// [`MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION`]). The newest is the converter's own
-/// `CONVERTER_SCHEMA_VERSION`, which lives in the converter crate.
+/// The matching converter generation is required for manifests and identity-bearing sidecars.
 pub const MIN_RUNTIME_CONVERTER_SCHEMA_VERSION: u32 = 29;
 
 /// Whether the runtime reads a world database of this schema: from

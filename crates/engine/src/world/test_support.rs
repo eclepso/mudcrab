@@ -41,6 +41,8 @@ pub(crate) fn install(connection: &mut Connection) -> PackIdentity {
     .unwrap();
     let order = names.iter().map(|name| table.id(name).unwrap()).collect();
     let identity = PackIdentity::new(table, order).unwrap();
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER); CREATE TABLE IF NOT EXISTS records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB)").unwrap();
+    connection.execute("INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM schema_info)",[shared::WORLD_DATABASE_SCHEMA_VERSION]).unwrap();
     let transaction = connection.transaction().unwrap();
     shared::records::create_record_context(&transaction, &identity).unwrap();
     transaction.execute_batch("CREATE TABLE inhouse_localized_fields(form_id INTEGER,field_index INTEGER,resolved_text TEXT)").unwrap();

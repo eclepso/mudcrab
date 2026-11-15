@@ -405,6 +405,7 @@ pub fn build_land_texture_arrays(
     output_root: &Path,
     options: &ArrayOptions,
 ) -> Result<(LandTextureTable, ArrayReport)> {
+    shared::world_assets::validate_world_database(&output_root.join("skyrim_world.db"))?;
     let connection = rusqlite::Connection::open_with_flags(
         output_root.join("skyrim_world.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

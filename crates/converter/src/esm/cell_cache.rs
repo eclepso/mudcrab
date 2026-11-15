@@ -65,6 +65,14 @@ pub(crate) fn form_key_texture_layers(
     form_key_texture_layers_with_report(record).map(|(layers, _)| layers)
 }
 
+/// Full source assignments retain owner/local identity before missing-target clearing.
+pub(crate) fn form_key_source_texture_layers(
+    record: &super::form_key_merge::FormKeyRecord,
+    order: &super::form_keys::FormKeyOrder,
+) -> Result<Vec<TerrainLayer>> {
+    form_key_texture_layers_with_context(record, Some(order)).map(|(layers, _)| layers)
+}
+
 /// Preserve the exact superseded occurrence as a resolved diagnostic identity.
 pub(crate) fn form_key_texture_layers_with_report(
     record: &super::form_key_merge::FormKeyRecord,
@@ -268,7 +276,7 @@ pub fn write_form_key_cell_cache(
             let normals = decode_normals(view.find(b"VNML").unwrap_or_default(), &heights);
             let vertex_colors = view.find(b"VCLR").unwrap_or_default().to_vec();
             let mut layers = if preserved {
-                form_key_texture_layers_with_context(record, Some(&conversion.order))?.0
+                form_key_source_texture_layers(record, &conversion.order)?
             } else {
                 form_key_texture_layers(record)?
             };
@@ -1052,6 +1060,12 @@ fn copy_texture_layers(layers: &[TerrainLayer]) -> Vec<TerrainLayer> {
 fn open_authenticated_cell_cache(
     path: &Path,
 ) -> Result<(Mmap, shared::pack_identity::PackIdentity)> {
+    shared::world_assets::validate_world_database(
+        &path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("skyrim_world.db"),
+    )?;
     let database = rusqlite::Connection::open_with_flags(
         path.parent()
             .unwrap_or_else(|| Path::new("."))

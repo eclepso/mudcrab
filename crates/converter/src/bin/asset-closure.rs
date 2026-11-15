@@ -114,13 +114,11 @@ fn main() -> Result<()> {
         .transpose()
         .wrap_err("source texture root does not exist")?;
     let database_path = assets_root.join("skyrim_world.db");
+    let _lock = shared::asset_lock::AssetLock::acquire_shared(&assets_root)?;
+    let database_schema = shared::world_assets::validate_world_database(&database_path)?;
     let connection =
         Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
-    let database_schema =
-        connection.query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
-            row.get::<_, u32>(0)
-        })?;
     let mut models = connection
         .prepare(
             "SELECT DISTINCT s.model_path FROM statics s \

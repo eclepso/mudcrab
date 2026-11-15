@@ -1787,6 +1787,15 @@ mod tests {
 
     fn seed_native_world(root: &Path, conversion: &crate::esm::form_key_merge::FormKeyConversion) {
         let mut database = rusqlite::Connection::open(root.join("skyrim_world.db")).unwrap();
+        database
+            .execute_batch("CREATE TABLE schema_info(version INTEGER)")
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO schema_info VALUES(?1)",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
         let tx = database.transaction().unwrap();
         conversion
             .order

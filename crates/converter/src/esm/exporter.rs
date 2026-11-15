@@ -132,8 +132,31 @@ fn optional_race_movement_link(
     Ok((value != 0).then_some(value))
 }
 
-/// Creates any missing world-database tables and stamps an empty database with the current schema.
+/// Create unbound scalar tables. A source-authenticated writer must seal the world generation.
+/// Existing on-disk worlds require complete conversion rather than a metadata-only stamp.
 pub fn create_tables(conn: &Connection) -> Result<()> {
+    let file: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !file.is_empty() {
+        let records: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='records')",
+            [],
+            |row| row.get(0),
+        )?;
+        if records {
+            return Err(sql_identity_error(
+                "source context is required to change a world; convert again",
+            ));
+        }
+    }
+    create_scalar_tables(conn)
+}
+
+/// Private CPU projections own unbound tables and never publish them as a current pack.
+fn create_scalar_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
@@ -338,7 +361,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
     )?
-    .execute([shared::WORLD_DATABASE_SCHEMA_VERSION])?;
+    .execute([0u32])?;
     Ok(())
 }
 
@@ -561,7 +584,7 @@ pub(crate) fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
     {
         tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
     }
-    create_tables(tx)?;
+    create_scalar_tables(tx)?;
     // Every complete snapshot owns these derived rows, including archive-only exports
     // that deliberately defer all runtime projections.
     crate::esm::rooms::clear(tx)?;
@@ -655,7 +678,7 @@ pub(crate) fn project_native_rows_with_offsets(
     if !file.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    create_tables(conn)?;
+    create_scalar_tables(conn)?;
     let mut ordered: Vec<_> = master.iter().collect();
     ordered.sort_unstable_by_key(|(id, _)| **id);
     project_scalar_records(
@@ -686,6 +709,16 @@ fn export_record_adapter(
     terrain_offsets: Option<&HashMap<u32, u64>>,
     options: ExportOptions,
 ) -> Result<()> {
+    let file: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !file.is_empty() {
+        return Err(sql_identity_error(
+            "u32 subset exports have no authenticated native source context; convert again from the original plugins",
+        ));
+    }
     let Some(order) = order else {
         let mut ordered: Vec<_> = master.iter().collect();
         ordered.sort_unstable_by_key(|(id, _)| **id);
@@ -1736,8 +1769,11 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
         row.get(0)
     })?;
     if version != shared::WORLD_DATABASE_SCHEMA_VERSION {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(sql_identity_error(
+            "world generation is obsolete; convert again",
+        ));
     }
+    shared::records::RecordContextReader::new(conn).map_err(sql_identity_error)?;
     Ok(())
 }
 

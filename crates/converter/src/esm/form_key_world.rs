@@ -4,7 +4,6 @@ use super::{
     form_key_projection::ProjectionStage,
     form_keys::FormKeyOrder,
     inhouse::{StringSources, read_plugin_strings},
-    records::RawRecord,
 };
 use crate::{
     config::RecordReader,
@@ -12,7 +11,7 @@ use crate::{
 };
 use color_eyre::{
     Result,
-    eyre::{WrapErr, ensure, eyre},
+    eyre::{ensure, eyre},
 };
 use rusqlite::{Connection, Transaction, params, types::Value as SqlValue};
 use shared::{form_key::FormKey, pack_identity::PackIdentity};
@@ -22,12 +21,15 @@ use std::{
     time::Instant,
 };
 
+/// Native text metadata distinguishes inline strings from localized table entries.
+type TextFact = (String, Option<String>, Option<u32>);
+
 /// Provenance stays native and independent of the scalar projection's compact CPU indices.
 #[derive(Default)]
 struct SourceFact {
     offset: u64,
     payload: Vec<u8>,
-    text_fields: BTreeMap<usize, (String, Option<String>, Option<u32>)>,
+    text_fields: BTreeMap<usize, TextFact>,
 }
 
 /// Build and publish a complete SQL generation with the selected independent field decoder.
@@ -216,7 +218,8 @@ pub(crate) fn convert_with_dump(
         let read = typed
             .as_mut()
             .ok_or_else(|| eyre!("typed dump requires the typed native reader"))?;
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut writer =
+            std::io::BufWriter::new(std::fs::File::create(path.join("typed-records.jsonl"))?);
         let wanted = |tag: &[u8; 4]| signatures.is_empty() || signatures.contains(tag);
         for header in &read.headers {
             if wanted(&header.source.record_type) {
@@ -266,15 +269,20 @@ pub(crate) fn convert_with_dump(
     output.pragma_update(None, "cache_size", -65_536)?;
     let projection_warnings = write_world(
         &mut output,
-        &projected,
-        &stage,
-        &conversion,
-        &facts,
-        &paths,
-        schemas,
-        typed.as_ref(),
-        mode,
+        WorldSnapshot {
+            projected: &projected,
+            stage: &stage,
+            conversion: &conversion,
+            facts: &facts,
+            paths: &paths,
+            schemas,
+            typed: typed.as_ref(),
+            mode,
+        },
     )?;
+    drop(projected);
+    drop(stage);
+    conversion.warnings.extend(projection_warnings);
     if let Some(read) = typed.as_ref() {
         if let Some(parent) = database.parent() {
             std::fs::write(
@@ -285,9 +293,6 @@ pub(crate) fn convert_with_dump(
             )?;
         }
     }
-    drop(projected);
-    drop(stage);
-    conversion.warnings.extend(projection_warnings);
     let warnings = conversion.warnings.clone();
     let notices = conversion.notices.clone();
     let mut phases = BTreeMap::new();
@@ -510,22 +515,35 @@ pub fn identity_column(table: &str, column: &str) -> bool {
     columns.split_ascii_whitespace().any(|name| name == column)
 }
 
-/// Publish actual keys and evidence once, with all owned tables in one rollback boundary.
-fn write_world(
-    output: &mut Connection,
-    projected: &Connection,
-    stage: &ProjectionStage<'_>,
-    conversion: &FormKeyConversion,
-    facts: &HashMap<FormKey, SourceFact>,
-    paths: &[PathBuf],
-    schemas: &RuntimeSchemas,
-    typed: Option<&records::native::NativeReadResult>,
+/// All inputs belong to the same frozen source and identity generation.
+struct WorldSnapshot<'a, 'b> {
+    projected: &'b Connection,
+    stage: &'b ProjectionStage<'a>,
+    conversion: &'a FormKeyConversion,
+    facts: &'b HashMap<FormKey, SourceFact>,
+    paths: &'b [PathBuf],
+    schemas: &'b RuntimeSchemas,
+    typed: Option<&'b records::native::NativeReadResult>,
     mode: super::inhouse::RecordBundleMode,
-) -> Result<Vec<String>> {
+}
+
+/// Publish actual keys and evidence once, with all owned tables in one rollback boundary.
+fn write_world(output: &mut Connection, snapshot: WorldSnapshot<'_, '_>) -> Result<Vec<String>> {
+    let WorldSnapshot {
+        projected,
+        stage,
+        conversion,
+        facts,
+        paths,
+        schemas,
+        typed,
+        mode,
+    } = snapshot;
     let identity = conversion.order.pack_identity()?;
     let definitions=projected.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN (SELECT name FROM pragma_table_list WHERE type='shadow') ORDER BY name")?.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let tx = output.transaction()?;
     for table in [
+        "land_context",
         "record_text",
         "resolved_links",
         "record_field_origins",
@@ -592,6 +610,8 @@ fn write_world(
                 blob
             ],
         )?;
+        #[cfg(test)]
+        super::publication_provenance_fault_point()?;
         let supplier = identity.order()[record.source.load_order as usize];
         tx.execute(
             "INSERT INTO record_context VALUES(?1,?2,?3,?4,?5,?6)",
@@ -694,7 +714,7 @@ fn write_world(
         if record.source.record_type != *b"LAND" || record.source.is_deleted() {
             continue;
         }
-        let layers = super::cell_cache::form_key_texture_layers(record)?;
+        let layers = super::cell_cache::form_key_source_texture_layers(record, &conversion.order)?;
         tx.execute(
             "INSERT INTO inhouse_terrain_layers VALUES(?1,?2,?3,?4)",
             params![
@@ -720,6 +740,17 @@ fn write_world(
                 )?;
             }
         }
+    }
+    let source_offsets = facts
+        .iter()
+        .map(|(key, fact)| (*key, fact.offset))
+        .collect();
+    let (lands, _) = super::cell_cache::native_land_winners(conversion, &source_offsets)?;
+    for (cell, land) in lands {
+        tx.execute(
+            "INSERT INTO land_context VALUES(?1,?2)",
+            params![cell.to_sql_i64(), land.to_sql_i64()],
+        )?;
     }
     super::insert_plugins(&tx, paths)?;
     if let Some(read) = typed {

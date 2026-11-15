@@ -311,6 +311,11 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
     }
     let options = &bound;
     let cache = CellCache::open(&assets.join("cell_cache.rkyv"))?;
+    shared::world_assets::validate_lod_build_contract(
+        &assets,
+        shared::LOD_CONVERTER_SCHEMA_VERSION,
+    )
+    .wrap_err("LOD package identity is invalid; convert again")?;
     let lod_manifest = lod_contract_status(&assets, &connection);
     let lod_chunks = load_lod_chunks(&connection, &assets, options.worldspace)?;
     let mut cells = Vec::new();

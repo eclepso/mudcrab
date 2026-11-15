@@ -33,6 +33,7 @@ mod legacy_text;
 pub mod load_order;
 pub mod lodsettings;
 pub mod mmap_reader;
+pub mod movement;
 mod object_materials;
 pub mod plugins_txt;
 pub mod projection_omissions;
@@ -44,6 +45,8 @@ pub mod types;
 pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
 };
+#[cfg(test)]
+mod atomic_publication_tests;
 #[cfg(test)]
 mod base_model_parity_tests;
 #[cfg(test)]
@@ -64,6 +67,53 @@ mod reference_links_parity_tests;
 mod report_warnings_official_tests;
 
 pub struct EsmParser;
+
+// A per-test-thread fault verifies the transaction boundary without global environment state.
+#[cfg(test)]
+std::thread_local! {
+    static PUBLICATION_PROVENANCE_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationProvenanceFault;
+
+#[cfg(test)]
+impl PublicationProvenanceFault {
+    pub(crate) fn arm() -> Self {
+        PUBLICATION_PROVENANCE_FAULT.with(|state| {
+            assert_eq!(state.get(), 0);
+            state.set(1);
+        });
+        Self
+    }
+
+    pub(crate) fn triggered(&self) -> bool {
+        PUBLICATION_PROVENANCE_FAULT.with(|state| state.get() == 2)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationProvenanceFault {
+    fn drop(&mut self) {
+        PUBLICATION_PROVENANCE_FAULT.with(|state| state.set(0));
+    }
+}
+
+/// Inject after canonical rows have been written and before source provenance is written.
+#[cfg(test)]
+pub(crate) fn publication_provenance_fault_point() -> Result<()> {
+    if PUBLICATION_PROVENANCE_FAULT.with(|state| {
+        if state.get() == 1 {
+            state.set(2);
+            true
+        } else {
+            false
+        }
+    }) {
+        color_eyre::eyre::bail!("injected canonical/provenance boundary failure");
+    }
+    Ok(())
+}
 
 /// Winning records with bounded data-loss warnings and faithful-outcome notices.
 #[derive(Debug)]

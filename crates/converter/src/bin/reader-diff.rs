@@ -50,7 +50,9 @@ fn main() -> Result<()> {
             create_new_output_root(&output)?;
             fs::create_dir(output.join("legacy"))?;
             let legacy = output.join("legacy").join("skyrim_world.db");
-            let paths = converter::esm::read_plugins_txt(&plugins, &data)?;
+            let paths = converter::esm::plugins_txt::read_form_key_plugins_with_options(
+                &plugins, &data, None, None,
+            )?;
             eprintln!("legacy reader: {} plugins", paths.len());
             converter::esm::EsmParser::convert_plugins(&paths, &legacy)?;
             eprintln!("in-house reader");
