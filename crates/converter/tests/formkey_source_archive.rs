@@ -4,6 +4,161 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
+/// Archive group keys use original MAST order, independently of owner allocation.
+fn grouped_conversion(root: &Path) -> converter::esm::form_key_merge::FormKeyConversion {
+    plugin(root, "Zulu.esm", &[], false, &[]);
+    plugin(root, "Alpha.esm", &[], false, &[]);
+    plugin(
+        root,
+        "Patch.esp",
+        &["Alpha.esm", "Zulu.esm"],
+        false,
+        &group(
+            0x0000_5678,
+            1,
+            &group(0x0100_1234, 6, &record(b"REFR", 0x0200_0912, &[])),
+        ),
+    );
+    EsmParser::merge_plugins_form_keys(
+        &["Zulu.esm", "Alpha.esm", "Patch.esp"].map(|name| root.join(name)),
+    )
+    .unwrap()
+}
+
+/// A valid key or NULL cannot replace the supplier-relative group identity.
+#[test]
+fn archive_reader_refuses_group_context_tampering() {
+    let root = tempfile::tempdir().unwrap();
+    let converted = grouped_conversion(root.path());
+    let mut connection = Connection::open_in_memory().unwrap();
+    converted.write_source_archive(&mut connection).unwrap();
+    for update in [
+        "UPDATE source_records SET cell_key=cell_key+1",
+        "UPDATE source_records SET cell_key=16781876",
+        "UPDATE source_records SET cell_key=NULL",
+        "UPDATE source_records SET world_key=world_key+1",
+        "UPDATE source_records SET world_key=NULL",
+        "UPDATE source_records SET source_cell=NULL",
+    ] {
+        connection.execute_batch("SAVEPOINT tamper").unwrap();
+        connection.execute_batch(update).unwrap();
+        assert!(
+            SourceArchive::read(&connection).is_err(),
+            "group context accepted: {update}"
+        );
+        connection
+            .execute_batch("ROLLBACK TO tamper; RELEASE tamper")
+            .unwrap();
+    }
+    assert_eq!(SourceArchive::read(&connection).unwrap().records.len(), 1);
+}
+
+/// Inconsistent internal group keys roll back the complete archive and its allocation.
+#[test]
+fn archive_writer_rolls_back_inconsistent_group_context() {
+    let root = tempfile::tempdir().unwrap();
+    let mut converted = grouped_conversion(root.path());
+    converted.records.values_mut().next().unwrap().cell = None;
+    let mut connection = Connection::open_in_memory().unwrap();
+    assert!(
+        converted.write_source_archive(&mut connection).is_err(),
+        "writer accepted a missing group key"
+    );
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM sqlite_schema WHERE type='table'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+/// Caller-owned tables do not participate in archive referential-integrity checks.
+#[test]
+fn archive_reader_preserves_unrelated_caller_foreign_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let converted = grouped_conversion(root.path());
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=OFF; CREATE TABLE caller_parent (id INTEGER PRIMARY KEY); CREATE TABLE caller_child (parent INTEGER REFERENCES caller_parent(id)); INSERT INTO caller_child VALUES(77)").unwrap();
+    converted.write_source_archive(&mut connection).unwrap();
+    assert!(
+        SourceArchive::read(&connection).is_ok(),
+        "caller-owned orphan rejected a valid archive"
+    );
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("SELECT parent FROM caller_child", [], |row| row.get(0))
+            .unwrap(),
+        77
+    );
+    connection
+        .execute_batch("UPDATE source_records SET supplier=999")
+        .unwrap();
+    assert!(SourceArchive::read(&connection).is_err());
+}
+
+/// Step 2's outfit, skin and alternate-texture self links retain physical source sites.
+#[test]
+fn archive_keeps_merged_step2_self_link_offsets() {
+    let root = tempfile::tempdir().unwrap();
+    let word = 0xFF00_0812u32.to_le_bytes();
+    let mods = [
+        1u32.to_le_bytes(),
+        4u32.to_le_bytes(),
+        *b"Rock",
+        word,
+        3u32.to_le_bytes(),
+    ]
+    .concat();
+    let body = [
+        record(b"STAT", 0x812, &[]),
+        record(b"NPC_", 0x820, &sub(b"DOFT", &word)),
+        record(b"OTFT", 0x821, &sub(b"INAM", &[word, word].concat())),
+        record(
+            b"ARMA",
+            0x822,
+            &[sub(b"NAM0", &word), sub(b"NAM1", &word)].concat(),
+        ),
+        record(b"STAT", 0x823, &sub(b"MODS", &mods)),
+    ]
+    .concat();
+    plugin(root.path(), "Links.esp", &[], false, &body);
+    let mut connection = Connection::open_in_memory().unwrap();
+    EsmParser::export_form_key_source_archive(&[root.path().join("Links.esp")], &mut connection)
+        .unwrap();
+    let archive = SourceArchive::read(&connection).unwrap();
+    let sites = archive
+        .records
+        .iter()
+        .flat_map(|row| {
+            row.links.iter().map(move |link| {
+                (
+                    row.key.local(),
+                    link.subrecord,
+                    link.byte_offset,
+                    link.source_word,
+                    link.key.unwrap().to_packed(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sites,
+        [
+            (0x820, 0, 0, 0xFF00_0812, 0x0100_0812),
+            (0x821, 0, 0, 0xFF00_0812, 0x0100_0812),
+            (0x821, 0, 4, 0xFF00_0812, 0x0100_0812),
+            (0x822, 0, 0, 0xFF00_0812, 0x0100_0812),
+            (0x822, 1, 0, 0xFF00_0812, 0x0100_0812),
+            (0x823, 0, 12, 0xFF00_0812, 0x0100_0812),
+        ]
+    );
+}
+
+/// Encode a bounded native subrecord during the test.
 fn sub(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     [
         tag.as_slice(),
@@ -13,6 +168,7 @@ fn sub(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     .concat()
 }
 
+/// Encode a native record header with an explicit supplier-relative word.
 fn record(tag: &[u8; 4], id: u32, payload: &[u8]) -> Vec<u8> {
     [
         tag.as_slice(),
@@ -25,6 +181,7 @@ fn record(tag: &[u8; 4], id: u32, payload: &[u8]) -> Vec<u8> {
     .concat()
 }
 
+/// Nest test records beneath an original source group label.
 fn group(label: u32, kind: i32, payload: &[u8]) -> Vec<u8> {
     [
         b"GRUP".as_slice(),
@@ -37,6 +194,7 @@ fn group(label: u32, kind: i32, payload: &[u8]) -> Vec<u8> {
     .concat()
 }
 
+/// Write a generated plugin with original master order and header flags.
 fn plugin(root: &Path, name: &str, masters: &[&str], light: bool, body: &[u8]) {
     let mut header = sub(
         b"HEDR",

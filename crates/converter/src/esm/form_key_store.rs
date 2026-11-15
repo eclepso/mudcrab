@@ -11,6 +11,7 @@ use rusqlite::{Connection, params};
 use shared::{
     form_key::{FormKey, PluginId},
     pack_identity::PackIdentity,
+    source_form_id::{self, Resolution, SourceFormId, ZeroPolicy},
 };
 use std::path::PathBuf;
 
@@ -93,8 +94,18 @@ impl FormKeyConversion {
                     .order()
                     .get(record.source.load_order as usize)
                     .ok_or_else(|| color_eyre::eyre::eyre!("unknown source supplier"))?;
-                identity.optional_key(record.cell.map(FormKey::to_sql_i64))?;
-                identity.optional_key(record.worldspace.map(FormKey::to_sql_i64))?;
+                validate_source_context(
+                    &identity,
+                    supplier,
+                    record.source.cell_form_id,
+                    record.cell,
+                )?;
+                validate_source_context(
+                    &identity,
+                    supplier,
+                    record.source.worldspace_form_id,
+                    record.worldspace,
+                )?;
                 records.execute(params![
                     key.to_sql_i64(),
                     sequence as i64,
@@ -157,25 +168,33 @@ fn validate_link_context(
     supplier: PluginId,
     link: &super::form_key_merge::ResolvedLink,
 ) -> Result<()> {
-    let entry = identity
-        .table()
-        .entry(supplier)
-        .ok_or_else(|| color_eyre::eyre::eyre!("unknown source supplier"))?;
-    let owner = match entry.facts.masters.get((link.source_word >> 24) as usize) {
-        Some(master) => identity
-            .table()
-            .id(master)
-            .ok_or_else(|| color_eyre::eyre::eyre!("unknown source master"))?,
-        None => supplier,
-    };
-    let expected = if link.source_word == 0 {
-        None
-    } else {
-        Some(FormKey::new(owner, link.source_word & 0x00ff_ffff)?)
+    validate_source_context(identity, supplier, Some(link.source_word), link.key)
+}
+
+/// Authenticate optional field/group keys using the same native rules as record admission.
+/// This checks an internal snapshot or stored archive, after per-item plugin recovery.
+fn validate_source_context(
+    identity: &PackIdentity,
+    supplier: PluginId,
+    word: Option<u32>,
+    key: Option<FormKey>,
+) -> Result<()> {
+    let outcome = source_form_id::resolve(
+        identity.table(),
+        SourceFormId {
+            raw: word.unwrap_or(0),
+            containing_plugin: supplier,
+        },
+        ZeroPolicy::Null,
+    );
+    let expected = match outcome {
+        Resolution::Resolved(key) | Resolution::SelfProjected { key, .. } => Some(key),
+        Resolution::Null => None,
+        other => color_eyre::eyre::bail!("invalid archived source context: {other:?}"),
     };
     ensure!(
-        link.key == expected,
-        "source link disagrees with its supplier and original master list"
+        key == expected,
+        "source key disagrees with its supplier and original master list"
     );
     Ok(())
 }
@@ -195,14 +214,16 @@ impl SourceArchive {
             "unsupported source archive; convert again"
         );
         let identity = PackIdentity::read_sql(connection)?;
-        ensure!(
-            connection
-                .prepare("PRAGMA foreign_key_check")?
-                .query([])?
-                .next()?
-                .is_none(),
-            "source archive has orphaned rows"
-        );
+        for table in ["source_records", "source_fields", "source_links"] {
+            ensure!(
+                connection
+                    .prepare(&format!("PRAGMA foreign_key_check({table})"))?
+                    .query([])?
+                    .next()?
+                    .is_none(),
+                "source archive has orphaned rows in {table}"
+            );
+        }
         let mut records = Vec::new();
         let mut statement = connection.prepare("SELECT key,sequence,supplier,source_word,signature,flags,source_cell,source_world,cell_key,world_key FROM source_records ORDER BY sequence")?;
         let mut rows = statement.query([])?;
@@ -264,12 +285,16 @@ impl SourceArchive {
                 validate_link_context(&identity, supplier, &link)?;
                 links.push(link);
             }
+            let cell = identity.optional_key(row.get(8)?)?;
+            let worldspace = identity.optional_key(row.get(9)?)?;
+            validate_source_context(&identity, supplier, source.cell_form_id, cell)?;
+            validate_source_context(&identity, supplier, source.worldspace_form_id, worldspace)?;
             records.push(SourceArchiveRecord {
                 key,
                 supplier,
                 source,
-                cell: identity.optional_key(row.get(8)?)?,
-                worldspace: identity.optional_key(row.get(9)?)?,
+                cell,
+                worldspace,
                 links,
             });
         }
