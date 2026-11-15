@@ -106,12 +106,12 @@ pub fn cell_cache_payload<'a>(
         archived.version == CELL_CACHE_VERSION,
         "cell cache is out of date; convert again"
     );
-    for cell in &archived.cells {
+    for cell in archived.cells.iter() {
         required(identity, cell.cell_id.into())?;
         if let Some(water) = cell.water_type_form_id.as_ref() {
             required(identity, (*water).into())?;
         }
-        for layer in &cell.layers {
+        for layer in cell.layers.iter() {
             optional(identity, layer.texture_form_id.into())?;
         }
     }
@@ -150,9 +150,9 @@ pub fn terrain_chunk_payload<'a>(identity: &PackIdentity, bytes: &'a [u8]) -> Re
         "terrain chunk is out of date; convert again"
     );
     required(identity, archived.worldspace_id.into())?;
-    for cell in &archived.cells {
+    for cell in archived.cells.iter() {
         required(identity, cell.cell_id.into())?;
-        for slot in &cell.quadrant_slots {
+        for slot in cell.quadrant_slots.iter() {
             optional(identity, (*slot).into())?;
         }
     }
