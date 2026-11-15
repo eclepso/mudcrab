@@ -189,7 +189,7 @@ fn native_broken_items_recover_locally_and_persist_loss_diagnostics() {
     let paths = [plugin(root.path(), "Broken.esp", &[], 0, &body)];
     let order = FormKeyOrder::read(&paths).unwrap();
     let result = read_plugins_form_keys(&paths, &order, &schemas()).unwrap();
-    let get = |local| FormKey::from_packed(0x0100_0000 | local).unwrap();
+    let get = |local: u64| FormKey::from_packed(0x0100_0000 | local).unwrap();
     assert!(result.records.contains_key(&get(0x820)));
     assert!(result.records.contains_key(&get(0x824)));
     assert!(!result.records.contains_key(&get(0x822)));

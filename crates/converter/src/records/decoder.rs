@@ -357,6 +357,7 @@ pub(crate) fn localized_field_bank(
 }
 
 /// Resolve a matched role's text bank from the same runtime schema as decoding.
+#[cfg(test)]
 pub(crate) fn string_table_with_prepared(
     prepared: &PreparedSchemas,
     record_type: &[u8; 4],

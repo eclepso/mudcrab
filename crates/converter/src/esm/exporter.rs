@@ -656,16 +656,6 @@ struct LegacyRecords<'a> {
     ordered: Vec<(&'a u32, &'a RawRecord)>,
 }
 
-/// Run scalar extractors in private memory using compact CPU indices, never legacy slots.
-/// The caller writes checked FormKeys and original canonical bytes to the actual pack separately.
-pub(crate) fn project_native_rows(
-    conn: &Connection,
-    master: &HashMap<u32, RawRecord>,
-    identities: &HashMap<u32, StableId>,
-) -> Result<()> {
-    project_native_rows_with_offsets(conn, master, identities, &HashMap::new())
-}
-
 /// Native LAND tie breaking uses the same physical positions as the paired cache producers.
 pub(crate) fn project_native_rows_with_offsets(
     conn: &Connection,

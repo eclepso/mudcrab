@@ -329,6 +329,7 @@ pub(crate) fn bounded_summary(value: String) -> String {
 
 /// Replace the complete scalar snapshot inside the caller's provenance transaction.
 /// Plugin IDs use the zero-based `record_overrides` convention, without a record FK.
+#[cfg(test)]
 pub(crate) fn write_tables<'a>(
     conn: &Connection,
     logs: impl IntoIterator<Item = (usize, &'a EventLog)>,

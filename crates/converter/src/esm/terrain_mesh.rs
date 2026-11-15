@@ -417,7 +417,7 @@ mod tests {
     fn heights_normals_and_colours_land_at_the_right_vertices() {
         let record = land(&all_bases(), &[], true);
         let (mesh, report) = build_cell_mesh(CELL, &record, &known_all(), [7; 32]).unwrap();
-        assert_eq!(mesh.cell_id, CELL);
+        assert_eq!(mesh.cell_id, u64::from(CELL));
         assert_eq!(mesh.key, [7; 32]);
         assert_eq!(mesh.slot_stride, 8);
         assert!(!report.needed_stride_16);

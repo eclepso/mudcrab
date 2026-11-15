@@ -1,6 +1,9 @@
 //! Scalar unresolved-texture diagnostics for the owned preserved-terrain snapshot.
 
-use rusqlite::{Transaction, params};
+use rusqlite::Transaction;
+#[cfg(test)]
+use rusqlite::params;
+#[cfg(test)]
 use std::collections::BTreeSet;
 
 /// Replace only the terrain tooling tables inside their owner's export transaction.
@@ -27,10 +30,11 @@ pub(super) fn replace_snapshot_tables(tx: &Transaction<'_>) -> rusqlite::Result<
 ///
 /// The existing caller excludes zero and keeps the authored IDs whose final
 /// target is missing or is not LTEX. Scalar rows preserve that set unchanged.
+#[cfg(test)]
 pub(super) fn write_unresolved_texture_ids(
     tx: &Transaction<'_>,
     form_id: u32,
-    ids: &BTreeSet<u32>,
+    ids: &BTreeSet<u64>,
 ) -> rusqlite::Result<()> {
     let mut insert = tx.prepare_cached(
         "INSERT INTO inhouse_unresolved_terrain_textures(form_id,texture_form_id) VALUES (?1,?2)",

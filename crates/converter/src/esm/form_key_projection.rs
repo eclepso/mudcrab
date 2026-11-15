@@ -179,11 +179,6 @@ impl<'a> ProjectionStage<'a> {
             .ok_or_else(|| eyre!("CPU projection index has no winning source record"))
     }
 
-    /// Run pure scalar projection in private memory; the connection is never a published world.
-    pub fn project(&self) -> Result<Connection> {
-        self.project_with_source_offsets(&HashMap::new())
-    }
-
     /// Preserve physical LAND precedence while adapting only private CPU indices.
     pub fn project_with_source_offsets(
         &self,

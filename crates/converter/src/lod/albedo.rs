@@ -1460,7 +1460,7 @@ mod tests {
 
     fn layer(id: u32, is_base: bool, opacity: f32) -> TerrainLayer {
         TerrainLayer {
-            texture_form_id: id,
+            texture_form_id: u64::from(id),
             quadrant: 0,
             layer: id as u16,
             is_base,

@@ -6,7 +6,7 @@ use converter::config::RecordReader;
 use shared::{
     form_key::FormKey,
     pack_identity::PackIdentity,
-    records_context::RecordContextReader,
+    records::RecordContextReader,
     terrain_mesh::{LAND_TEXTURE_TABLE_PATH, LandTextureTable, terrain_chunk_path},
 };
 
@@ -296,6 +296,24 @@ fn assert_findings_once(expected: &[String], actual: &[String]) {
     );
 }
 
+fn assert_notices_once(expected: &[String], actual: &[String]) {
+    const LOD_NOTICE: &str = "Terrain LOD compilation disabled by --no-lod";
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|notice| notice.as_str() == LOD_NOTICE)
+            .count(),
+        1,
+        "the requested LOD stage reports its disabled state once per run"
+    );
+    let record_notices: Vec<_> = actual
+        .iter()
+        .filter(|notice| notice.as_str() != LOD_NOTICE)
+        .cloned()
+        .collect();
+    assert_findings_once(expected, &record_notices);
+}
+
 /// The shared winner warning exercises source and cache reporting. Frontend admission rejects
 /// the malformed geometry first, so this does not generate a cache-only LAND build error.
 #[tokio::test]
@@ -331,7 +349,7 @@ async fn both_readers_warm_broken_mod_cache_retains_neighbors_and_findings_once(
             "a frontend loss must also persist"
         );
         assert_findings_once(&warnings, &publication.report.warnings);
-        assert_findings_once(&notices, &publication.report.notices);
+        assert_notices_once(&notices, &publication.report.notices);
         let names: &[&str] = if reader == RecordReader::Inhouse {
             &["cell_cache.rkyv", "cell_cache_preserved.rkyv"]
         } else {
@@ -359,7 +377,7 @@ async fn both_readers_warm_broken_mod_cache_retains_neighbors_and_findings_once(
         assert!(!warm.complete);
         assert_cached_native_neighbors(&publication.output);
         assert_findings_once(&warnings, &warm.warnings);
-        assert_findings_once(&notices, &warm.notices);
+        assert_notices_once(&notices, &warm.notices);
         assert_eq!(std::fs::read(notes_path).unwrap(), notes_bytes);
         for (name, expected) in cache_bytes {
             assert_eq!(

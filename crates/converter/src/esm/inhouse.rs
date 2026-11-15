@@ -716,7 +716,7 @@ pub(crate) fn terrain_runtime_layers(
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut statement = conn.prepare("SELECT form_id FROM records WHERE record_type='LTEX'")?;
     let textures = statement
-        .query_map([], |row| row.get::<_, u32>(0))?
+        .query_map([], |row| row.get::<_, u64>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
     let mut output = preserved.clone();
     for layers in output.values_mut() {
@@ -1295,8 +1295,9 @@ fn convert_plugins_with_text_sources_report_impl(
             .map(|layer| layer.texture_form_id)
             .filter(|id| {
                 *id != 0
-                    && !master
-                        .get(id)
+                    && !u32::try_from(*id)
+                        .ok()
+                        .and_then(|id| master.get(&id))
                         .is_some_and(|record| record.record_type == *b"LTEX")
             })
             .collect::<BTreeSet<_>>();

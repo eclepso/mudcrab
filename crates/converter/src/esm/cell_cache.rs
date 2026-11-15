@@ -469,6 +469,7 @@ pub fn write_cell_cache_with_source_order(
 /// Resolve native duplicate slots and NULL assignments once, while their distinction
 /// remains available. The caller may then clear unusable texture IDs without losing
 /// the retained assignment's weights. Runtime capacity does not limit this source projection.
+#[cfg(test)]
 pub(crate) fn preserved_texture_layers(record: &RawRecord) -> Result<Vec<TerrainLayer>> {
     let (mut layers, _) = extract_texture_layers(&record.subrecords)?;
     normalize_texture_layers(&mut layers);
@@ -492,6 +493,7 @@ pub(crate) fn write_cell_cache_with_preserved_layers(
 
 /// Archive every normalized source layer without imposing the runtime material's capacity.
 /// This auxiliary cache is for preservation; the engine continues to load `cell_cache.rkyv`.
+#[cfg(test)]
 pub(crate) fn write_preserved_cell_cache_with_source_layers(
     records: &HashMap<u32, RawRecord>,
     source_offsets: &HashMap<u32, u64>,
