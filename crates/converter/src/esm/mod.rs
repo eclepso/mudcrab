@@ -31,6 +31,7 @@ mod legacy_text;
 pub mod load_order;
 pub mod lodsettings;
 pub mod mmap_reader;
+mod object_materials;
 pub mod plugins_txt;
 pub mod projection_omissions;
 pub mod records;
@@ -711,8 +712,14 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Music (`ZNAM`) as well, which the in-house schema remaps too.
         b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" | b"ZNAM" if record_type == b"WRLD" => Fixed(SINGLE),
         b"RNAM" | b"CNAM" | b"INAM" if record_type == b"NPC_" => Fixed(SINGLE),
-        // NPC Traits links: both are optional FormIDs in the actor schema.
-        b"WNAM" | b"TPLT" if record_type == b"NPC_" => Fixed(SINGLE),
+        // NPC Traits and default outfit are optional FormIDs in the actor schema.
+        // Outfit layouts follow xEdit xedit-4.1.5f's TES5 definitions (OTFT:9964-9967).
+        b"WNAM" | b"TPLT" | b"DOFT" if record_type == b"NPC_" => Fixed(SINGLE),
+        // INAM holds all outfit items; each word resolves independently, including NULLs.
+        b"INAM" if record_type == b"OTFT" => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
         // xEdit 9fb016884bec138ea6c7b872cec831537d464c3e,
         // wbDefinitionsTES5.pas:9463-9468. Match the in-house actors schema.
         b"WKMV" | b"RNMV" | b"SWMV" | b"FLMV" | b"SNMV" | b"SPMV" if record_type == b"RACE" => {
@@ -724,7 +731,8 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // all three, and the catalog reads them as load-order FormIDs.
         b"WNAM" if record_type == b"RACE" => Fixed(SINGLE),
         b"MODL" if record_type == b"ARMO" => Fixed(SINGLE),
-        b"RNAM" if record_type == b"ARMA" => Fixed(SINGLE),
+        // xEdit 4.1.5f / items.json: race and male/female skin texture sets are scalar links.
+        b"RNAM" | b"NAM0" | b"NAM1" if record_type == b"ARMA" => Fixed(SINGLE),
         // Additional races repeat as one FormID per MODL subrecord; malformed entries
         // are discarded independently, matching ARMO/MODL's existing clear policy.
         b"MODL" if record_type == b"ARMA" => Fixed(SINGLE),
@@ -920,6 +928,26 @@ fn remap_record_at_sites(
     let mut malformed_subrecords = Vec::new();
     for (index, (tag, data)) in record.subrecords.iter_mut().enumerate() {
         let remap_link = |offset, form_id| remap_optional(index, tag, offset, form_id, true);
+        if record.record_type == *b"STAT" && tag.as_slice() == b"MODS" {
+            let Some(offsets) = object_materials::form_offsets(data) else {
+                warnings
+                    .skipped_optional(plugin_name, format!("STAT {source_id:08X}: malformed MODS"));
+                malformed_subrecords.push(index);
+                continue;
+            };
+            for offset in offsets {
+                let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                let resolved = remap_link(offset, value).unwrap_or_else(|error| {
+                    warnings.skipped_optional(
+                        plugin_name,
+                        format!("STAT {source_id:08X} MODS reference {value:08X}: {error}"),
+                    );
+                    0
+                });
+                data[offset..offset + 4].copy_from_slice(&resolved.to_le_bytes());
+            }
+            continue;
+        }
         if record.record_type == *b"GRAS" && tag.as_slice() == b"MODS" {
             color_eyre::eyre::ensure!(data.len() >= 4, "truncated GRAS alternate textures");
             let count = u32::from_le_bytes(data[..4].try_into().unwrap());
