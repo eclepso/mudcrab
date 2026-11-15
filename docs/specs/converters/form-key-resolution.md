@@ -2,9 +2,11 @@
 
 FormKey uses Mutagen's owner/local identity concept. A converter run assigns
 pack-local plugin numbers independently of load priority. Source words select
-an owner through the containing file's original MAST list before the checked
-`LegacyIdView` packs a global u32. Existing u32 entry points and stored formats
-retain their signatures and widths.
+an owner through the containing file's original MAST list. World schema 10 /
+producer 29 stores checked 64-bit FormKeys, with SQL NULL for optional identity.
+Native source bytes stay four bytes wide. A checked `LegacyIdView` is used only
+at supported runtime/request boundaries; it does not limit native conversion.
+Old converted worlds must be converted again.
 
 For a MAST list of length N, selectors below N name that master and selectors
 at or above N name self, for every record, field and link type, including VMAD.
@@ -64,26 +66,34 @@ NAVM adaptations do not count as resolved-to-self projections.
 `EsmParser::merge_plugins_form_keys` accepts an already recovered load order
 without full/light slot caps. Its records retain native source words separately
 from resolved header, group and recognized link identities. It does not publish
-these source words as legacy canonical fields. The default typed and legacy
-readers resolve links before checked u32 projection and merge winners by FormKey.
+these source words as legacy canonical fields. Both production frontends merge winners by FormKey and publish original native
+canonical bytes with physical source ordinals and byte offsets. Resolved targets,
+NULL and cleared outcomes are stored separately. Scalar extractors share private
+CPU indices in an unbound in-memory database; these indices never enter a pack.
 The existing public u32 reader APIs retain their legacy slot limits;
 malformed-selector recovery changes as described above.
 `convert_selected_form_key_plugins` and the `formkey-records` CLI use the same
 official/CCC selection and dependency recovery with slot exclusions disabled.
 
-`EsmParser::convert_form_key_plugins` additionally requests legacy publication.
-For more than 254 full or 4096 light plugins it returns the complete native
-winner set and `LegacyWriterOutcome::Unavailable` with one per-run notice,
-leaving the database destination untouched. No session stand-ins are allocated.
-Publishing extended identities and full schema-decoded resolved references belongs
-to the writer/reader transition; the native link list here covers the legacy
-reader's recognized layouts and is not a versioned resolved-reference sidecar.
+`EsmParser::convert_form_key_plugins` and the `formkey-records` CLI publish the
+native contextual world generation, including extended owner orders. The historic
+`LegacyWriterOutcome::Published` API name remains, but successful output is the
+current FormKey format. No runtime stand-ins are allocated. Public u32 subset
+exporters lack original physical context and refuse on-disk publication rather
+than stamping incomplete output. Fresh unbound scalar tables use version 0.
+
+`pack_identity` binds the immutable allocation, TES4/source content facts and
+supplier priority. Canonical readers check this contract before interpreting
+keys or native fields. Cell caches, terrain, LOD manifests and named catalogs
+bind the same table digest. Resume, repair and metadata rebuild refuse older or
+mixed generations; a full conversion from original sources creates a fresh one.
 
 Identity traversal explicitly compares original owner kind (full before light),
 owner ordinal within that kind, then local ID. This matches unsigned legacy ID
 order within Skyrim's limits. Winning supplier priority remains separate and
-continues to select overrides. SQL still stores legacy IDs and keeps its existing
-numeric ordering. LAND retains supplier priority and native offset precedence.
+continues to select overrides. Persisted FormKey allocation order is not load
+priority: first-choice queries and bounded samples explicitly retain original
+owner ordering. LAND retains supplier priority and physical offset precedence.
 
 The SQLite writer sorts previously unordered CELL, terrain and emittance writes.
 The previous CELL pass used an unordered map, so database bytes already varied
@@ -91,6 +101,6 @@ from run to run. Fixed ordering establishes a reproducible physical layout witho
 intentionally changing logical rows. Verification compares every schema object and sorted rows of every
 table, including virtual-table shadow tables. Non-SQLite serialization retains
 its established ordering. Database-cache receipts and generated-artifact seals
-hash physical DB bytes and can therefore differ. Existing cache payloads remain
-valid against their own stored hashes; the rebuilt producer changes the database
-cache identity. Independent asset-cache formats and keys do not change here.
+hash physical DB bytes and can therefore differ. Identity-bearing old cache payloads are refused. Database-cache format 3 binds
+world/cell/context generations and the table digest before reuse. Independent
+asset-cache eligibility keeps its own existing proofs.

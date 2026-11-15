@@ -821,6 +821,12 @@ pub async fn run_merged_terrain_stage(
              merged terrain to be built from"
         );
     };
+    let report_database = Connection::open_with_flags(
+        staging.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let report_identity = shared::pack_identity::PackIdentity::read_sql(&report_database)?;
+    drop(report_database);
     let started = Instant::now();
     let _ = progress_tx
         .send(ProgressEvent::new(
@@ -856,6 +862,7 @@ pub async fn run_merged_terrain_stage(
         .extend(terrain.chunk_files.iter().map(PathBuf::from));
     report.terrain_warnings = terrain.warnings.clone();
     report.terrain_elapsed_ms = started.elapsed().as_millis();
+    report.terrain_report = Some(terrain.to_portable_value(&report_identity)?);
     report.terrain = Some(terrain);
     let _ = progress_tx
         .send(ProgressEvent::new(
@@ -878,6 +885,16 @@ pub async fn run_form_key_merged_terrain_stage(
     progress_tx: &Sender<ProgressEvent>,
     report: &mut PipelineReport,
 ) -> Result<()> {
+    let report_database = Connection::open_with_flags(
+        staging.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let report_identity = shared::pack_identity::PackIdentity::read_sql(&report_database)?;
+    drop(report_database);
+    color_eyre::eyre::ensure!(
+        report_identity.digest() == conversion.order.pack_identity()?.digest(),
+        "terrain source and world belong to different generations; convert again"
+    );
     let started = Instant::now();
     let _ = progress_tx
         .send(ProgressEvent::new(
@@ -910,6 +927,7 @@ pub async fn run_form_key_merged_terrain_stage(
         .extend(terrain.chunk_files.iter().map(PathBuf::from));
     report.terrain_warnings = terrain.warnings.clone();
     report.terrain_elapsed_ms = started.elapsed().as_millis();
+    report.terrain_report = Some(terrain.to_portable_value(&report_identity)?);
     report.terrain = Some(terrain);
     let _ = progress_tx
         .send(ProgressEvent::new(

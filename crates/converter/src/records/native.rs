@@ -216,6 +216,26 @@ impl<'a> DecodeContext<'a> {
         }
         diagnostics.link(word);
         let mut key = self.resolve_word(word)?;
+        let master_count = self
+            .order
+            .table()
+            .entry(self.order.plugin_order()[self.supplier])
+            .expect("validated supplier")
+            .facts
+            .masters
+            .len();
+        if crate::esm::legacy_projection::LegacyTypedReaderProjection::maps_to_null(
+            word,
+            master_count,
+            true,
+            diagnostics.event_context.record_type,
+            diagnostics.event_context.field.as_deref(),
+        ) {
+            diagnostics.note("link", || {
+                format!("optional FormID {word:08X} exceeds master list")
+            });
+            key = None;
+        }
         if let Some(target) = key {
             let entry = self
                 .order

@@ -548,7 +548,10 @@ fn archive_reader_refuses_unknown_table_and_bad_physical_coordinates() {
             .contains("convert again")
     );
     connection
-        .execute_batch(&format!("UPDATE source_archive SET version={}", converter::esm::form_key_store::SOURCE_ARCHIVE_VERSION))
+        .execute_batch(&format!(
+            "UPDATE source_archive SET version={}",
+            converter::esm::form_key_store::SOURCE_ARCHIVE_VERSION
+        ))
         .unwrap();
     connection
         .execute_batch("UPDATE source_links SET byte_offset=1")

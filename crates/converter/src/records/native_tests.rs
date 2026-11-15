@@ -558,3 +558,63 @@ fn native_notices_do_not_filter_on_plugin_filename_text() {
         .insert("cleared owner.esp".into(), diagnostic);
     assert_eq!(result.notices().len(), 1);
 }
+
+/// Retain the scoped NAVM publication policy while native bytes and other self links stay exact.
+#[test]
+fn native_navm_onam_keeps_scoped_null_projection_and_valid_neighbor() {
+    let root = tempfile::tempdir().unwrap();
+    let words = [0x3f00_003fu32.to_le_bytes(), 0x3f00_0810u32.to_le_bytes()].concat();
+    let body = [
+        record(
+            b"NAVM",
+            0x800,
+            0,
+            &[sub(b"EDID", b"Mesh\0"), sub(b"ONAM", &words)].concat(),
+        ),
+        record(b"TEST", 0x810, 0, &sub(b"EDID", b"Target\0")),
+        record(
+            b"TEST",
+            0x811,
+            0,
+            &[
+                sub(b"EDID", b"Neighbor\0"),
+                sub(b"LINK", &0x3f00_0810u32.to_le_bytes()),
+            ]
+            .concat(),
+        ),
+    ]
+    .concat();
+    let paths = vec![plugin(root.path(), "NavmSource.esm", &[], 0, &body)];
+    let order = crate::esm::form_keys::FormKeyOrder::read(&paths).unwrap();
+    let result = read_plugins_form_keys(&paths, &order, &schemas()).unwrap();
+    let mesh = result
+        .records
+        .values()
+        .find(|record| record.source.record_type == *b"NAVM")
+        .unwrap();
+    assert_eq!(mesh.links.len(), 2);
+    assert!(mesh.links.iter().all(|link| link.key.is_none()
+        && link.outcome == crate::esm::form_key_merge::LinkOutcome::Cleared));
+    assert_eq!(
+        mesh.canonical
+            .subrecords
+            .iter()
+            .find(|(tag, _)| tag == b"ONAM")
+            .unwrap()
+            .1,
+        words
+    );
+    let neighbor = result
+        .records
+        .values()
+        .find(|record| record.source.form_id == 0x811)
+        .unwrap();
+    assert_eq!(neighbor.links.len(), 1);
+    assert_eq!(neighbor.links[0].key.unwrap().local(), 0x810);
+    assert!(
+        result
+            .warnings()
+            .iter()
+            .any(|line| line.to_ascii_lowercase().contains("navmsource.esm"))
+    );
+}

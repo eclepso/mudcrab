@@ -1,5 +1,12 @@
 # In-house record diagnostics
 
+World 10 stores semantic diagnostic keys as checked FormKeys. Native source
+header/group/link words remain labelled 32-bit facts. Named history, diagnostic
+and typed JSONL reports authenticate the table before emitting `local:Plugin`
+identities or null. Physical offsets and source words stay exact. Canonical
+records, source context, history and diagnostic journals share one publication
+transaction. Older worlds must be converted again.
+
 The in-house reader keeps its console and `inhouse-reader-diagnostics.json`
 summaries small: per-plugin counts and first examples. Complete diagnostic
 details are scalar rows in the optional `record_diagnostics` SQL table. This

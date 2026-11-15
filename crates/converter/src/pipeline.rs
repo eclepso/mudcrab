@@ -135,8 +135,11 @@ pub struct PipelineReport {
     /// The merged terrain (#215) this run built, when `merged_terrain` is on: the land texture
     /// arrays, one merged mesh per exterior cell, the chunk files, and every cell or texture
     /// left out with its reason. `None` when the option is off or no world database was built.
-    #[serde(default)]
+    #[serde(skip)]
     pub terrain: Option<crate::terrain_pipeline::TerrainReport>,
+    /// Portable persisted terrain report; record identities are named, never pack-local numbers.
+    #[serde(default, rename = "terrain")]
+    pub terrain_report: Option<serde_json::Value>,
     /// Wall time spent building merged terrain, excluding other conversion stages.
     #[serde(default)]
     pub terrain_elapsed_ms: u128,
@@ -181,9 +184,9 @@ pub(crate) fn conversion_is_complete(report: &PipelineReport) -> bool {
 
 /// One line per projection omission category (#297): a lost light row warns, so the run is
 /// incomplete; an unresolved emittance target keeps the model's emission and is only noted.
-pub(crate) fn report_projection_omissions(
+pub(crate) fn report_projection_omissions<I: crate::esm::projection_omissions::OmissionIdentity>(
     report: &mut PipelineReport,
-    omissions: &crate::esm::projection_omissions::ProjectionOmissions,
+    omissions: &crate::esm::projection_omissions::ProjectionOmissions<I>,
 ) {
     use crate::esm::projection_omissions::{Severity, summary_line};
     for (category, outcome) in &omissions.categories {

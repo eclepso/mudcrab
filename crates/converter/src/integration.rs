@@ -2,7 +2,7 @@
 
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
-    esm::projection_omissions::ProjectionOmissions,
+    esm::projection_omissions::NativeProjectionOmissions,
     mesh::glb_bounds_from_bytes,
 };
 use color_eyre::{
@@ -41,9 +41,9 @@ pub struct IntegrationReport {
     #[serde(default)]
     pub room_graph: crate::esm::rooms::RoomGraphReport,
     /// Plugin rows the light and emittance projections left out (db-schema.md section 18);
-    /// empty when nothing was left out or the database predates the tables.
-    #[serde(default, skip_serializing_if = "ProjectionOmissions::is_empty")]
-    pub projection_omissions: ProjectionOmissions,
+    /// identities are portable owner/local names, read only after the pack contract authenticates.
+    #[serde(default, skip_serializing_if = "NativeProjectionOmissions::is_empty")]
+    pub projection_omissions: NativeProjectionOmissions,
     pub missing_texture_count: u64,
     pub unavailable_texture_source_count: u64,
     pub issues: Vec<String>,
@@ -51,6 +51,11 @@ pub struct IntegrationReport {
 }
 
 pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationReport>> {
+    let database = staging.join("skyrim_world.db");
+    if !database.is_file() {
+        return Ok(None);
+    }
+    shared::world_assets::validate_world_database(&database)?;
     let sources = source_file_index(staging)?;
     finalize_world_database_with_sources(staging, &sources)
 }
@@ -64,17 +69,17 @@ pub fn finalize_world_database_with_sources(
     if !database_path.is_file() {
         return Ok(None);
     }
-    let mut connection = Connection::open(&database_path)?;
-    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
-    let version: u32 =
-        connection.query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
-            row.get(0)
-        })?;
-    ensure!(
-        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
-        "world database is out of date; convert again"
-    );
+    shared::world_assets::validate_world_database(&database_path)?;
+    let mut connection =
+        Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let identity = shared::records::RecordContextReader::new(&connection)
+        .wrap_err("world native context is unavailable; convert again")?
+        .identity()
+        .clone();
+    let projection_omissions =
+        NativeProjectionOmissions::read_with_identity(&connection, &identity)?;
     let mut report = IntegrationReport {
+        projection_omissions,
         schema_version: connection.query_row(
             "SELECT version FROM schema_info LIMIT 1",
             [],
@@ -114,7 +119,7 @@ pub fn finalize_world_database_with_sources(
                  GROUP BY priority
              ) p ON p.priority=r.load_order
              WHERE s.model_path IS NOT NULL AND s.model_path <> ''
-             ORDER BY s.id",
+             ORDER BY ((SELECT flags FROM pack_plugins WHERE id=(s.id >> 24)) & 2),(SELECT supplier_priority FROM pack_plugins WHERE id=(s.id >> 24)),(s.id & 16777215)",
         )?;
         statement
             .query_map([], |row| {
@@ -204,11 +209,10 @@ pub fn finalize_world_database_with_sources(
     // Room membership by model bounds needs the bounds just written.
     crate::esm::rooms::add_overlap_rows(&mut connection)?;
     report.room_graph = crate::esm::rooms::RoomGraphReport::read(&connection)?;
-    report.projection_omissions = ProjectionOmissions::read(&connection)?;
 
     let diffuse_paths = {
         let mut statement = connection.prepare(
-            "SELECT id,diffuse_path FROM texture_sets WHERE diffuse_path IS NOT NULL AND diffuse_path <> '' ORDER BY id",
+            "SELECT id,diffuse_path FROM texture_sets WHERE diffuse_path IS NOT NULL AND diffuse_path <> '' ORDER BY ((SELECT flags FROM pack_plugins WHERE id=(texture_sets.id >> 24)) & 2),(SELECT supplier_priority FROM pack_plugins WHERE id=(texture_sets.id >> 24)),(texture_sets.id & 16777215)",
         )?;
         statement
             .query_map([], |row| {
@@ -235,7 +239,7 @@ pub fn finalize_world_database_with_sources(
     }
     let flow_paths = {
         let mut statement = connection.prepare(
-            "SELECT id,flow_normal_path FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> '' ORDER BY id",
+            "SELECT id,flow_normal_path FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> '' ORDER BY ((SELECT flags FROM pack_plugins WHERE id=(waters.id >> 24)) & 2),(SELECT supplier_priority FROM pack_plugins WHERE id=(waters.id >> 24)),(waters.id & 16777215)",
         )?;
         statement
             .query_map([], |row| {
@@ -486,7 +490,7 @@ mod tests {
         let owner = table.id("Fixture.esm").unwrap();
         let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
         let tx = connection.unchecked_transaction().unwrap();
-        identity.write_sql(&tx).unwrap();
+        shared::records::create_record_context(&tx, &identity).unwrap();
         tx.commit().unwrap();
     }
 
@@ -513,6 +517,12 @@ mod tests {
                 connection.execute(&format!("UPDATE \"{table}\" SET \"{column}\"=\"{column}\"|16777216 WHERE \"{column}\">0 AND \"{column}\"<16777216"),[]).unwrap();
             }
         }
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
         let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
         let cache = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
@@ -523,6 +533,57 @@ mod tests {
             shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Baseline-compatible regression: an actual integration report emits source names.
+    #[test]
+    fn integration_omission_samples_use_portable_source_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x62; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let owner = table.id("Fixture.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        shared::records::create_record_context(&transaction, &identity).unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        let key = shared::form_key::FormKey::new(owner, 0x801).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projection_omission_stats VALUES('light_short_data','data_loss',1)",
+                [],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO projection_omission_samples VALUES('light_short_data',?1,'DATA is short')",[key.to_sql_i64()]).unwrap();
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: Vec::new(),
+        };
+        fs::write(
+            directory.path().join("cell_cache.rkyv"),
+            shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
+        )
+        .unwrap();
+        drop(connection);
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            json["projection_omissions"]["light_short_data"]["samples"][0]["form_id"],
+            "000801:Fixture.esm"
+        );
     }
 
     #[test]

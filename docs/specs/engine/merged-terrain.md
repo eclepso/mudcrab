@@ -6,13 +6,23 @@ about 7 ms of render-thread time for a 17 x 17 ring is spent on that bookkeeping
 
 The converter writes the data (`shared::terrain_mesh`); this document is the engine side.
 
+## Identity generation
+
+World 10 / producer 29 binds terrain to the authenticated pack table. Cell
+caches use version 4 and terrain chunks version 2. Their fixed 96-byte envelope
+checks kind, version, table digest and content before rkyv access. Binary
+CELL/WRLD/LTEX fields are eight-byte FormKeys. Texture-table JSON and terrain
+reports use names or null. `lod-manifest.json` carries `plugin_table_digest`, and
+terrain LOD compiler 5 emits named GLB cell extras. Old or foreign generations
+are refused before payload access with convert-again advice.
+
 ## Inputs
 
 | File | Under the converted output root | What |
 |---|---|---|
 | Land texture table | `terrain/land-textures.json` (`LAND_TEXTURE_TABLE_PATH`) | The class arrays and the LTEX FormID to id table |
 | Texture arrays | the table's `arrays[].path`, e.g. `terrain/land-diffuse-bc1-1024.ktx2` | One `texture_2d_array` per class (usage, block format, size), full mips |
-| Cell chunks | `terrain/<wrld:08x>/chunk_<cx>_<cy>.rkyv` (`terrain_chunk_path`) | A `TerrainChunkFile`: the cell meshes of 4 x 4 cells |
+| Cell chunks | `terrain/<wrld:016x>/chunk_<cx>_<cy>.rkyv` (`terrain_chunk_path`) | A `TerrainChunkFile`: the cell meshes of 4 x 4 cells |
 
 A conversion without the table is `absent`: every cell takes today's quadrant path, with no
 message per cell. A table that does not validate, a device that cannot bind it, an array file that

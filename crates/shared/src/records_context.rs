@@ -164,11 +164,33 @@ impl<'a> RecordContextReader<'a> {
             self.identity.order().contains(&supplier),
             "unknown record supplier; convert again"
         );
-        let blob: Vec<u8> = self.connection.query_row(
-            "SELECT data FROM records WHERE form_id=?1",
-            [key.to_sql_i64()],
-            |row| row.get(0),
-        )?;
+        let (signature, cell, world, blob): (String, Option<i64>, Option<i64>, Vec<u8>) =
+            self.connection.query_row(
+                "SELECT record_type,cell_id,worldspace_id,data FROM records WHERE form_id=?1",
+                [key.to_sql_i64()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        ensure!(
+            signature == "GMST"
+                || source_key(&self.identity, supplier, source_header)? == Some(key),
+            "record owner disagrees with original supplier/header; convert again"
+        );
+        ensure!(
+            self.identity.optional_key(cell)?
+                == source_cell
+                    .map(|raw| source_key(&self.identity, supplier, raw))
+                    .transpose()?
+                    .flatten(),
+            "cell context disagrees with original supplier/group; convert again"
+        );
+        ensure!(
+            self.identity.optional_key(world)?
+                == source_world
+                    .map(|raw| source_key(&self.identity, supplier, raw))
+                    .transpose()?
+                    .flatten(),
+            "world context disagrees with original supplier/group; convert again"
+        );
         let mut aligned = rkyv::util::AlignedVec::<16>::new();
         aligned.extend_from_slice(&blob);
         let data = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&aligned)

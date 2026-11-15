@@ -1,11 +1,12 @@
-# FormKey identity contract (step 1)
+# FormKey identity contract
 
 Part of [#542](https://github.com/Mudcrab-Team/mudcrab/issues/542).
-Step 1 adds shared types beside the existing APIs. **No output, format or schema
-change.** Every existing u32 type, field and function stays unchanged. The new
-resolver and legacy view are exercised by additive converter tests, without
-changing production conversion or runtime behavior. This step does not remove
-plugin admission limits.
+The shared types were introduced in step 1. Step 3 production uses world schema
+10 / producer 29, with authenticated plugin tables, source-aware canonical
+payloads, checked 64-bit SQL/binary keys and named JSON. Old converted worlds
+must be converted again. Runtime u32 handles remain an explicit checked
+boundary within Skyrim's slot limits; native conversion accepts extended owner
+orders. Stand-in runtime IDs belong to step 4.
 
 ## Layout and table scope
 

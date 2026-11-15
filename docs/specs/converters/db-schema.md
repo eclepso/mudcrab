@@ -12,6 +12,35 @@ retain the runtime approximation and do not imply complete shader support.
 ARMO model projection uses MOD2 with MOD4 as the female world-model fallback
 for both frontends. MOD3 is an ARMA model slot, not an ARMO world-model path.
 
+## FormKey generation (world 10 / producer 29)
+
+Older worlds must be converted again. Engine, launcher, inspectors, resume,
+repair and metadata rebuild reject old or mixed generations before content reads.
+Required identities are positive SQLite `i64` FormKeys; optional identities are
+SQL NULL. Native source words stay four bytes and require the original supplier
+and MAST list. Portable JSON uses `local:Plugin.esp` strings or null.
+
+`pack_plugins` retains allocation, original TES4 facts/content hashes and supplier
+priority; `pack_identity` authenticates that frozen table. `plugins.id` and
+`load_order` remain zero-based supplying priority. Both frontends accept native
+owner orders beyond the old 254-full/4,096-light runtime slot limits. Runtime
+requests use a checked boundary and decline unrepresentable identities until
+step 4.
+
+Canonical `records.data`, cell/reference/water payloads and VMAD retain native
+source bytes. `canonical_record_contract`, `record_context`,
+`record_source_fields`, `record_field_origins`, `resolved_links` and `record_text`
+carry their interpretation. Sites name the original field ordinal, byte offset,
+source word, nullable target and explicit `resolved`, `null` or `cleared` outcome.
+Opaque fields remain evidence and are marked unusable by runtime scalar readers.
+`land_context` identifies the winning LAND for each `land.vtex` payload. Original
+decompressed payloads remain in `inhouse_source_records` for both frontends.
+
+All owned SQL, context and typed history/diagnostics publish in one transaction.
+Failure retains the previous complete database and caller-owned tables. Subset
+exporters without source context cannot stamp a world; fresh unbound scalar
+tables use version 0. Complete conversion seals version 10.
+
 ---
 
 ## 1. Schema Overview
@@ -20,15 +49,15 @@ for both frontends. MOD3 is an ARMA model slot, not an ARMO world-model path.
 
 MO2 profiles reuse the shared selection rules and the converter's header/missing-master closure recovery over winning overlay paths. Installed official masters and game-folder CCC entries remain implicitly active; other selected plugins follow `loadorder.txt`. Missing ordered entries append in last-occurrence `plugins.txt` order, with a warning. Both profile lists use Windows-1252 and retain only the last duplicate. Missing files and unusable dependency closures skip with profile-context notices, preserving usable neighbors. Classic Skyrim still activates bare profile entries. Plugin-name keys use the shared Unicode `normalize_plugin_name` function (`to_lowercase`) across player lists, MO2 lists, merged Data lookup, master matching and identity maps. Windows-1252 `CAFÉ.esp` and `café.esp` therefore match; Unicode normalization and full Unicode case folding are not implemented. Record signatures, EditorIDs and other asset keys retain their existing rules. MO2 preserves its existing final order validation rather than applying player-list priority normalization.
 
-The existing explicit-order normalization gives ESM-flagged plugins and `.esm`/`.esl` files priority, preserving listed order within each category except that regular dependencies are moved ahead of master files that need them. Cyclic plugins and all their dependents are omitted before normalization. The established final order admits at most 254 full and 4,096 light plugins; overflow and its transitive dependents are omitted without backfilling later entries or changing survivor order. One bounded warning summarizes each recovery cause; the conversion report's `skipped_plugins` retains every original filename removed by selection recovery, once each in pre-recovery selection order, including attempted ambiguous filenames, unusable headers and missing-master closures. Unchecked plugins are not skips. `load_order` records surviving original filenames in the same order as the published `plugins` table. Both vectors default to empty when absent from older reports. A plugin the normalized order still places before one of its masters is omitted with its dependents rather than moved. Surviving paths feed slot assignment, archive priority, database merging and terrain caches. An ESL-flagged `.esp` takes a light slot but stays among regular plugins.
+The existing explicit-order normalization gives ESM-flagged plugins and `.esm`/`.esl` files priority, preserving listed order within each category except that regular dependencies are moved ahead of master files that need them. Cyclic plugins and all their dependents are omitted before normalization. The production FormKey order retains every usable owner without legacy runtime slot caps. One bounded warning summarizes each recovery cause; the conversion report's `skipped_plugins` retains every original filename removed by selection recovery, once each in pre-recovery selection order, including attempted ambiguous filenames, unusable headers and missing-master closures. Unchecked plugins are not skips. `load_order` records surviving original filenames in the same order as the published `plugins` table. Both vectors default to empty when absent from older reports. A plugin the normalized order still places before one of its masters is omitted with its dependents rather than moved. Surviving paths feed slot assignment, archive priority, database merging and terrain caches. An ESL-flagged `.esp` takes a light slot but stays among regular plugins.
 
 Player and MO2 selection use a shared fallback when `Skyrim.ccc` is missing or unreadable: the installed subset of `ccBGSSSE001-Fish.esm`, `ccQDRSSE001-SurvivalMode.esl`, `ccBGSSSE037-Curios.esl`, `ccBGSSSE025-AdvDSGS.esm` and `_ResourcePack.esl`, in that order after the five official masters. A readable CCC, even empty, stays authoritative. `selection_warnings` records the fallback's CCC path and read failure separately from conversion failures; CLI/progress/launcher display it as a warning without making usable output incomplete. The optional vector defaults to empty for older reports.
 
 Archive ownership and load-order priority share the same exact-or-space/dash/underscore stem matcher. The longest installed owner must survive recovery before a companion can contribute inputs, including repair and metadata rebuilds. Active `_` and `-` companions are admitted in MO2; unowned archives remain excluded there and admitted outside MO2. Equal active stems keep their first slot. Direct MO2 plugin-name ambiguity in the winning layer is recoverable; higher-layer unique replacements retain normal overlay behavior.
 
-Without `plugins_file` or an MO2 profile, only plugins directly in Data are selected and dependencies precede dependents. Among ready plugins, ESM-flagged plugins and `.esm`/`.esl` files take priority, followed by the five official files' conventional order and Unicode-normalized filename order. Unusable headers and missing-master closures are omitted with bounded notices, as in player selection, and this path shares cycle and slot-overflow recovery. A nonempty plugin selection reduced to no usable plugins fails clearly, while asset-only inputs retain their existing behavior. Automatic discovery cannot infer override priorities between unrelated mods; nested backup/optional plugins are ignored while nested assets remain discoverable.
+Without `plugins_file` or an MO2 profile, only plugins directly in Data are selected and dependencies precede dependents. Among ready plugins, ESM-flagged plugins and `.esm`/`.esl` files take priority, followed by the five official files' conventional order and Unicode-normalized filename order. Unusable headers and missing-master closures are omitted with bounded notices, as in player selection, and this path shares dependency and cycle recovery. A nonempty plugin selection reduced to no usable plugins fails clearly, while asset-only inputs retain their existing behavior. Automatic discovery cannot infer override priorities between unrelated mods; nested backup/optional plugins are ignored while nested assets remain discoverable.
 
-The database stamps its version in `schema_info`; the current version is **9**
+The database stamps its version in `schema_info`; the current version is **10**
 (`shared::WORLD_DATABASE_SCHEMA_VERSION`). Schema 4 added lights and
 `references.radius_override`. Schema 5 adds grass data in #152;
 the combined producer exports grass and LOD tables. Schema 6 adds LOD origins, chunk metadata,
@@ -40,10 +69,10 @@ normal paths. Both frontends project TX06 into `detail_path` and TX07 into
 projects only XESP byte 4 into `enable_parent_flags`. Separate candidate fixes
 used producer 25/world 8 for different contracts; the combined output first shipped
 as 26/9, and producer 27 keeps world schema 9.
-The engine, `world-inspect` and launcher accept world schemas **3 through 9**, using
-`shared::supports_runtime_world_database_schema`. Complete converter packages
-support schemas **15 through 28**. Legacy worlds render full detail without
-LOD; an advertised LOD package requires the current database contract.
+The engine, `world-inspect` and launcher accept world schema **10** and producer
+**29**, authenticating the plugin table before identity-bearing content. Old
+worlds receive convert-again advice. LOD additionally binds its manifest to the
+same table digest and compiler version.
 
 Converter producer 26 also corrects the texture encodings chosen from those
 columns. Producer 27 adds sphere, multi-sphere and cylinder collision shapes
@@ -110,10 +139,10 @@ CREATE TABLE IF NOT EXISTS plugins (
 
 ### 2. Primary Record Database (`records`)
 
-Stores subrecord byte payloads indexed by 32-bit Skyrim `FormID` and 4-character
-record type codes, encoded as rkyv `ArchivedRecordData`. Both frontends resolve
-known embedded links to load-order numbering. The in-house frontend projects
-validated decoded fields into this existing encoding. Its auxiliary experimental
+Stores subrecord byte payloads indexed by 64-bit pack-scoped FormKeys and
+4-character signatures, encoded as rkyv `ArchivedRecordData`. Both frontends keep
+native four-byte words and pair recognized occurrences with context/site tables.
+Scalar SQL projections store resolved keys. Its auxiliary experimental
 `inhouse_source_records(form_id, source_form_id, load_order, record_type, flags,
 payload)` table holds original
 decompressed source bytes, including file-relative IDs and unused framing. Those
@@ -827,7 +856,7 @@ attachments; fresh legacy databases retain the legacy JSON projection.
 
 ### 10. FormID Translation Map (`formid_map`)
 
-Maps each resolved 32-bit FormID to its stable owning plugin and plugin-local
+Maps each stored FormKey to its stable owning plugin and plugin-local
 ID. `plugin_name` is the lowercase owning filename, such as `skyrim.esm`;
 `internal_id` is the low 24 bits for full plugins or the low 12 bits for light
 plugins. Full and light slots are assigned independently. The pair
@@ -914,7 +943,7 @@ it neither resolves plugin-local IDs nor upgrades an old pack.
 
 ```sql
 CREATE TABLE IF NOT EXISTS formid_map (
-    form_id INTEGER PRIMARY KEY,       -- Resolved 32-bit Skyrim FormID
+    form_id INTEGER PRIMARY KEY,       -- Positive 64-bit pack-scoped FormKey
     plugin_name TEXT NOT NULL,          -- Owning plugin filename
     internal_id INTEGER NOT NULL,       -- Plugin-local ID (24 or 12 bits)
     record_type TEXT NOT NULL           -- Record type ('REFR', 'NPC_', etc.)
@@ -1389,7 +1418,7 @@ reused database, and adds `destination_name` to a table that predates it.
 `door-links-annotate <skyrim_world.db>` rebuilds it in one transaction from a converted
 database's own winning records, with no plugin reparsed, so an existing package gains doors
 without a full conversion. It takes the asset lock exclusively (close the engine first), accepts
-schemas 4 through the current one, and leaves meshes, terrain, `schema_info`, reader identity and
+only authenticated schema 10, and leaves meshes, terrain, `schema_info`, reader identity and
 the other tables unchanged. A corrupt `records` row fails the rebuild and keeps the old table.
 
 **This table is optional and did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`**, for the same

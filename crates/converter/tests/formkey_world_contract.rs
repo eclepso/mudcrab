@@ -140,3 +140,21 @@ fn production_canonical_fields_keep_source_words() {
         "canonical field must preserve original Alpha MAST[0] word"
     );
 }
+
+/// Source metadata and stored root/group keys must agree before any canonical field is used.
+#[test]
+fn production_context_refuses_wrong_owner_and_group_metadata() {
+    for tamper in [
+        "UPDATE record_context SET source_header=2065 WHERE record_key=50333713",
+        "UPDATE records SET cell_id=50333713 WHERE form_id=50333713",
+        "UPDATE records SET worldspace_id=50333713 WHERE form_id=50333713",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (_, connection) = world(root.path());
+        let reader = shared::records::RecordContextReader::new(&connection).unwrap();
+        let key = reader.identity().required_key(50333713).unwrap();
+        connection.execute(tamper, []).unwrap();
+        let error = reader.record(key).unwrap_err();
+        assert!(error.to_string().contains("convert again"), "{error:#}");
+    }
+}
