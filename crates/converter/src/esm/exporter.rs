@@ -469,6 +469,7 @@ pub fn export_to_db_with_load_order(
 /// Replace plugin metadata and the complete legacy snapshot in one transaction.
 /// `unresolved_fields` are the localized fields the legacy text pass left without text; like the
 /// in-house reader's, they stay in `records.data` and are left out of the runtime projections.
+#[cfg(test)]
 pub(super) fn export_plugins_to_db(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,
@@ -491,6 +492,7 @@ pub(super) fn export_plugins_to_db(
 }
 
 /// Export canonical decoded fields with Skyrim's texture slots and byte-wide XESP flags.
+#[cfg(test)]
 pub(crate) fn export_inhouse_to_db(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,
@@ -515,6 +517,7 @@ pub(crate) fn export_inhouse_to_db(
 
 /// Fresh diagnostic bundles only: archive canonical records and identities without runtime views.
 /// The shared loop writes identical records/formid_map SQL before its explicit deferral branch.
+#[cfg(test)]
 pub(crate) fn export_inhouse_record_archive_to_db(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,

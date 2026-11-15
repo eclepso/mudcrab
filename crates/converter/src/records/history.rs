@@ -128,6 +128,7 @@ fn create_history_tables(conn: &Connection) -> Result<()> {
 
 /// Atomically retain the exact ordered add-ons beside their producing history snapshot.
 /// Configuration is already validated before conversion; this persists reproducible bytes.
+#[cfg(test)]
 pub(crate) fn write_tables_with_schemas(
     conn: &Connection,
     entries: &[HistoryEntry],
@@ -234,6 +235,7 @@ pub(crate) fn write_tables_with_schemas(
 }
 
 /// Preserve native MAST order as scalar rows; a zero-master plugin has only its TES4 row.
+#[cfg(test)]
 fn write_master_table(conn: &Connection, order: &LoadOrder) -> Result<()> {
     conn.execute_batch(
         "DROP TABLE IF EXISTS inhouse_plugin_masters;

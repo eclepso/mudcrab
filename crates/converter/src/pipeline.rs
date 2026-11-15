@@ -20,7 +20,6 @@ use crate::{
     config::{PipelineConfig, TextureEncoder},
     esm::{
         EsmParser,
-        cell_cache::write_cell_cache,
         exporter::validate_database,
         lodsettings::{LodSettings, sidecar_path},
         plugins_txt::read_form_key_with_selection_diagnostics,

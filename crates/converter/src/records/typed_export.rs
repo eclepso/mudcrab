@@ -1,11 +1,14 @@
 //! Stream the complete typed diagnostic record without building a per-record JSON tree.
 //! Field and component order are retained. Floats use the prior JSON DOM's f64 widening.
 
-use super::{DecodedField, DecodedRecord, Value};
+#[cfg(test)]
+use super::DecodedRecord;
+use super::{DecodedField, Value};
 use serde::{Serialize, Serializer, ser::SerializeSeq, ser::SerializeStruct};
 use std::{collections::BTreeMap, io::Write};
 
 /// Write the existing twenty-field record envelope; the caller owns JSONL framing and flushes.
+#[cfg(test)]
 pub(crate) fn write_record<W: Write>(
     writer: &mut W,
     record: &DecodedRecord,
@@ -20,6 +23,7 @@ pub(crate) fn write_record<W: Write>(
     )
 }
 
+#[cfg(test)]
 struct RecordView<'a> {
     record: &'a DecodedRecord,
     localization: &'a BTreeMap<usize, serde_json::Value>,
@@ -90,6 +94,7 @@ impl Serialize for NativeRecordView<'_> {
     }
 }
 
+#[cfg(test)]
 impl Serialize for RecordView<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let record = self.record;

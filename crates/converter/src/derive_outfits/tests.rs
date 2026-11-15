@@ -1,100 +1,158 @@
 use super::*;
-use shared::records::{ArchivedRecordData, ArchivedSubRecord};
+use shared::{
+    actor_outfits::ActorOutfitCatalogFile,
+    form_key::{FormKey, NamedFormKey},
+    pack_identity::PackIdentity,
+    plugin_table::{PluginFacts, PluginTable},
+    records::RecordContextReader,
+};
 
 const NORD: u32 = 0x200;
 const DEFAULT_RACE: u32 = 25;
 
-fn blob(subrecords: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
-    let data = ArchivedRecordData {
-        subrecords: subrecords
-            .iter()
-            .map(|(tag, data)| ArchivedSubRecord {
-                tag: **tag,
-                data: data.clone(),
-            })
-            .collect(),
-    };
-    rkyv::to_bytes::<rkyv::rancor::Error>(&data)
-        .unwrap()
-        .to_vec()
-}
-
 fn ids(ids: &[u32]) -> Vec<u8> {
     ids.iter().flat_map(|id| id.to_le_bytes()).collect()
 }
-
 fn text(value: &str) -> Vec<u8> {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
     bytes
 }
 
-/// A world database with one Nord actor in a blacksmith outfit (torso and shoes).
-fn write_database(path: &Path) {
-    let connection = Connection::open(path).unwrap();
-    connection
-        .execute_batch(&format!(
-            "CREATE TABLE schema_info (version INTEGER NOT NULL);
-             INSERT INTO schema_info VALUES ({});
-             CREATE TABLE records (form_id INTEGER PRIMARY KEY, record_type TEXT NOT NULL,
-               cell_id INTEGER, worldspace_id INTEGER, load_order INTEGER NOT NULL, data BLOB NOT NULL);
-             CREATE TABLE actor_models (id INTEGER PRIMARY KEY, race_id INTEGER NOT NULL,
-               sex TEXT NOT NULL, skin_armo_id INTEGER, head_model TEXT, head_source TEXT,
-               resolution TEXT NOT NULL);
-             INSERT INTO actor_models(id, race_id, sex, resolution) VALUES (256, {NORD}, 'male', 'body_head');
-             INSERT INTO actor_models(id, race_id, sex, resolution) VALUES (257, {NORD}, 'male', 'unresolved');",
-            shared::WORLD_DATABASE_SCHEMA_VERSION
-        ))
-        .unwrap();
-    let records: Vec<(u32, &str, Vec<u8>)> = vec![
-        (
+/// Frame generated native source fields; these bytes are interpreted only by production readers.
+fn record(tag: &[u8; 4], id: u32, fields: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let payload: Vec<u8> = fields
+        .iter()
+        .flat_map(|(signature, data)| {
+            [
+                signature.as_slice(),
+                &(data.len() as u16).to_le_bytes(),
+                data.as_slice(),
+            ]
+            .concat()
+        })
+        .collect();
+    [
+        tag.as_slice(),
+        &(payload.len() as u32).to_le_bytes(),
+        &[0; 4],
+        &id.to_le_bytes(),
+        &[0; 8],
+        &payload,
+    ]
+    .concat()
+}
+
+/// A real contextual world with one resolved Nord actor and one unresolved neighbor.
+/// No numeric SQL fixture is relabeled: the native writer owns keys, source sites and projections.
+fn write_database(path: &Path) -> PackIdentity {
+    let source = tempfile::tempdir().unwrap();
+    let plugin = source.path().join("Skyrim.esm");
+    let body = [
+        record(b"RACE", DEFAULT_RACE, &[]),
+        record(b"RACE", NORD, &[(b"WNAM", ids(&[0x600]))]),
+        record(
+            b"NPC_",
             0x100,
-            "NPC_",
-            blob(&[(b"ACBS", vec![0; 24]), (b"DOFT", ids(&[0x300]))]),
+            &[
+                (b"ACBS", vec![0; 24]),
+                (b"RNAM", ids(&[NORD])),
+                (b"DOFT", ids(&[0x300])),
+            ],
         ),
-        (
+        // A missing race leaves this actor unresolved despite its valid outfit.
+        record(
+            b"NPC_",
             0x101,
-            "NPC_",
-            blob(&[(b"ACBS", vec![0; 24]), (b"DOFT", ids(&[0x300]))]),
+            &[(b"ACBS", vec![0; 24]), (b"DOFT", ids(&[0x300]))],
         ),
-        (
-            0x300,
-            "OTFT",
-            blob(&[(b"INAM", ids(&[0x400, 0x401, 0x402]))]),
-        ),
-        (0x400, "ARMO", blob(&[(b"MODL", ids(&[0x500]))])),
-        (0x401, "ARMO", blob(&[(b"MODL", ids(&[0x501]))])),
-        (0x402, "LVLI", blob(&[])),
-        (
+        record(b"OTFT", 0x300, &[(b"INAM", ids(&[0x400, 0x401, 0x402]))]),
+        record(b"ARMO", 0x400, &[(b"MODL", ids(&[0x500]))]),
+        record(b"ARMO", 0x401, &[(b"MODL", ids(&[0x501]))]),
+        record(b"LVLI", 0x402, &[]),
+        record(
+            b"ARMA",
             0x500,
-            "ARMA",
-            blob(&[
+            &[
                 (b"BOD2", [4u32.to_le_bytes(), 2u32.to_le_bytes()].concat()),
                 (b"RNAM", ids(&[DEFAULT_RACE])),
                 (b"MOD2", text("Clothes\\BlackSmith\\M\\Torso_1.nif")),
-            ]),
+            ],
         ),
-        (
+        record(
+            b"ARMA",
             0x501,
-            "ARMA",
-            blob(&[
+            &[
                 (
                     b"BOD2",
                     [0x80u32.to_le_bytes(), 2u32.to_le_bytes()].concat(),
                 ),
                 (b"RNAM", ids(&[DEFAULT_RACE])),
                 (b"MOD2", text("Clothes\\BlackSmith\\M\\Shoes_1.nif")),
-            ]),
+            ],
+        ),
+        // The actor's own skin is separate from the worn outfit under test.
+        record(b"ARMO", 0x600, &[(b"MODL", ids(&[0x700]))]),
+        record(
+            b"ARMA",
+            0x700,
+            &[
+                (b"BOD2", [4u32.to_le_bytes(), 2u32.to_le_bytes()].concat()),
+                (b"RNAM", ids(&[DEFAULT_RACE])),
+                (
+                    b"MOD2",
+                    text("Actors\\Character\\Character Assets\\MaleBody_1.nif"),
+                ),
+            ],
         ),
     ];
-    for (id, kind, data) in records {
+    let header = record(
+        b"TES4",
+        0,
+        &[(
+            b"HEDR",
+            [
+                1.71f32.to_le_bytes(),
+                (body.len() as u32).to_le_bytes(),
+                0x800u32.to_le_bytes(),
+            ]
+            .concat(),
+        )],
+    );
+    fs::write(&plugin, [header, body.concat()].concat()).unwrap();
+    crate::esm::EsmParser::convert_plugins(&[plugin], path).unwrap();
+    let connection = Connection::open(path).unwrap();
+    let identity = PackIdentity::read_sql(&connection).unwrap();
+    let owner = identity.table().id("Skyrim.esm").unwrap();
+    let key = |local| FormKey::new(owner, local).unwrap();
+    assert_ne!(
         connection
-            .execute(
-                "INSERT INTO records(form_id, record_type, load_order, data) VALUES (?1, ?2, 0, ?3)",
-                rusqlite::params![id, kind, data],
+            .query_row(
+                "SELECT resolution FROM actor_models WHERE id=?1",
+                [key(0x100).to_sql_i64()],
+                |row| row.get::<_, String>(0)
             )
-            .unwrap();
-    }
+            .unwrap(),
+        "unresolved"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT resolution FROM actor_models WHERE id=?1",
+                [key(0x101).to_sql_i64()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "unresolved"
+    );
+    let reader = RecordContextReader::new(&connection).unwrap();
+    let npc = reader.record(key(0x100)).unwrap();
+    assert_eq!(npc.first_link(*b"DOFT", 0).unwrap(), Some(key(0x300)));
+    assert_eq!(
+        npc.bytes(*b"DOFT").unwrap(),
+        0x300u32.to_le_bytes().as_slice()
+    );
+    identity
 }
 
 struct Fixture {
@@ -110,10 +168,10 @@ impl Fixture {
         let registered = directory.path().join("registered");
         let clone = directory.path().join("clone");
         fs::create_dir_all(&registered).unwrap();
-        write_database(&registered.join("skyrim_world.db"));
+        let identity = write_database(&registered.join("skyrim_world.db"));
         fs::write(
             registered.join("conversion-manifest.json"),
-            r#"{"schema_version":28,"complete":true}"#,
+            serde_json::to_vec(&serde_json::json!({"schema_version":crate::cache::CONVERTER_SCHEMA_VERSION,"complete":true,"plugin_table_digest":identity.digest_hex()})).unwrap(),
         )
         .unwrap();
         fs::write(registered.join("integration-report.json"), "{}").unwrap();
@@ -193,15 +251,38 @@ fn derives_the_catalog_and_a_receipt_into_the_clone_only() {
     assert_eq!(report.skipped["converted_model_missing"], 1);
     assert_eq!(report.skipped["leveled_list"], 1);
 
-    let catalog: ActorOutfitCatalog =
+    let catalog: ActorOutfitCatalogFile =
         serde_json::from_slice(&fs::read(fixture.clone.join(CATALOG_FILE)).unwrap()).unwrap();
-    assert_eq!(catalog.validate(), Ok(()));
-    let outfit = catalog.find(0x100).unwrap();
+    let connection = Connection::open(fixture.clone.join("skyrim_world.db")).unwrap();
+    let identity = PackIdentity::read_sql(&connection).unwrap();
+    catalog.validate_for(&identity).unwrap();
+    assert_eq!(catalog.pack_identity, identity.digest_hex());
+    let npc = NamedFormKey::new("Skyrim.esm", 0x100).unwrap();
+    let outfit = catalog
+        .outfits
+        .iter()
+        .find(|row| row.npc_id == npc)
+        .unwrap();
+    assert_eq!(outfit.npc_id.to_string(), "000100:Skyrim.esm");
+    assert_eq!(outfit.outfit_id.to_string(), "000300:Skyrim.esm");
+    assert_eq!(outfit.parts[0].armo_id.to_string(), "000400:Skyrim.esm");
+    assert_eq!(outfit.parts[0].armature_id.to_string(), "000500:Skyrim.esm");
     assert_eq!(
         outfit.parts[0].scene,
         "meshes/clothes/blacksmith/m/torso_1.glb"
     );
-    assert!(catalog.find(0x101).is_none());
+    assert!(
+        !catalog
+            .outfits
+            .iter()
+            .any(|row| row.npc_id == NamedFormKey::new("Skyrim.esm", 0x101).unwrap())
+    );
+    let json = serde_json::to_value(&catalog).unwrap();
+    assert_eq!(json["outfits"][0]["npc_id"], "000100:Skyrim.esm");
+    assert_eq!(
+        json["outfits"][0]["parts"][0]["armature_race_id"],
+        "000019:Skyrim.esm"
+    );
 
     let receipt: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.clone.join(RECEIPT_FILE)).unwrap()).unwrap();
@@ -286,7 +367,10 @@ fn refuses_a_hard_link_to_the_registered_file() {
 fn refuses_an_incomplete_manifest_after_the_clone_is_proven() {
     let fixture = Fixture::new();
     let manifest = fixture.registered.join("conversion-manifest.json");
-    fs::write(&manifest, r#"{"schema_version":28,"complete":false}"#).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    value["complete"] = serde_json::Value::Bool(false);
+    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     copy_directory(&fixture.registered, &fixture.clone);
     // Re-register the changed manifest so the clone proof passes and only completeness fails.
     let registry = fs::read_to_string(&fixture.registry).unwrap();
@@ -341,4 +425,27 @@ fn a_foreign_world_schema_is_refused() {
         .unwrap();
     let error = run(&fixture.options()).unwrap_err().to_string();
     assert!(error.contains("outside the runtime range"), "{error}");
+}
+
+#[test]
+fn named_catalog_readback_refuses_another_conversion_generation() {
+    let fixture = Fixture::new();
+    run(&fixture.options()).unwrap();
+    let catalog: ActorOutfitCatalogFile =
+        serde_json::from_slice(&fs::read(fixture.clone.join(CATALOG_FILE)).unwrap()).unwrap();
+    let table = PluginTable::fresh(vec![(
+        "Skyrim.esm".into(),
+        PluginFacts {
+            content_hash: Some([0xA5; 32]),
+            ..Default::default()
+        },
+    )])
+    .unwrap();
+    let owner = table.id("Skyrim.esm").unwrap();
+    let other = PackIdentity::new(table, vec![owner]).unwrap();
+    let error = catalog.validate_for(&other).unwrap_err().to_string();
+    assert!(
+        error.contains("another conversion") && error.contains("convert again"),
+        "{error}"
+    );
 }

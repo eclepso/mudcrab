@@ -1,9 +1,9 @@
 use crate::esm::{
-    binary::parse_plugin_file_with_warnings,
-    exporter::{create_tables, validate_inhouse_record},
-    records::RawRecord,
+    binary::parse_plugin_file_with_warnings, exporter::validate_inhouse_record, records::RawRecord,
 };
 use color_eyre::{Result, eyre::WrapErr};
+#[cfg(test)]
+use exporter::create_tables;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -29,6 +29,7 @@ pub mod inhouse;
 mod inhouse_script_properties;
 mod inhouse_terrain_diagnostics;
 pub(crate) mod legacy_projection;
+#[cfg(test)]
 mod legacy_text;
 pub mod load_order;
 pub mod lodsettings;
@@ -252,6 +253,7 @@ impl EsmParser {
     }
 
     /// Export legacy records, resolving localized text through the in-house string sources.
+    #[cfg(test)]
     fn convert_legacy_plugins_report(
         plugin_paths: &[PathBuf],
         db_path: &Path,

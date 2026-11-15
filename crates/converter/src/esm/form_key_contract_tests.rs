@@ -427,6 +427,34 @@ fn oracle_word(record: &RawRecord, tag: &[u8; 4]) -> u32 {
     u32::from_le_bytes(data.as_slice().try_into().unwrap())
 }
 
+#[test]
+fn old_scalar_conversion_route_refuses_disk_publication() {
+    let (directory, paths, _) = record_oracle_fixture();
+    let database = directory.path().join("old-scalar.db");
+    let error = super::EsmParser::convert_legacy_plugins_report(
+        &paths,
+        &database,
+        super::inhouse::StringSources::default_language(
+            super::inhouse::StringRoots::PluginLooseFirst(directory.path()),
+        ),
+    )
+    .err()
+    .expect("old scalar route must not publish a native world");
+    assert!(
+        format!("{error:#}").contains("no authenticated native source context"),
+        "{error:#}"
+    );
+    let connection = rusqlite::Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT version FROM schema_info", [], |row| row
+                .get::<_, u32>(0))
+            .unwrap(),
+        0,
+        "refused scalar output must not acquire the native schema stamp"
+    );
+}
+
 /// Compare production publication with the retained old record remapper.
 #[test]
 fn real_old_record_oracle_names_strict_header_difference() {

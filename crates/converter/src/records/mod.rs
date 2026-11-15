@@ -536,9 +536,9 @@ pub(crate) fn decode_text(bytes: &[u8]) -> String {
     decoder::decode_string(bytes)
 }
 
-pub(crate) use decoder::{
-    PreparedSchemas, localized_field_bank, prepare_runtime_schema, string_table_with_prepared,
-};
+pub(crate) use decoder::localized_field_bank;
+#[cfg(test)]
+pub(crate) use decoder::{PreparedSchemas, prepare_runtime_schema, string_table_with_prepared};
 
 /// Scan in load order using the converter's single slot/master authority.
 /// Input recovery returns the accepted names in `ReadResult::load_order`; use that list
@@ -576,6 +576,7 @@ pub(crate) fn read_plugins_with_validation_and_observer(
 }
 
 /// Use a validated conversion-local schema for initial decode, replay and target checks.
+#[cfg(test)]
 pub(crate) fn read_plugins_with_runtime_schemas(
     plugin_paths: &[PathBuf],
     order: &LoadOrder,

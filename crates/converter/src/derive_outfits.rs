@@ -9,11 +9,6 @@
 //! contains one, that is not an exact copy of the named registered pack's manifests, or whose
 //! database lacks the tables it reads. Every refusal names its reason.
 
-#[cfg(test)]
-use crate::{
-    actor_models::{ActorModelCatalog, ActorModelRow},
-    esm::records::RawRecord,
-};
 use crate::{actor_outfits::resolve_form_key_actor_outfits, cache::hash_file};
 use color_eyre::{
     Result,
@@ -21,11 +16,10 @@ use color_eyre::{
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-#[cfg(test)]
-use shared::actor_outfits::ActorOutfitCatalog;
-use shared::actor_outfits::PATH as CATALOG_FILE;
-#[cfg(test)]
-use std::collections::HashMap;
+use shared::{
+    actor_outfits::{ActorOutfitCatalogFile, PATH as CATALOG_FILE},
+    pack_identity::PackIdentity,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -92,6 +86,7 @@ pub fn run(options: &DeriveOutfitsOptions) -> Result<DeriveOutfitsReport> {
     let database = options.target.join("skyrim_world.db");
     let connection = open_database_read_only(&database)?;
     let schema = check_world_inputs(&connection)?;
+    let identity = PackIdentity::read_sql(&connection)?;
 
     let protected = protected_files(&options.target)?;
     let before = top_level_names(&options.target)?;
@@ -117,7 +112,7 @@ pub fn run(options: &DeriveOutfitsOptions) -> Result<DeriveOutfitsReport> {
     write_atomic(&catalog_path, text.as_bytes())?;
     // A partial overlay would pass for a complete one at the next engine start. Remove it when
     // anything after the write goes wrong.
-    let finish = verify_after_write(&options.target, &before, &protected);
+    let finish = verify_after_write(&options.target, &before, &protected, &identity);
     if let Err(error) = finish {
         let _ = fs::remove_file(&catalog_path);
         return Err(error);
@@ -188,6 +183,7 @@ fn verify_after_write(
     target: &Path,
     before: &BTreeSet<String>,
     protected: &[(PathBuf, u64, SystemTime)],
+    identity: &PackIdentity,
 ) -> Result<()> {
     for (path, length, modified) in protected {
         let metadata = fs::metadata(path)?;
@@ -204,11 +200,12 @@ fn verify_after_write(
         added.is_subset(&allowed),
         "the derive changed the clone beyond {CATALOG_FILE}: new entries {added:?}"
     );
-    let written: ActorOutfitCatalog = serde_json::from_slice(&fs::read(target.join(CATALOG_FILE))?)
-        .wrap_err("the new catalog does not read back")?;
+    let written: ActorOutfitCatalogFile =
+        serde_json::from_slice(&fs::read(target.join(CATALOG_FILE))?)
+            .wrap_err("the new catalog does not read back")?;
     written
-        .validate()
-        .map_err(|reason| color_eyre::eyre::eyre!("the new catalog is invalid: {reason}"))
+        .validate_for(identity)
+        .wrap_err("the new catalog is invalid")
 }
 
 fn top_level_names(directory: &Path) -> Result<BTreeSet<String>> {
@@ -404,114 +401,6 @@ fn check_world_inputs(connection: &Connection) -> Result<u32> {
         "refused: the world database has no OTFT records, so there is no outfit to derive"
     );
     Ok(schema)
-}
-
-/// The winning actor and armor records with their exact header flags.
-///
-/// Header flags come from `inhouse_source_records`. A pack without that table has no flags, so a
-/// deleted record there reads as present; the receipt records which source was used.
-#[cfg(test)]
-fn load_records(connection: &Connection) -> Result<(HashMap<u32, RawRecord>, bool)> {
-    let has_headers: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='inhouse_source_records')",
-        [],
-        |row| row.get(0),
-    )?;
-    let sql = if has_headers {
-        format!(
-            "SELECT r.form_id, r.record_type, r.load_order, r.data, COALESCE(h.flags, 0) \
-             FROM records r LEFT JOIN inhouse_source_records h \
-             ON h.form_id = r.form_id AND h.load_order = r.load_order AND h.record_type = r.record_type \
-             WHERE r.record_type IN ({RECORD_TYPES})"
-        )
-    } else {
-        format!(
-            "SELECT form_id, record_type, load_order, data, 0 FROM records \
-             WHERE record_type IN ({RECORD_TYPES})"
-        )
-    };
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, u32>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, u32>(4)?,
-        ))
-    })?;
-    let mut records = HashMap::new();
-    for row in rows {
-        let (id, kind, load_order, bytes, flags) = row?;
-        let data =
-            rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-                .map_err(|error| color_eyre::eyre::eyre!("record {id:08X} {kind}: {error}"))?;
-        let record_type: [u8; 4] = kind
-            .as_bytes()
-            .try_into()
-            .map_err(|_| color_eyre::eyre::eyre!("record {id:08X} has type `{kind}`"))?;
-        records.insert(
-            id,
-            RawRecord {
-                form_id: id,
-                record_type,
-                flags,
-                subrecords: data
-                    .subrecords
-                    .into_iter()
-                    .map(|field| (field.tag.to_vec(), field.data))
-                    .collect(),
-                cell_form_id: None,
-                worldspace_form_id: None,
-                load_order,
-            },
-        );
-    }
-    Ok((records, has_headers))
-}
-
-/// The published `actor_models` rows: race, sex and resolution are read, not recomputed, so the
-/// outfit follows exactly the actors the engine spawns.
-#[cfg(test)]
-fn load_models(connection: &Connection) -> Result<ActorModelCatalog> {
-    let mut statement =
-        connection.prepare("SELECT id, race_id, sex, resolution FROM actor_models")?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, u32>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let mut catalog = ActorModelCatalog::default();
-    for row in rows {
-        let (id, race_id, sex, resolution) = row?;
-        let sex = match sex.as_str() {
-            "male" => "male",
-            "female" => "female",
-            _ => continue,
-        };
-        let resolution = match resolution.as_str() {
-            "body" => "body",
-            "body_head" => "body_head",
-            "unresolved" => "unresolved",
-            _ => continue,
-        };
-        catalog.models.push(ActorModelRow {
-            id,
-            race_id,
-            sex,
-            skin_armo_id: None,
-            head_model: None,
-            head_source: None,
-            resolution,
-            skin_tone: None,
-            weight: None,
-        });
-    }
-    catalog.models.sort_by_key(|row| row.id);
-    Ok(catalog)
 }
 
 #[cfg(test)]

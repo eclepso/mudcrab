@@ -73,6 +73,7 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail, eyre},
 };
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use shared::terrain_mesh::{
     DEFAULT_LAND_TEXTURE_FORM_ID, LAND_TEXTURE_TABLE_PATH, LandTextureDefault, LandTextureRequest,

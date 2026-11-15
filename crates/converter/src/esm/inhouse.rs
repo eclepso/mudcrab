@@ -1,10 +1,11 @@
 //! Adapt schema-decoded fields to the established runtime projections.
 //! Source payloads remain separate from resolved canonical projection fields.
 
-use crate::{config::RecordReader, esm::RecordConversion, records};
+use crate::{config::RecordReader, records};
 #[cfg(test)]
 use crate::{
     esm::{
+        RecordConversion,
         cell_cache::validate_inhouse_land,
         exporter::{
             create_tables, export_inhouse_record_archive_to_db, export_inhouse_to_db,
@@ -22,14 +23,12 @@ use rusqlite::params;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
 #[cfg(test)]
-use std::{
-    io::{BufWriter, Write},
-    time::Instant,
-};
+use std::{io::BufWriter, time::Instant};
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
 pub const ADAPTER_VERSION: u32 = 14;
@@ -840,6 +839,7 @@ pub(crate) fn convert_plugins(
 
 /// Publish usable records with bounded recovery warnings and compatibility notices.
 /// One authoritative text-source policy applies to candidate admission and publication.
+#[cfg(test)]
 pub(crate) fn convert_plugins_with_string_sources_report(
     plugin_paths: &[PathBuf],
     db_path: &Path,
