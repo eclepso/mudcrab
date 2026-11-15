@@ -4,6 +4,55 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
+/// Diagnostic storage follows permissive converter admission rather than runtime slot widths.
+fn light_archive_round_trip(local: u32, version: f32) {
+    let root = tempfile::tempdir().unwrap();
+    let body = [
+        record(b"STAT", local, &[]),
+        group(
+            local,
+            6,
+            &record(b"REFR", 0x811, &sub(b"NAME", &local.to_le_bytes())),
+        ),
+    ]
+    .concat();
+    plugin(root.path(), "Light.esl", &[], true, &body);
+    let path = root.path().join("Light.esl");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[30..34].copy_from_slice(&version.to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+    let converted = EsmParser::merge_plugins_form_keys(&[path]).unwrap();
+    assert_eq!(converted.records.len(), 2);
+    let mut connection = Connection::open_in_memory().unwrap();
+    assert!(
+        converted.write_source_archive(&mut connection).is_ok(),
+        "archive rejected an admitted native light identity"
+    );
+    let archive = SourceArchive::read(&connection).unwrap();
+    let placed = archive
+        .records
+        .iter()
+        .find(|row| row.key.local() == 0x811)
+        .unwrap();
+    assert_eq!(
+        placed.cell.unwrap().to_packed(),
+        0x0100_0000 | u64::from(local)
+    );
+    assert_eq!(placed.links[0].key, placed.cell);
+}
+
+/// Low native light locals remain archiveable with an original pre-1.71 header.
+#[test]
+fn archive_light_compatibility_keeps_low_pre171_locals() {
+    light_archive_round_trip(0x123, 1.70);
+}
+
+/// Native archives retain owners whose local cannot be represented in a legacy light slot.
+#[test]
+fn archive_light_compatibility_keeps_locals_above_legacy_width() {
+    light_archive_round_trip(0x1234, 1.71);
+}
+
 /// Archive group keys use original MAST order, independently of owner allocation.
 fn grouped_conversion(root: &Path) -> converter::esm::form_key_merge::FormKeyConversion {
     plugin(root, "Zulu.esm", &[], false, &[]);

@@ -11,7 +11,6 @@ use rusqlite::{Connection, params};
 use shared::{
     form_key::{FormKey, PluginId},
     pack_identity::PackIdentity,
-    source_form_id::{self, Resolution, SourceFormId, ZeroPolicy},
 };
 use std::path::PathBuf;
 
@@ -172,6 +171,7 @@ fn validate_link_context(
 }
 
 /// Authenticate optional field/group keys using the same native rules as record admission.
+/// Like `FormKeyOrder::resolve`, this retains light locals outside legacy slot/header limits.
 /// This checks an internal snapshot or stored archive, after per-item plugin recovery.
 fn validate_source_context(
     identity: &PackIdentity,
@@ -179,18 +179,22 @@ fn validate_source_context(
     word: Option<u32>,
     key: Option<FormKey>,
 ) -> Result<()> {
-    let outcome = source_form_id::resolve(
-        identity.table(),
-        SourceFormId {
-            raw: word.unwrap_or(0),
-            containing_plugin: supplier,
-        },
-        ZeroPolicy::Null,
-    );
-    let expected = match outcome {
-        Resolution::Resolved(key) | Resolution::SelfProjected { key, .. } => Some(key),
-        Resolution::Null => None,
-        other => color_eyre::eyre::bail!("invalid archived source context: {other:?}"),
+    let entry = identity
+        .table()
+        .entry(supplier)
+        .ok_or_else(|| color_eyre::eyre::eyre!("unknown source supplier"))?;
+    let raw = word.unwrap_or(0);
+    let owner = match entry.facts.masters.get((raw >> 24) as usize) {
+        Some(master) => identity
+            .table()
+            .id(master)
+            .ok_or_else(|| color_eyre::eyre::eyre!("unknown source master"))?,
+        None => supplier,
+    };
+    let expected = if raw == 0 {
+        None
+    } else {
+        Some(FormKey::new(owner, raw & 0x00ff_ffff)?)
     };
     ensure!(
         key == expected,
