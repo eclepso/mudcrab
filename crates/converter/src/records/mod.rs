@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod fidelity;
 pub mod history;
 pub mod history_source;
+pub mod native;
 pub(crate) mod profile;
 pub(crate) mod scanner;
 pub mod schema_format;
@@ -14,6 +15,9 @@ pub(crate) mod schema_lineage;
 pub mod source_identity;
 pub(crate) mod typed_export;
 pub mod vmad;
+pub use native::{
+    NativeReadResult, NativeRecord, read_plugins_form_keys, read_plugins_form_keys_with_validation,
+};
 
 #[cfg(test)]
 pub(crate) mod review_recovery_tests;
@@ -43,6 +47,8 @@ pub enum Value {
     String(String),
     LocalizedString(u32),
     FormId(u32),
+    /// Native semantic identity, portable by name; canonical source words remain four bytes.
+    NativeFormKey(shared::form_key::NamedFormKey),
     Bytes(Vec<u8>),
     /// Internal first-pass bytes resolved after accepted winner kinds are known.
     Deferred(Vec<u8>),
@@ -84,6 +90,7 @@ impl PartialEq for Value {
             (Self::String(a), Self::String(b)) => a == b,
             (Self::LocalizedString(a), Self::LocalizedString(b)) => a == b,
             (Self::FormId(a), Self::FormId(b)) => a == b,
+            (Self::NativeFormKey(a), Self::NativeFormKey(b)) => a == b,
             (Self::Bytes(a), Self::Bytes(b)) | (Self::Deferred(a), Self::Deferred(b)) => a == b,
             (Self::Struct(a), Self::Struct(b)) => a == b,
             (Self::Array(a), Self::Array(b)) => a == b,
@@ -117,6 +124,9 @@ impl Serialize for Value {
                 serializer.serialize_newtype_variant("Value", 4, "LocalizedString", value)
             }
             Self::FormId(value) => {
+                serializer.serialize_newtype_variant("Value", 5, "FormId", value)
+            }
+            Self::NativeFormKey(value) => {
                 serializer.serialize_newtype_variant("Value", 5, "FormId", value)
             }
             Self::Bytes(value) => serializer.serialize_newtype_variant("Value", 6, "Bytes", value),
@@ -705,7 +715,8 @@ fn read_plugins_with_prepared(
                 .flatten();
             let offset = scanned.source_record_offset;
             let context = decoder::Context {
-                order,
+                native: None,
+                order: Some(order),
                 plugin_index: index,
                 localized: order.metadata[index].flags & 0x80 != 0,
                 source_ids: Some(&source_ids),

@@ -1,11 +1,149 @@
 //! Optional, typed idle bindings produced from effective RACE authoring and actor bodies.
 //! The catalog carries full runtime keys; consumers never infer a rig from a species name.
 
+use crate::{form_key::NamedFormKey, pack_identity::PackIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PATH: &str = "meshes/actor-idles/catalog.json";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+/// Named wire representation; numeric keys remain inside authenticated pack members.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActorIdleCatalogFile {
+    pub version: u32,
+    pub pack_identity: String,
+    pub bindings: Vec<ActorIdleBindingFile>,
+    pub unresolved: Vec<UnresolvedIdleFile>,
+    #[serde(default)]
+    pub clip_issues: Vec<IdleClipIssueFile>,
+    #[serde(default)]
+    pub discovery_issues: Vec<String>,
+    #[serde(default)]
+    pub excluded: Vec<UnresolvedIdleFile>,
+}
+
+/// Named wire representation; numeric keys remain inside authenticated pack members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorIdleBindingFile {
+    pub race_id: NamedFormKey,
+    pub sex: String,
+    pub body_scene: String,
+    pub project: String,
+    pub skeleton: String,
+    pub race_skeleton_nif: String,
+    pub bound_tracks: usize,
+    pub moving_bound_tracks: usize,
+    pub skipped_tracks: Vec<String>,
+    pub source: String,
+    pub scene: String,
+    pub clips: BTreeMap<String, ActorIdleClip>,
+}
+
+/// Named wire representation; numeric keys remain inside authenticated pack members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdleClipIssueFile {
+    pub race_id: NamedFormKey,
+    pub sex: String,
+    pub body_scene: String,
+    pub source: String,
+    pub reason: String,
+    pub not_applicable: bool,
+    pub identified_as_idle: bool,
+}
+
+/// Named wire representation; numeric keys remain inside authenticated pack members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnresolvedIdleFile {
+    pub race_id: NamedFormKey,
+    pub sex: String,
+    pub body_scene: String,
+    pub reason: String,
+}
+
+impl ActorIdleCatalogFile {
+    /// Authenticate the producing pack before interpreting any portable record identity.
+    pub fn validate_for(&self, identity: &PackIdentity) -> color_eyre::Result<()> {
+        color_eyre::eyre::ensure!(
+            self.version == VERSION,
+            "unsupported actor idle catalog; convert again"
+        );
+        color_eyre::eyre::ensure!(
+            self.pack_identity == identity.digest_hex(),
+            "actor idle catalog belongs to another conversion; convert again"
+        );
+        let mut seen = BTreeSet::new();
+        for row in &self.bindings {
+            let key = identity
+                .table()
+                .intern(&row.race_id)?
+                .ok_or_else(|| color_eyre::eyre::eyre!("idle binding has no race identity"))?;
+            color_eyre::eyre::ensure!(
+                seen.insert((key, &row.sex, &row.body_scene)),
+                "duplicate actor idle binding"
+            );
+            // Metadata validation is deliberately independent of identity validation above.
+            // The zero here never leaves this one-row metadata probe or becomes a handle.
+            let mut metadata = serde_json::to_value(row)?;
+            metadata["race_id"] = serde_json::json!(0);
+            let probe = ActorIdleCatalog {
+                version: VERSION,
+                bindings: vec![serde_json::from_value(metadata)?],
+                ..Default::default()
+            };
+            probe.validate().map_err(color_eyre::eyre::Error::msg)?;
+        }
+        for row in self.unresolved.iter().chain(&self.excluded) {
+            identity.table().intern(&row.race_id)?;
+        }
+        for row in &self.clip_issues {
+            identity.table().intern(&row.race_id)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve representable runtime races and retain valid neighboring bindings.
+    pub fn to_runtime(&self, identity: &PackIdentity) -> color_eyre::Result<ActorIdleCatalog> {
+        self.validate_for(identity)?;
+        let mut value = serde_json::to_value(self)?;
+        value
+            .as_object_mut()
+            .expect("catalog object")
+            .remove("pack_identity");
+        let mut unavailable = 0usize;
+        for group in ["bindings", "unresolved", "clip_issues", "excluded"] {
+            let Some(rows) = value
+                .get_mut(group)
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            let mut kept = Vec::with_capacity(rows.len());
+            for mut row in rows.drain(..) {
+                let named: NamedFormKey = serde_json::from_value(row["race_id"].clone())?;
+                let result = identity
+                    .table()
+                    .intern(&named)
+                    .map_err(color_eyre::eyre::Error::new)
+                    .and_then(|key| key.map_or(Ok(0), |key| identity.runtime_id(key)));
+                match result {
+                    Ok(runtime) => {
+                        row["race_id"] = serde_json::json!(runtime);
+                        kept.push(row);
+                    }
+                    Err(_) => unavailable += 1,
+                }
+            }
+            *rows = kept;
+        }
+        let mut catalog: ActorIdleCatalog = serde_json::from_value(value)?;
+        if unavailable != 0 {
+            catalog.discovery_issues.push(format!("{unavailable} actor idle entries require runtime identity slots unavailable before step 4"));
+        }
+        catalog.validate().map_err(color_eyre::eyre::Error::msg)?;
+        Ok(catalog)
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActorIdleCatalog {
@@ -161,6 +299,35 @@ pub fn validate_clip(source: &str, clip: &ActorIdleClip) -> Result<(), &'static 
 }
 
 impl ActorIdleCatalog {
+    /// Encode the runtime helper's identities as explicit names rather than JSON numbers.
+    /// Cap-free converter producers construct `ActorIdleCatalogFile` from FormKeys directly.
+    pub fn to_file(&self, identity: &PackIdentity) -> color_eyre::Result<ActorIdleCatalogFile> {
+        self.validate().map_err(color_eyre::eyre::Error::msg)?;
+        let mut value = serde_json::to_value(self)?;
+        value["pack_identity"] = serde_json::json!(identity.digest_hex());
+        for group in ["bindings", "unresolved", "clip_issues", "excluded"] {
+            let Some(rows) = value
+                .get_mut(group)
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for row in rows {
+                let raw = row["race_id"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| color_eyre::eyre::eyre!("invalid runtime race handle"))?;
+                row["race_id"] = match identity.runtime_key(raw)? {
+                    Some(key) => serde_json::to_value(identity.table().named(key)?)?,
+                    None => serde_json::Value::Null,
+                };
+            }
+        }
+        let file: ActorIdleCatalogFile = serde_json::from_value(value)?;
+        file.validate_for(identity)?;
+        Ok(file)
+    }
+
     /// Reject the whole catalog if a key or identity is ambiguous. An optional sidecar must
     /// not turn a malformed binding into an unrelated actor's animation.
     pub fn validate(&self) -> Result<(), &'static str> {

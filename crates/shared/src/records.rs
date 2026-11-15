@@ -5,6 +5,10 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+#[path = "records_context.rs"]
+mod context;
+pub use context::{ContextualRecord, RecordContextReader, RECORD_CONTEXT_VERSION, create_record_context, source_key};
+
 #[derive(Debug, Archive, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchivedSubRecord {
     pub tag: [u8; 4],

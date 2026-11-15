@@ -38,7 +38,7 @@ fn grass(id: u32, density: u8) -> Vec<u8> {
     )
 }
 
-/// Same-priority LAND uses the shared deterministic fallback in both cache and SQL.
+/// Same-priority LAND uses the same native source order in cache and SQL.
 #[test]
 fn same_priority_land_cells_publish_with_valid_neighbors() {
     const CHILD_ROOT: &str = "MUDCRAB_AMBIGUOUS_LAND_TEST_ROOT";
@@ -47,27 +47,46 @@ fn same_priority_land_cells_publish_with_valid_neighbors() {
         let paths = [root.join("Base.esm"), root.join("Patch.esp")];
         let db = root.join("world.db");
         EsmParser::convert_plugins(&paths, &db).unwrap();
-        let records = EsmParser::merge_plugins(&paths).unwrap();
-        let path = root.join("cell_cache.rkyv");
+        let records = EsmParser::merge_plugins_form_keys(&paths).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+        let positions = conn
+            .prepare("SELECT form_id,source_record_offset FROM inhouse_terrain_source_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u64>(1)?)))
+            .unwrap()
+            .map(|row| {
+                let (key, position) = row.unwrap();
+                (identity.required_key(key).unwrap(), position)
+            })
+            .collect();
+        let cache_directory = tempfile::tempdir_in(&root).unwrap();
+        let path = cache_directory.path().join("cell_cache.rkyv");
         assert_eq!(
-            converter::esm::cell_cache::write_cell_cache(&records, &path).unwrap(),
+            converter::esm::cell_cache::write_form_key_cell_cache(
+                &records, &positions, &path, false
+            )
+            .unwrap()
+            .0,
             4
         );
-        let cache =
-            rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(&fs::read(path).unwrap())
-                .unwrap();
-        let conn = rusqlite::Connection::open(db).unwrap();
-        for (cell, height) in [(100, 80.0), (200, 72.0), (300, 40.0), (400, 48.0)] {
+        let file = fs::read(path).unwrap();
+        let mut bytes = rkyv::util::AlignedVec::<16>::with_capacity(file.len());
+        bytes.extend_from_slice(&file);
+        let payload = shared::cache_identity::cell_cache_payload(&identity, &bytes, false).unwrap();
+        let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(payload).unwrap();
+        for (local, height) in [(100, 64.0), (200, 72.0), (300, 40.0), (400, 48.0)] {
+            let cell = identity.runtime_key(local).unwrap().unwrap();
             let terrain = cache
                 .cells
                 .iter()
-                .find(|land| land.cell_id == cell)
+                .find(|land| land.cell_id == cell.to_packed())
                 .unwrap();
             assert_eq!(terrain.heights[0], height);
             let bytes: Vec<u8> = conn
                 .query_row(
                     "SELECT heightmap FROM land WHERE cell_id=?1",
-                    [cell],
+                    [cell.to_sql_i64()],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -92,7 +111,7 @@ fn same_priority_land_cells_publish_with_valid_neighbors() {
         );
         assert_eq!(
             conn.query_row(
-                "SELECT record_type FROM records WHERE form_id=2304",
+                "SELECT record_type FROM records WHERE form_id=16779520",
                 [],
                 |row| row.get::<_, String>(0)
             )
@@ -135,7 +154,7 @@ fn same_priority_land_cells_publish_with_valid_neighbors() {
         0,
         [
             // IDs deliberately disagree with physical record order. The merged map
-            // lacks source positions, so the shared highest-ID fallback applies.
+            // supplies source positions; the final physical LAND must win.
             group(
                 100,
                 [

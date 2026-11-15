@@ -14,6 +14,9 @@ use crate::esm::{extractors::SubrecordView, records::RawRecord};
 use shared::actor_outfits::{ActorOutfit, ActorOutfitCatalog, OutfitPart, VERSION};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+pub mod form_keys;
+pub use form_keys::resolve_form_key_actor_outfits;
+
 /// `NPC_/ACBS` template flag: the actor uses its template's inventory and outfit.
 const USE_INVENTORY: u16 = 0x0100;
 

@@ -9,21 +9,25 @@
 //! contains one, that is not an exact copy of the named registered pack's manifests, or whose
 //! database lacks the tables it reads. Every refusal names its reason.
 
+#[cfg(test)]
 use crate::{
     actor_models::{ActorModelCatalog, ActorModelRow},
-    actor_outfits::resolve_actor_outfits,
-    cache::hash_file,
     esm::records::RawRecord,
 };
+use crate::{actor_outfits::resolve_form_key_actor_outfits, cache::hash_file};
 use color_eyre::{
     Result,
     eyre::{WrapErr, bail, ensure},
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-use shared::actor_outfits::{ActorOutfitCatalog, PATH as CATALOG_FILE};
+#[cfg(test)]
+use shared::actor_outfits::ActorOutfitCatalog;
+use shared::actor_outfits::PATH as CATALOG_FILE;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::{Instant, SystemTime},
@@ -32,7 +36,7 @@ use std::{
 /// Name of the receipt written beside the catalog.
 pub const RECEIPT_FILE: &str = "actor-outfits-receipt.json";
 /// Receipt format name, so a reader can recognise the file.
-pub const RECEIPT_FORMAT: &str = "actor-outfits-receipt/1";
+pub const RECEIPT_FORMAT: &str = "actor-outfits-receipt/2";
 
 /// Record types the resolver follows. `LVLI` is loaded only so a leveled list is counted as one.
 const RECORD_TYPES: &str = "'NPC_','RACE','OTFT','ARMO','ARMA','LVLI'";
@@ -91,13 +95,21 @@ pub fn run(options: &DeriveOutfitsOptions) -> Result<DeriveOutfitsReport> {
 
     let protected = protected_files(&options.target)?;
     let before = top_level_names(&options.target)?;
-    let (records, headers) = load_records(&connection)?;
-    let models = load_models(&connection)?;
+    let records: i64 = connection.query_row(
+        &format!("SELECT count(*) FROM records WHERE record_type IN ({RECORD_TYPES})"),
+        [],
+        |row| row.get(0),
+    )?;
+    let models: i64 =
+        connection.query_row("SELECT count(*) FROM actor_models", [], |row| row.get(0))?;
+    let headers: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='record_context')",
+        [],
+        |row| row.get(0),
+    )?;
     let target = options.target.clone();
-    let catalog = resolve_actor_outfits(&records, &models, &|scene| target.join(scene).is_file());
-    catalog
-        .validate()
-        .map_err(|reason| color_eyre::eyre::eyre!("the derived catalog is invalid: {reason}"))?;
+    let catalog =
+        resolve_form_key_actor_outfits(&connection, &|scene| target.join(scene).is_file())?;
 
     let catalog_path = options.target.join(CATALOG_FILE);
     let receipt_path = options.target.join(RECEIPT_FILE);
@@ -130,9 +142,9 @@ pub fn run(options: &DeriveOutfitsOptions) -> Result<DeriveOutfitsReport> {
         },
         "world_database_schema": schema,
         "inputs": {
-            "records_loaded": records.len(),
+            "records_loaded": records,
             "record_flags_from_source_headers": headers,
-            "actor_models": models.models.len(),
+            "actor_models": models,
         },
         "catalog": {
             "file": CATALOG_FILE,
@@ -358,10 +370,12 @@ fn check_world_inputs(connection: &Connection) -> Result<u32> {
         .wrap_err("refused: the world database has no schema_info version")?;
     ensure!(
         shared::supports_runtime_world_database_schema(schema),
-        "refused: world database schema {schema} is outside the runtime range {} to {}",
+        "refused: world database schema {schema} is outside the runtime range {} to {}; convert again",
         shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION,
         shared::WORLD_DATABASE_SCHEMA_VERSION
     );
+    shared::pack_identity::PackIdentity::read_sql(connection)
+        .wrap_err("refused: the world identity is unavailable; convert again")?;
     for (table, columns) in REQUIRED_COLUMNS {
         let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1)")?;
         let present: BTreeSet<String> = statement
@@ -396,6 +410,7 @@ fn check_world_inputs(connection: &Connection) -> Result<u32> {
 ///
 /// Header flags come from `inhouse_source_records`. A pack without that table has no flags, so a
 /// deleted record there reads as present; the receipt records which source was used.
+#[cfg(test)]
 fn load_records(connection: &Connection) -> Result<(HashMap<u32, RawRecord>, bool)> {
     let has_headers: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='inhouse_source_records')",
@@ -457,6 +472,7 @@ fn load_records(connection: &Connection) -> Result<(HashMap<u32, RawRecord>, boo
 
 /// The published `actor_models` rows: race, sex and resolution are read, not recomputed, so the
 /// outfit follows exactly the actors the engine spawns.
+#[cfg(test)]
 fn load_models(connection: &Connection) -> Result<ActorModelCatalog> {
     let mut statement =
         connection.prepare("SELECT id, race_id, sex, resolution FROM actor_models")?;

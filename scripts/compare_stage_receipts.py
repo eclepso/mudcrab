@@ -20,6 +20,9 @@ import math
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from form_key_identity import PackIdentity, TAMRIEL, named, require_schema
+
 
 STAGE3_RELATIVE = 0.02
 # One 8-bit step: a relative tolerance alone fails a channel that legitimately reads 0.0.
@@ -58,12 +61,22 @@ def malformed(stage, value):
 
 def compare(reference, candidate, relative, tolerance, absolute=STAGE3_ABSOLUTE):
     failures, skipped, passed = [], [], []
+    for label, document in (("reference", reference), ("candidate", candidate)):
+        try:
+            require_schema(document, "schema")
+            for field in ("worldspace_id", "interior_cell_id"):
+                if field in document["pose"]:
+                    named(document["pose"][field], nullable=True)
+        except (ValueError, KeyError, TypeError) as error:
+            failures.append(f"{label} identity: {error}")
     for key in POSE_KEYS:
         absent = [side for side, posed in (("the reference", reference["pose"]),
                                            ("the candidate", candidate["pose"])) if key not in posed]
         if absent:
             failures.append(f"pose {key}: missing from {' and '.join(absent)}")
-        elif reference["pose"][key] != candidate["pose"][key]:
+        elif (named(reference["pose"][key], True) != named(candidate["pose"][key], True)
+              if key in ("worldspace_id", "interior_cell_id") and not failures
+              else reference["pose"][key] != candidate["pose"][key]):
             failures.append(f"pose {key}: {reference['pose'][key]} != {candidate['pose'][key]}")
     by_name = {probe["name"]: probe for probe in candidate["probes"]}
     for probe in reference["probes"]:

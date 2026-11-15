@@ -133,8 +133,8 @@ fn put_record(hasher: &mut Sha256, record: &RawRecord, masters: &[String]) {
 /// One cell mesh with the placement the chunk file needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacedCellMesh {
-    /// The WRLD FormID (load-order numbering) the cell belongs to.
-    pub worldspace_id: u32,
+    /// The checked pack-scoped WRLD FormKey the cell belongs to.
+    pub worldspace_id: u64,
     /// The cell's grid position in its worldspace; negative west or south of the origin.
     pub grid_x: i32,
     pub grid_y: i32,
@@ -144,7 +144,7 @@ pub struct PlacedCellMesh {
 /// One worldspace's share of a [`ChunkWriteReport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldspaceChunkWrite {
-    pub worldspace_id: u32,
+    pub worldspace_id: u64,
     /// Chunk files written for this worldspace.
     pub files: usize,
     /// Cell meshes written across those files.
@@ -175,10 +175,27 @@ pub fn write_terrain_chunks(
     output_root: &Path,
     cells: Vec<PlacedCellMesh>,
 ) -> Result<ChunkWriteReport> {
-    let mut by_chunk: BTreeMap<(u32, i32, i32), Vec<TerrainCellMesh>> = BTreeMap::new();
-    let mut seen: HashMap<(u32, u32), (i32, i32)> = HashMap::new();
+    let database = rusqlite::Connection::open_with_flags(
+        output_root.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .wrap_err("terrain publication requires authenticated world context; convert again")?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&database)?;
+    write_form_key_terrain_chunks(output_root, &identity, cells)
+}
+
+/// Publish chunks bound to the same immutable plugin allocation as their world database.
+pub fn write_form_key_terrain_chunks(
+    output_root: &Path,
+    identity: &shared::pack_identity::PackIdentity,
+    cells: Vec<PlacedCellMesh>,
+) -> Result<ChunkWriteReport> {
+    let mut by_chunk: BTreeMap<(u64, i32, i32), Vec<TerrainCellMesh>> = BTreeMap::new();
+    let mut seen: HashMap<(u64, u64), (i32, i32)> = HashMap::new();
     for cell in cells {
         let mesh = cell.mesh;
+        shared::cache_identity::required(identity, cell.worldspace_id)?;
+        shared::cache_identity::required(identity, mesh.cell_id)?;
         if let Some(first) = seen.insert(
             (cell.worldspace_id, mesh.cell_id),
             (cell.grid_x, cell.grid_y),
@@ -195,7 +212,7 @@ pub fn write_terrain_chunks(
         }
         // Every slot texture is known by construction; the map only lets the shared check run,
         // as `build_cell_mesh` does. The game-wide land-texture table is checked at load.
-        let ids: HashMap<u32, u16> = mesh
+        let ids: HashMap<u64, u16> = mesh
             .quadrant_slots
             .iter()
             .map(|&ltex| (ltex, 0))
@@ -216,7 +233,23 @@ pub fn write_terrain_chunks(
         bytes: 0,
     };
     for ((worldspace_id, chunk_x, chunk_y), mut chunk_cells) in by_chunk {
-        chunk_cells.sort_unstable_by_key(|mesh| mesh.cell_id);
+        chunk_cells.sort_unstable_by_key(|mesh| {
+            let key = shared::cache_identity::required(identity, mesh.cell_id)
+                .expect("validated CELL key");
+            let entry = identity
+                .table()
+                .entry(key.plugin())
+                .expect("allocated CELL owner");
+            (
+                u8::from(entry.facts.flags.light),
+                identity
+                    .order()
+                    .iter()
+                    .position(|owner| *owner == key.plugin())
+                    .unwrap_or(usize::MAX),
+                key.local(),
+            )
+        });
         let cell_count = chunk_cells.len();
         // The path is derived from a cell of the chunk's south-west corner, the one coordinate
         // `terrain_chunk_path` maps back to this chunk.
@@ -226,11 +259,14 @@ pub fn write_terrain_chunks(
             chunk_y * TERRAIN_CHUNK_SIDE_CELLS,
         );
         let path = output_root.join(&relative);
-        let bytes = rkyv::to_bytes::<Error>(&TerrainChunkFile {
-            format_version: TERRAIN_MESH_FORMAT_VERSION,
-            worldspace_id,
-            cells: chunk_cells,
-        })
+        let bytes = shared::cache_identity::encode_terrain_chunk(
+            identity,
+            &TerrainChunkFile {
+                format_version: TERRAIN_MESH_FORMAT_VERSION,
+                worldspace_id,
+                cells: chunk_cells,
+            },
+        )
         .wrap_err_with(|| format!("failed to serialize terrain chunk {relative}"))?;
         write_atomically(&path, &bytes)
             .wrap_err_with(|| format!("failed to write terrain chunk {relative}"))?;
@@ -258,12 +294,31 @@ pub fn write_terrain_chunks(
 /// Reads one terrain chunk file, validating the archive as it reads (rkyv bytecheck) and
 /// refusing a [`TERRAIN_MESH_FORMAT_VERSION`] it does not know.
 pub fn read_terrain_chunk(path: &Path) -> Result<TerrainChunkFile> {
+    let root = path
+        .ancestors()
+        .find(|root| root.join("skyrim_world.db").is_file())
+        .ok_or_else(|| eyre!("terrain chunk has no world allocation; convert again"))?;
+    let database = rusqlite::Connection::open_with_flags(
+        root.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&database)?;
+    read_form_key_terrain_chunk(path, &identity)
+}
+
+/// Authenticate a chunk's fixed envelope before accessing its changed rkyv root.
+pub fn read_form_key_terrain_chunk(
+    path: &Path,
+    identity: &shared::pack_identity::PackIdentity,
+) -> Result<TerrainChunkFile> {
     let file = fs::read(path)
         .wrap_err_with(|| format!("failed to read terrain chunk {}", path.display()))?;
-    // rkyv needs an aligned buffer; a plain Vec<u8> is only checked in debug builds.
+    // Align the entire envelope; its fixed 96-byte header preserves 16-byte payload alignment.
     let mut bytes = rkyv::util::AlignedVec::<16>::with_capacity(file.len());
     bytes.extend_from_slice(&file);
-    let archived = rkyv::access::<shared::terrain_mesh::ArchivedTerrainChunkFile, Error>(&bytes)
+    let payload = shared::cache_identity::terrain_chunk_payload(identity, &bytes)
+        .wrap_err_with(|| format!("invalid terrain chunk {}", path.display()))?;
+    let archived = rkyv::access::<shared::terrain_mesh::ArchivedTerrainChunkFile, Error>(payload)
         .wrap_err_with(|| format!("invalid terrain chunk {}", path.display()))?;
     let chunk = rkyv::deserialize::<TerrainChunkFile, Error>(archived)
         .wrap_err_with(|| format!("invalid terrain chunk {}", path.display()))?;
@@ -319,8 +374,36 @@ mod tests {
     use shared::{LAND_SIDE, terrain_mesh::QUADRANT_VERTICES};
     use std::collections::HashSet;
 
-    const TAMRIEL: u32 = 0x0000_003C;
-    const SOLSTHEIM: u32 = 0x0001_4000;
+    const TAMRIEL: u64 = 0x0100_003C;
+    const SOLSTHEIM: u64 = 0x0101_4000;
+
+    fn bind_mesh(mut mesh: TerrainCellMesh) -> TerrainCellMesh {
+        mesh.cell_id |= 0x0100_0000;
+        for slot in &mut mesh.quadrant_slots {
+            if *slot != 0 {
+                *slot |= 0x0100_0000;
+            }
+        }
+        mesh
+    }
+
+    fn write_terrain_chunks(root: &Path, cells: Vec<PlacedCellMesh>) -> Result<ChunkWriteReport> {
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x56; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let owner = table.id("Fixture.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+        let mut db = rusqlite::Connection::open(root.join("skyrim_world.db")).unwrap();
+        let tx = db.transaction().unwrap();
+        identity.write_sql(&tx).unwrap();
+        tx.commit().unwrap();
+        super::write_terrain_chunks(root, cells)
+    }
 
     /// A record whose only content is one subrecord.
     fn record(record_type: [u8; 4], form_id: u32, tag: &[u8], data: &[u8]) -> RawRecord {
@@ -388,7 +471,7 @@ mod tests {
     }
 
     /// The mesh [`land`] builds, keyed by [`cell_mesh_key`].
-    fn placed(worldspace_id: u32, grid_x: i32, grid_y: i32, cell_id: u32) -> PlacedCellMesh {
+    fn placed(worldspace_id: u64, grid_x: i32, grid_y: i32, cell_id: u32) -> PlacedCellMesh {
         let record = land(cell_id);
         let known: HashSet<u32> = (0x100..0x104).collect();
         let key = cell_mesh_key(&record, &names(&["Skyrim.esm"]), &[], &[]);
@@ -397,7 +480,7 @@ mod tests {
             worldspace_id,
             grid_x,
             grid_y,
-            mesh,
+            mesh: bind_mesh(mesh),
         }
     }
 
@@ -568,7 +651,8 @@ mod tests {
         .sum();
         assert_eq!(report.bytes, on_disk, "every byte written is counted");
 
-        let chunk = read_terrain_chunk(&root.join("terrain/0000003c/chunk_0_0.rkyv")).unwrap();
+        let chunk =
+            read_terrain_chunk(&root.join("terrain/000000000100003c/chunk_0_0.rkyv")).unwrap();
         assert_eq!(chunk.format_version, TERRAIN_MESH_FORMAT_VERSION);
         assert_eq!(chunk.worldspace_id, TAMRIEL);
         assert_eq!(
@@ -577,7 +661,7 @@ mod tests {
                 .iter()
                 .map(|mesh| mesh.cell_id)
                 .collect::<Vec<_>>(),
-            vec![0x1000, 0x1001],
+            vec![0x0100_1000, 0x0100_1001],
             "cells are written sorted by cell_id, not in the order they were given"
         );
         assert_eq!(
@@ -589,16 +673,28 @@ mod tests {
             "the key travels in the file for the load-time check"
         );
 
-        let west = read_terrain_chunk(&root.join("terrain/0000003c/chunk_-1_-2.rkyv")).unwrap();
+        let west =
+            read_terrain_chunk(&root.join("terrain/000000000100003c/chunk_-1_-2.rkyv")).unwrap();
         assert_eq!(west.cells.len(), 1);
-        assert_eq!(west.cells[0].cell_id, 0x1003);
-        assert!(!root.join("terrain/0000003c/chunk_0_-1.rkyv").exists());
-        assert!(!root.join("terrain/0000003c/chunk_-1_-1.rkyv").exists());
-        let other = read_terrain_chunk(&root.join("terrain/00014000/chunk_-1_0.rkyv")).unwrap();
-        assert_eq!(other.worldspace_id, SOLSTHEIM);
-        assert_eq!(other.cells[0].cell_id, 0x2001);
+        assert_eq!(west.cells[0].cell_id, 0x0100_1003);
         assert!(
-            !root.join("terrain/0000003c/chunk_-1_0.rkyv").exists(),
+            !root
+                .join("terrain/000000000100003c/chunk_0_-1.rkyv")
+                .exists()
+        );
+        assert!(
+            !root
+                .join("terrain/000000000100003c/chunk_-1_-1.rkyv")
+                .exists()
+        );
+        let other =
+            read_terrain_chunk(&root.join("terrain/0000000001014000/chunk_-1_0.rkyv")).unwrap();
+        assert_eq!(other.worldspace_id, SOLSTHEIM);
+        assert_eq!(other.cells[0].cell_id, 0x0100_2001);
+        assert!(
+            !root
+                .join("terrain/000000000100003c/chunk_-1_0.rkyv")
+                .exists(),
             "a worldspace's cells never land in another worldspace's file"
         );
     }
@@ -623,8 +719,8 @@ mod tests {
         let cells = vec![placed(TAMRIEL, 0, 0, 0x1234), placed(TAMRIEL, 3, 3, 0x1234)];
         let error = write_terrain_chunks(dir.path(), cells).unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("00001234"), "{message}");
-        assert!(message.contains("0000003C"), "{message}");
+        assert!(message.contains("01001234"), "{message}");
+        assert!(message.contains("0100003C"), "{message}");
         assert!(
             !dir.path().join("terrain").exists(),
             "nothing is written for a rejected set"
@@ -665,11 +761,7 @@ mod tests {
         fs::write(&path, &wrong_version).unwrap();
         let error = read_terrain_chunk(&path).unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("format version"), "{message}");
-        assert!(
-            message.contains(&(TERRAIN_MESH_FORMAT_VERSION + 1).to_string()),
-            "{message}"
-        );
+        assert!(message.contains("convert"), "{message}");
     }
 
     #[test]
@@ -678,7 +770,7 @@ mod tests {
         let mut placed = placed(TAMRIEL, 0, 0, 0x1000);
         placed.mesh.heights[0] = f32::NAN;
         let error = write_terrain_chunks(dir.path(), vec![placed]).unwrap_err();
-        assert!(format!("{error:#}").contains("00001000"), "{error:#}");
+        assert!(format!("{error:#}").contains("01001000"), "{error:#}");
         assert!(!dir.path().join("terrain").exists());
     }
 
@@ -699,6 +791,7 @@ mod tests {
         let known: HashSet<u32> = (0x100..0x200).collect();
         let key = cell_mesh_key(&record, &names(&["Skyrim.esm"]), &[], &[]);
         let (mesh, report) = build_cell_mesh(0x1000, &record, &known, key).unwrap();
+        let mesh = bind_mesh(mesh);
         assert_eq!(mesh.slot_stride, 16);
         assert!(report.needed_stride_16);
         let quadrants = mesh.quadrant_slot_counts;

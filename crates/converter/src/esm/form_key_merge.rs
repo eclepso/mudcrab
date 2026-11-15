@@ -2,11 +2,30 @@
 //! FormKey follows Mutagen's owner/local identity; source payload words remain source-local.
 use super::{
     EsmParser, GameSettingIdentities, RemapWarnings, binary::parse_plugin_file_with_warnings,
-    form_keys::FormKeyOrder, records::RawRecord, remap_record_at_sites,
+    form_keys::FormKeyOrder, records::RawRecord, remap_record_at_sites_with_origins,
 };
 use color_eyre::Result;
 use shared::{form_key::FormKey, source_form_id::ZeroPolicy};
 use std::{cell::RefCell, collections::HashMap, path::PathBuf};
+
+/// Stored semantic outcome, independent of original four-byte source evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Resolved,
+    Null,
+    Cleared,
+}
+
+impl LinkOutcome {
+    /// Stable SQL spelling for the versioned resolved-link contract.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Null => "null",
+            Self::Cleared => "cleared",
+        }
+    }
+}
 
 /// A recognized native link resolved without any runtime slot allocation.
 #[derive(Debug, Clone)]
@@ -18,15 +37,57 @@ pub struct ResolvedLink {
     pub byte_offset: usize,
     pub source_word: u32,
     pub key: Option<FormKey>,
+    pub outcome: LinkOutcome,
 }
 
 /// Native supplier bytes and resolved identities are separate from legacy writer projections.
 #[derive(Debug)]
 pub struct FormKeyRecord {
     pub source: RawRecord,
+    /// Sanitized runtime fields retain native words; original source is diagnostic evidence.
+    pub canonical: Option<RawRecord>,
+    /// Original source ordinal for each sanitized canonical occurrence.
+    pub canonical_ordinals: Vec<usize>,
+    /// Resolved localized scalar text by original occurrence; None means omit the runtime value.
+    pub localized_text: std::collections::BTreeMap<usize, Option<String>>,
+    /// Original occurrences retained as evidence but not certified for scalar runtime projection.
+    pub runtime_omitted: std::collections::BTreeSet<usize>,
     pub cell: Option<FormKey>,
     pub worldspace: Option<FormKey>,
     pub links: Vec<ResolvedLink>,
+}
+
+impl FormKeyRecord {
+    /// Bounded canonical fields for projection without rewriting native links.
+    pub fn canonical_record(&self) -> &RawRecord {
+        self.canonical.as_ref().unwrap_or(&self.source)
+    }
+
+    /// Keep omitted/repeated/opaque occurrences distinct across canonical serialization.
+    pub fn source_ordinal(&self, canonical_ordinal: usize) -> Result<usize> {
+        if self.canonical.is_none() {
+            return Ok(canonical_ordinal);
+        }
+        self.canonical_ordinals
+            .get(canonical_ordinal)
+            .copied()
+            .ok_or_else(|| color_eyre::eyre::eyre!("canonical occurrence has no source origin"))
+    }
+
+    /// Resolve only a recognized physical site; missing metadata is never guessed from bytes.
+    pub fn resolved_at(
+        &self,
+        source_ordinal: usize,
+        byte_offset: usize,
+    ) -> Result<Option<FormKey>> {
+        self.links
+            .iter()
+            .find(|site| site.subrecord == source_ordinal && site.byte_offset == byte_offset)
+            .map(|site| site.key)
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("missing resolved link site {source_ordinal}:{byte_offset}")
+            })
+    }
 }
 
 /// A cap-free native winner set. Numeric keys have meaning only with this run's plugin table.
@@ -93,6 +154,15 @@ impl EsmParser {
                 .expect("allocated supplier")
                 .display_name;
             let (native, parser_warnings) = parse_plugin_file_with_warnings(path)?;
+            let source_keys = native
+                .iter()
+                .filter_map(|record| {
+                    order
+                        .resolve(priority, record.form_id, ZeroPolicy::Null)
+                        .ok()
+                        .flatten()
+                })
+                .collect::<std::collections::HashSet<_>>();
             summaries.extend(parser_warnings);
             for mut source in native {
                 source.load_order = priority as u32;
@@ -111,7 +181,7 @@ impl EsmParser {
                 };
                 let links = RefCell::new(Vec::new());
                 let mut checked = source.clone();
-                let admission = remap_record_at_sites(
+                let admission = remap_record_at_sites_with_origins(
                     &mut checked,
                     name,
                     &warnings,
@@ -128,7 +198,29 @@ impl EsmParser {
                         Ok(word)
                     },
                     |subrecord, signature, byte_offset, word, _| {
-                        let resolved = order.resolve(priority, word, ZeroPolicy::Null)?;
+                        let mut resolved = order.resolve(priority, word, ZeroPolicy::Null)?;
+                        let past_master = (word >> 24) as usize
+                            > order
+                                .table
+                                .entry(order.order[priority])
+                                .expect("supplier")
+                                .facts
+                                .masters
+                                .len();
+                        let mut outcome = if resolved.is_some() {
+                            LinkOutcome::Resolved
+                        } else {
+                            LinkOutcome::Null
+                        };
+                        if past_master
+                            && resolved.is_some_and(|key| {
+                                key.local() >= 0x800 && !source_keys.contains(&key)
+                            })
+                        {
+                            warnings.skipped_optional(name, format!("{} record source {raw:08X}: optional FormID {word:08X} exceeds master list", String::from_utf8_lossy(&source.record_type)));
+                            resolved = None;
+                            outcome = LinkOutcome::Cleared;
+                        }
                         if resolved.is_some() {
                             order.note_projection(priority, word);
                         }
@@ -138,14 +230,48 @@ impl EsmParser {
                             byte_offset,
                             source_word: word,
                             key: resolved,
+                            outcome,
                         });
                         Ok(word)
                     },
                     false,
                 );
-                if let Err(error) = admission {
-                    warnings.skipped_record(name, &source, raw, error.to_string());
-                    continue;
+                let canonical_ordinals = match admission {
+                    Ok(ordinals) => ordinals,
+                    Err(error) => {
+                        warnings.skipped_record(name, &source, raw, error.to_string());
+                        continue;
+                    }
+                };
+                links
+                    .borrow_mut()
+                    .retain(|link| canonical_ordinals.contains(&link.subrecord));
+                if !source.is_deleted() {
+                    let validation = if matches!(&source.record_type, b"GMST" | b"RACE") {
+                        super::exporter::validate_inhouse_record(&checked)
+                            .map_err(color_eyre::eyre::Error::from)
+                    } else if source.record_type == *b"MOVT"
+                        && key.is_some_and(|key| {
+                            key.local() == 0x3580d
+                                && order
+                                    .table()
+                                    .entry(key.plugin())
+                                    .is_some_and(|entry| entry.normalized_name == "skyrim.esm")
+                        })
+                    {
+                        let mut selected = checked.clone();
+                        selected.form_id = 0x3580d;
+                        super::exporter::validate_inhouse_record(&selected)
+                            .map_err(color_eyre::eyre::Error::from)
+                    } else if source.record_type == *b"LAND" {
+                        super::cell_cache::validate_inhouse_land(&checked)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = validation {
+                        warnings.skipped_record(name, &source, raw, error.to_string());
+                        continue;
+                    }
                 }
                 // from_facts allocates every supplier and requires all original masters to precede it.
                 if let Some(key) = key {
@@ -236,6 +362,10 @@ impl EsmParser {
                         key,
                         FormKeyRecord {
                             source,
+                            canonical: Some(checked),
+                            canonical_ordinals,
+                            localized_text: Default::default(),
+                            runtime_omitted: Default::default(),
                             cell,
                             worldspace,
                             links: links.into_inner(),

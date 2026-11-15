@@ -84,12 +84,25 @@ fn record_decode_visit(field: &FieldSchema, diagnostics: &PluginDiagnostics) {
 
 /// Per-file interpretation supplied by the shared load-order authority.
 pub(crate) struct Context<'a> {
-    pub order: &'a LoadOrder,
+    pub order: Option<&'a LoadOrder>,
+    /// Native production resolution never projects through legacy runtime slots.
+    pub native: Option<&'a super::native::DecodeContext<'a>>,
     pub plugin_index: usize,
     pub localized: bool,
     /// All safely observed source headers, including forward optional-link targets.
     pub source_ids: Option<&'a std::collections::HashSet<u32>>,
     pub winning_types: Option<&'a HashMap<u32, [u8; 4]>>,
+}
+
+impl Context<'_> {
+    /// Catalogue probes resolve source context without recording a physical link occurrence.
+    fn link_kind(&self, word: u32) -> Option<[u8; 4]> {
+        if let Some(native) = self.native {
+            return native.link_kind(word);
+        }
+        let id = remap(word, self, true, &mut PluginDiagnostics::default()).ok()?;
+        self.winning_types?.get(&id).copied()
+    }
 }
 
 /// A first-pass link observation needed to preserve contextual replay event keys.
@@ -508,6 +521,15 @@ fn subrecords<'a>(
     }
 }
 
+/// Preserve the same safely framed source prefix used by the typed decoder.
+pub(super) fn native_source_fields(payload: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    subrecords(payload, &mut PluginDiagnostics::default(), 0)
+        .fields
+        .into_iter()
+        .map(|(signature, bytes)| (signature.to_vec(), bytes.to_vec()))
+        .collect()
+}
+
 /// Resolve native words before the named legacy projection; optional failures clear locally.
 fn remap(
     value: u32,
@@ -516,8 +538,26 @@ fn remap(
     diagnostics: &mut PluginDiagnostics,
 ) -> Result<u32, String> {
     diagnostics.link(value);
+    if let Some(native) = context.native {
+        let key = native.resolve_word(value)?;
+        let supplier = native
+            .order
+            .table()
+            .entry(native.order.plugin_order()[native.supplier])
+            .expect("allocated native supplier");
+        if key.is_some()
+            && (value >> 24) as usize > supplier.facts.masters.len()
+            && diagnostics.event_context.field.as_deref() == Some("record_header")
+        {
+            diagnostics.note("compatibility", || {
+                format!("native source header {value:08X} uses supplier-self ownership")
+            });
+        }
+        return Ok(value);
+    }
+    let legacy_order = context.order.expect("legacy decoder context");
     let result: Result<u32, String> = (|| {
-        let order = context.order.form_key_context()?;
+        let order = legacy_order.form_key_context()?;
         let observed = order.note_typed_source(
             context.plugin_index,
             value,
@@ -534,7 +574,7 @@ fn remap(
             .map_err(|error| error.to_string())?;
         if crate::esm::legacy_projection::LegacyTypedReaderProjection::maps_to_null(
             value,
-            context.order.metadata[context.plugin_index].masters.len(),
+            legacy_order.metadata[context.plugin_index].masters.len(),
             optional,
             diagnostics.event_context.record_type,
             diagnostics.event_context.field.as_deref(),
@@ -585,7 +625,7 @@ fn remap(
         // Ownership is self; an optional link to an absent target still publishes NULL.
         // Preserve the old source-context diagnostic, including losing/rejected versions.
         let past_master =
-            (value >> 24) as usize > context.order.metadata[context.plugin_index].masters.len();
+            (value >> 24) as usize > legacy_order.metadata[context.plugin_index].masters.len();
         // Only runtime schema fields have the ordinary dangling-target NULL policy. Group labels
         // and catalogue probes still project self without an extra presence requirement.
         let source_field = diagnostics.event_context.record_type != Some(*b"TES4")
@@ -718,15 +758,19 @@ fn decode_with_identity_inner(
     );
     diagnostics.set_field("record_header".into());
     // Runtime ownership uses the common self rule; original source provenance stays distinct.
-    let source_identity = super::source_identity::resolve(
-        &scanned.record_type,
-        scanned.source_form_id,
-        context.plugin_index,
-        context.order,
-    );
+    let source_identity = context.order.map(|order| {
+        super::source_identity::resolve(
+            &scanned.record_type,
+            scanned.source_form_id,
+            context.plugin_index,
+            order,
+        )
+    });
     let id = remap(scanned.source_form_id, context, false, diagnostics)?;
     diagnostics.event_context.form_id = Some(id);
-    if source_identity.state == super::source_identity::SourceIdentityState::MasterIndexOutOfRange {
+    if source_identity.is_some_and(|identity| {
+        identity.state == super::source_identity::SourceIdentityState::MasterIndexOutOfRange
+    }) {
         diagnostics.note("compatibility", || {
             format!(
                 "{} {:08X}: original owner unresolved; supplier-self runtime projection {id:08X}",
@@ -808,11 +852,11 @@ fn decode_with_identity_inner(
     let mut rejected_land_layer: Option<(usize, usize)> = None;
     diagnostics.set_field("payload_framing".into());
     let framed = subrecords(&scanned.payload, diagnostics, scanned.source_form_id);
-    let link_kind = |source_id| {
-        let id = remap(source_id, context, true, &mut PluginDiagnostics::default()).ok()?;
-        context.winning_types?.get(&id).copied()
-    };
+    let link_kind = |source_id| context.link_kind(source_id);
     for (position, &(signature, bytes)) in framed.fields.iter().enumerate() {
+        if let Some(native) = context.native {
+            native.start_field(position, signature, bytes);
+        }
         if potential_deferred {
             for &signature in &rejected_fields[observed_rejections..] {
                 rejections.push((position - 1, signature));
@@ -912,7 +956,7 @@ fn decode_with_identity_inner(
                             canonical_bytes,
                             opaque: false,
                         });
-                        if capture_ownership {
+                        if capture_ownership || context.native.is_some() {
                             field_positions.push((position, fields.len() - 1));
                         }
                     }
@@ -939,7 +983,7 @@ fn decode_with_identity_inner(
                 opaque: true,
                 localized_bank: None,
             });
-            if capture_ownership {
+            if capture_ownership || context.native.is_some() {
                 field_positions.push((position, fields.len() - 1));
             }
             continue;
@@ -1012,7 +1056,7 @@ fn decode_with_identity_inner(
                         canonical_bytes,
                         opaque: false,
                     });
-                    if capture_ownership {
+                    if capture_ownership || context.native.is_some() {
                         field_positions.push((position, fields.len() - 1));
                     }
                 }
@@ -1081,7 +1125,7 @@ fn decode_with_identity_inner(
                     opaque: true,
                     localized_bank: None,
                 });
-                if capture_ownership {
+                if capture_ownership || context.native.is_some() {
                     field_positions.push((position, fields.len() - 1));
                 }
             }
@@ -1165,7 +1209,7 @@ fn decode_with_identity_inner(
                     canonical_bytes,
                     opaque: false,
                 });
-                if capture_ownership {
+                if capture_ownership || context.native.is_some() {
                     field_positions.push((position, fields.len() - 1));
                 }
             }
@@ -1254,6 +1298,9 @@ fn decode_with_identity_inner(
                 cache_from,
             }));
         }
+    }
+    if let Some(native) = context.native {
+        native.finish_fields(&field_positions);
     }
     Ok(DecodedRecord {
         form_id: id,
@@ -1535,6 +1582,12 @@ fn value_inner(
         return alternate_textures(bytes, context, diagnostics);
     }
     if field.decider.as_deref() == Some("vmad") {
+        if let Some(native) = context.native {
+            return super::vmad::decode_at(bytes, &selection.record_type, |offset, word| {
+                let value = native.site_at(bytes, offset, word, &["*".into()], diagnostics)?;
+                Ok((word, value))
+            });
+        }
         return super::vmad::decode(bytes, &selection.record_type, |id| {
             remap(id, context, true, diagnostics)
         });
@@ -1571,6 +1624,11 @@ fn value_inner(
             Value::Float(number)
         }
         "form_id" => {
+            if let Some(native) = context.native {
+                let word = u32::from_le_bytes(bytes.try_into().expect("checked native word"));
+                let value = native.site_at(bytes, 0, word, &field.targets, diagnostics)?;
+                return Ok((value, bytes.to_vec()));
+            }
             let resolved = remap(
                 u32::from_le_bytes(bytes.try_into().expect("checked FormID")),
                 context,
@@ -1787,13 +1845,22 @@ fn alternate_textures(
             .unwrap_or(name_bytes.len());
         let name = decode_string(&name_bytes[..name_end]);
         position = end;
-        let link = remap(read_u32(position)?, context, true, diagnostics)?;
+        let raw = read_u32(position)?;
+        let (link, value) = if let Some(native) = context.native {
+            (
+                raw,
+                native.site_at(bytes, position, raw, &["TXST".into()], diagnostics)?,
+            )
+        } else {
+            let link = remap(raw, context, true, diagnostics)?;
+            (link, Value::FormId(link))
+        };
         canonical[position..position + 4].copy_from_slice(&link.to_le_bytes());
         let index = read_u32(position + 4)?;
         position += 8;
         values.push(Value::Struct(vec![
             ("name".into(), Value::String(name)),
-            ("texture_set".into(), Value::FormId(link)),
+            ("texture_set".into(), value),
             ("index".into(), Value::Unsigned(u64::from(index))),
         ]));
     }
@@ -2723,10 +2790,7 @@ fn replay_deferred(
     }
     let mut framing = PluginDiagnostics::default();
     let framed = subrecords(&record.raw_payload, &mut framing, record.source_form_id);
-    let link_kind = |source_id| {
-        let id = remap(source_id, context, true, &mut PluginDiagnostics::default()).ok()?;
-        context.winning_types?.get(&id).copied()
-    };
+    let link_kind = |source_id| context.link_kind(source_id);
     let mut totals = first.baseline;
     let mut previous = Vec::new();
     let mut omitted = Vec::new();
@@ -2985,7 +3049,8 @@ pub(crate) fn resolve_deferred(
             };
             let priority = record.load_order as usize;
             let context = Context {
-                order,
+                native: None,
+                order: Some(order),
                 plugin_index: priority,
                 localized: order.metadata[priority].flags & 0x80 != 0,
                 source_ids: source_catalogued.then_some(source_ids),
@@ -3738,7 +3803,8 @@ mod tests {
             // Source headers are independent of the injected winning-kind probe.
             let source_ids = std::collections::HashSet::from([0x1880]);
             let first_context = Context {
-                order: &order,
+                native: None,
+                order: Some(&order),
                 plugin_index: 0,
                 localized: false,
                 source_ids: Some(&source_ids),
@@ -3956,7 +4022,8 @@ mod tests {
                 payload: payload.clone(),
             };
             let first_context = Context {
-                order: &order,
+                native: None,
+                order: Some(&order),
                 plugin_index: 0,
                 localized: false,
                 source_ids: None,
@@ -4142,7 +4209,8 @@ mod tests {
                 payload: payload.clone(),
             };
             let first_context = Context {
-                order: &order,
+                native: None,
+                order: Some(&order),
                 plugin_index: 0,
                 localized: false,
                 source_ids: None,
@@ -4346,7 +4414,8 @@ mod tests {
             &schema,
             &prepared,
             &Context {
-                order: &order,
+                native: None,
+                order: Some(&order),
                 plugin_index: 0,
                 localized: false,
                 source_ids: None,
@@ -4619,7 +4688,8 @@ mod tests {
             &schema,
             &prepared,
             &Context {
-                order: &order,
+                native: None,
+                order: Some(&order),
                 plugin_index: 1,
                 localized: false,
                 source_ids: Some(&source_ids),
@@ -4634,7 +4704,8 @@ mod tests {
             &schema,
             &prepared,
             &Context {
-                order: &order,
+                native: None,
+                order: Some(&order),
                 plugin_index: 1,
                 localized: false,
                 source_ids: Some(&source_ids),
@@ -4699,7 +4770,8 @@ mod tests {
         let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
         let order = LoadOrder::read(&[]).unwrap();
         let context = Context {
-            order: &order,
+            native: None,
+            order: Some(&order),
             plugin_index: 0,
             localized: false,
             source_ids: None,
@@ -4839,7 +4911,8 @@ mod tests {
         let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
         let order = LoadOrder::read(&[]).unwrap();
         let context = Context {
-            order: &order,
+            native: None,
+            order: Some(&order),
             plugin_index: 0,
             localized: false,
             source_ids: None,
@@ -5061,7 +5134,8 @@ mod tests {
         };
         let order = LoadOrder::read(&[]).unwrap();
         let context = Context {
-            order: &order,
+            native: None,
+            order: Some(&order),
             plugin_index: 0,
             localized: false,
             source_ids: None,
@@ -5176,7 +5250,8 @@ mod tests {
             payload: replay_probe_subrecord(b"MODS", &payload),
         };
         let context = Context {
-            order: &order,
+            native: None,
+            order: Some(&order),
             plugin_index: 0,
             localized: false,
             source_ids: None,

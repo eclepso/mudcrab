@@ -89,6 +89,8 @@ enum WorldspaceValue {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RouteFile {
+    #[serde(default = "legacy_route_schema")]
+    schema_version: u32,
     #[serde(default)]
     name: String,
     /// What the route is and why its waypoints are where they are. Not read by the engine.
@@ -114,6 +116,11 @@ struct RouteFile {
 
 fn default_eye_height() -> f32 {
     DEFAULT_EYE_HEIGHT
+}
+
+/// Unversioned route input is the existing legacy-request syntax, validated against a pack later.
+fn legacy_route_schema() -> u32 {
+    1
 }
 
 fn parse_worldspace(value: &WorldspaceValue) -> Result<u32> {
@@ -142,6 +149,8 @@ pub struct RoutePlan {
     pub name: String,
     /// The worldspace the file names; the run starts there.
     pub worldspace: u32,
+    /// Portable report identity populated only after authenticating the requested world.
+    pub worldspace_name: Option<shared::form_key::NamedFormKey>,
     /// Units per second.
     pub speed: f32,
     pub eye_height: f32,
@@ -168,6 +177,46 @@ pub struct RoutePose {
 }
 
 impl RoutePlan {
+    /// Bind route-file identities before a database query or terrain cache read.
+    pub fn load_with_identity(
+        path: &Path,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("cannot read the route file {}", path.display()))?;
+        let mut plan = Self::parse_with_identity(&text, identity)?;
+        plan.source = path.display().to_string();
+        Ok(plan)
+    }
+
+    /// Portable version 2 input names its world; older numeric requests are checked explicitly.
+    pub fn parse_with_identity(
+        text: &str,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Self> {
+        let mut document: serde_json::Value =
+            serde_json::from_str(text).wrap_err("the route is not valid JSON")?;
+        let version = document
+            .get("schema_version")
+            .map_or(Some(1), serde_json::Value::as_u64)
+            .ok_or_else(|| color_eyre::eyre::eyre!("invalid route schema version"))?;
+        ensure!(
+            matches!(version, 1 | 2),
+            "unsupported route identity schema"
+        );
+        if version == 2 {
+            let word = crate::config::external_request(&document["worldspace"], 2, identity)?
+                .ok_or_else(|| color_eyre::eyre::eyre!("route worldspace cannot be null"))?;
+            document["worldspace"] = word.into();
+            document["schema_version"] = 1.into();
+        }
+        let mut plan = Self::parse(&serde_json::to_string(&document)?)?;
+        plan.worldspace_name = Some(crate::config::named_runtime_request(
+            identity,
+            plan.worldspace,
+        )?);
+        Ok(plan)
+    }
     /// Reads and validates a route file.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -185,6 +234,10 @@ impl RoutePlan {
     }
 
     fn from_file(file: RouteFile) -> Result<Self> {
+        ensure!(
+            file.schema_version == 1,
+            "named route schema requires an authenticated world identity"
+        );
         let worldspace = parse_worldspace(&file.worldspace)?;
         ensure!(
             file.speed.is_finite() && file.speed > 0.0 && file.speed <= MAX_SPEED,
@@ -236,6 +289,7 @@ impl RoutePlan {
             source: String::new(),
             name: file.name,
             worldspace,
+            worldspace_name: None,
             speed: file.speed,
             eye_height: file.eye_height,
             looped: file.looped,
@@ -344,6 +398,7 @@ impl RouteGround {
         let connection =
             Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
+        shared::world_assets::install_runtime_identity_functions(&connection)?;
         let mut cells = HashMap::new();
         for grid in route_cells(plan) {
             let cell_id = connection
@@ -495,9 +550,14 @@ impl RouteRunner {
             u64::from(self.finished)
         };
         RouteReport {
+            schema_version: crate::shots::EXTERNAL_IDENTITY_SCHEMA_VERSION,
             file: self.plan.source.clone(),
             name: self.plan.name.clone(),
-            worldspace: self.plan.worldspace,
+            worldspace: self
+                .plan
+                .worldspace_name
+                .clone()
+                .unwrap_or(shared::form_key::NamedFormKey::Null),
             waypoints: self.plan.waypoints.len(),
             length_units: self.plan.length(),
             speed_units_per_second: self.plan.speed,
@@ -524,10 +584,11 @@ impl RouteRunner {
 /// run that followed no route.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RouteReport {
+    pub schema_version: u32,
     /// The route file as given on the command line.
     pub file: String,
     pub name: String,
-    pub worldspace: u32,
+    pub worldspace: shared::form_key::NamedFormKey,
     pub waypoints: usize,
     /// One lap, or the whole route when it does not loop.
     pub length_units: f32,
@@ -592,6 +653,27 @@ pub(crate) fn drive_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Route report identity is named; legacy input never masquerades as a stored FormKey.
+    #[test]
+    fn named_route_reports_and_checked_legacy_requests_share_one_table() {
+        let identity = crate::config::identity_request_fixture();
+        let input = r#"{"schema_version":2,"worldspace":"00003C:Zulu.esm","speed":100,"waypoints":[[0,0],[1000,0]]}"#;
+        let plan = RoutePlan::parse_with_identity(input, &identity).unwrap();
+        assert_eq!(plan.worldspace, 0x3c);
+        let ground = RouteGround::from_cells([((0, 0), flat(0.0))]);
+        let run = RouteRunner::new(plan, ground);
+        let report = serde_json::to_value(run.report()).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["worldspace"], "00003C:Zulu.esm");
+        assert!(
+            RoutePlan::parse_with_identity(
+                r#"{"worldspace":16777276,"speed":100,"waypoints":[[0,0],[1000,0]]}"#,
+                &identity
+            )
+            .is_err()
+        );
+    }
 
     const GOOD: &str = r#"{
         "name": "test",

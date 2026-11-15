@@ -23,7 +23,7 @@ use crate::{
         cell_cache::write_cell_cache,
         exporter::validate_database,
         lodsettings::{LodSettings, sidecar_path},
-        plugins_txt::read_with_selection_diagnostics,
+        plugins_txt::read_form_key_with_selection_diagnostics,
     },
     integration::{IntegrationReport, finalize_world_database_with_sources},
     lod::{
@@ -435,6 +435,8 @@ impl AssetPipeline {
             .wrap_err_with(|| format!("failed to create {}", staging.join("vfs").display()))?;
         if config.resume_staging.is_some() {
             invalidate_staged_generated_outputs(&staging)?;
+        } else {
+            crate::cache::write_staging_generation(&staging)?;
         }
 
         // A run that stops keeps its staging folder, whether it failed or was interrupted: the
@@ -613,6 +615,7 @@ impl AssetPipeline {
         };
         let mut ingestion_journal = IngestionJournal::open(staging)?;
         let mut manifest = ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             retained_mesh_schema_version: None,
             retained_asset_configuration_hash: None,
@@ -713,7 +716,7 @@ impl AssetPipeline {
                     .ok_or_else(|| eyre!("MO2 profile is missing while MO2 plugins are active"))?
                     .profile;
                 let mut recovery_notices = Vec::new();
-                let plugins = crate::esm::plugins_txt::recover_with_diagnostics(
+                let plugins = crate::esm::plugins_txt::recover_form_key_with_diagnostics(
                     plugins,
                     &mut recovery_notices,
                     &mut report.skipped_plugins,
@@ -732,7 +735,7 @@ impl AssetPipeline {
                     !plugins.is_empty(),
                     "MO2 profile {profile}: no usable active plugins remain"
                 );
-                crate::esm::load_order::LoadOrder::read(&plugins).wrap_err_with(|| {
+                crate::esm::form_keys::FormKeyOrder::read(&plugins).wrap_err_with(|| {
                     format!("MO2 profile {profile}: invalid plugin/master order")
                 })?;
                 plugins
@@ -1167,8 +1170,11 @@ impl AssetPipeline {
                 report.warnings.extend(conversion.warnings);
                 report.notices.extend(conversion.notices);
                 let phases = conversion.phases;
-                let merged = conversion.records;
-                report.database_runtime_records_built = merged.len() as u64;
+                let merged = conversion
+                    .native
+                    .ok_or_else(|| eyre!("native world generation missing"))?;
+                let source_offsets = conversion.source_offsets;
+                report.database_runtime_records_built = merged.records.len() as u64;
                 report.phase_elapsed_ms.insert(
                     "database_conversion".into(),
                     database_started.elapsed().as_millis(),
@@ -1183,10 +1189,24 @@ impl AssetPipeline {
                 let terrain_caches_started = Instant::now();
                 if config.record_reader == crate::config::RecordReader::Inhouse {
                     crate::esm::inhouse::write_database_profile(staging, &db_path, &phases)?;
-                    crate::esm::inhouse::write_terrain_caches(&merged, &db_path, staging)?;
-                } else {
-                    write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
                 }
+                let (_, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
+                    &merged,
+                    &source_offsets,
+                    &staging.join("cell_cache.rkyv"),
+                    false,
+                )?;
+                report.warnings.extend(cache_warnings);
+                if config.record_reader == crate::config::RecordReader::Inhouse {
+                    let (_, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
+                        &merged,
+                        &source_offsets,
+                        &staging.join("cell_cache_preserved.rkyv"),
+                        true,
+                    )?;
+                    report.warnings.extend(cache_warnings);
+                }
+                manifest.record_data_complete = Some(report.warnings.is_empty());
                 report.phase_elapsed_ms.insert(
                     "terrain_caches".into(),
                     terrain_caches_started.elapsed().as_millis(),
@@ -1197,12 +1217,8 @@ impl AssetPipeline {
                 // cell keeps is checked before the texture, mesh and LOD stages run, so a bad load
                 // order fails in minutes. The positions are the ones the cell cache was ordered by.
                 if config.merged_terrain {
-                    merged_terrain_offsets = crate::terrain_pipeline::cell_cache_source_offsets(
-                        config.record_reader,
-                        &db_path,
-                    )?;
-                    crate::esm::cell_cache::merged_terrain_lands(&merged, &merged_terrain_offsets)?;
-                    merged_terrain_records = Some(crate::terrain_pipeline::terrain_records(merged));
+                    merged_terrain_offsets = source_offsets;
+                    merged_terrain_records = Some(Arc::new(merged));
                 } else {
                     drop(merged);
                 }
@@ -1248,6 +1264,10 @@ impl AssetPipeline {
                     }
                 }
             }
+            manifest.plugin_table_digest = Some(
+                shared::pack_identity::PackIdentity::read_sql(&Connection::open(&db_path)?)?
+                    .digest_hex(),
+            );
             if config.record_reader == crate::config::RecordReader::Inhouse {
                 report
                     .artifacts
@@ -1648,11 +1668,12 @@ impl AssetPipeline {
         // once the world database and every converted texture are in staging. Off by default
         // until the engine half that reads these outputs lands.
         if config.merged_terrain {
-            crate::terrain_pipeline::run_merged_terrain_stage(
+            crate::terrain_pipeline::run_form_key_merged_terrain_stage(
                 staging,
-                merged_terrain_records.take(),
+                merged_terrain_records
+                    .take()
+                    .ok_or_else(|| eyre!("native merged terrain generation missing"))?,
                 std::mem::take(&mut merged_terrain_offsets),
-                &plugins,
                 &crate::terrain_pipeline::TerrainOptions::from_config(config),
                 progress_tx,
                 &mut report,
@@ -4028,7 +4049,7 @@ fn plugin_paths_with_diagnostics(
     selection_warnings: &mut Vec<CreationFallbackWarning>,
 ) -> Result<Vec<PathBuf>> {
     if let Some(path) = &config.plugins_file {
-        return read_with_selection_diagnostics(
+        return read_form_key_with_selection_diagnostics(
             path,
             &config.data_dir,
             config.skyrim_ccc_file.as_deref(),
@@ -4080,7 +4101,8 @@ fn plugin_paths_with_diagnostics(
         (rank, name, path.file_name().unwrap_or_default().to_owned())
     });
     let had_plugins = !plugins.is_empty();
-    let plugins = crate::esm::plugins_txt::recover_discovered(plugins, notices, skipped_plugins)?;
+    let plugins =
+        crate::esm::plugins_txt::recover_form_key_discovered(plugins, notices, skipped_plugins)?;
     ensure!(
         !had_plugins || !plugins.is_empty(),
         "no usable plugins remain after automatic master/dependency/slot recovery: {}",
@@ -5010,7 +5032,8 @@ async fn compile_lod_chunks_inline(
         ));
     }
     let mut chunk_inputs = BTreeMap::new();
-    let mut worlds: Vec<(u32, String)> = connection
+    let pack_identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    let mut worlds: Vec<(u64, String)> = connection
         .prepare("SELECT id, editor_id FROM worldspaces ORDER BY id")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -5041,6 +5064,12 @@ async fn compile_lod_chunks_inline(
     }
     'world: for (index, (worldspace_id, editor_id)) in worlds.iter().enumerate() {
         interrupt(cancellation)?;
+        let worldspace_name = pack_identity
+            .table()
+            .named(shared::cache_identity::required(
+                &pack_identity,
+                *worldspace_id,
+            )?)?;
         let settings = match resolve_lod_settings(config, &staging.join("vfs"), editor_id) {
             Ok(Some(settings)) => settings,
             Ok(None) => {
@@ -5049,7 +5078,7 @@ async fn compile_lod_chunks_inline(
                 );
                 report.lod_warnings.push(message);
                 world_settings.push(serde_json::json!({
-                    "worldspace_id": worldspace_id,
+                    "worldspace": worldspace_name,
                     "editor_id": editor_id,
                     "status": "missing",
                 }));
@@ -5069,7 +5098,7 @@ async fn compile_lod_chunks_inline(
                     "worldspace {editor_id} ({worldspace_id:08X}) has invalid LOD settings: {error:#}; its terrain LOD is skipped"
                 ));
                 world_settings.push(serde_json::json!({
-                    "worldspace_id": worldspace_id,
+                    "worldspace": worldspace_name,
                     "editor_id": editor_id,
                     "status": "invalid",
                 }));
@@ -5087,7 +5116,7 @@ async fn compile_lod_chunks_inline(
         };
         let origin = settings.origin;
         world_settings.push(serde_json::json!({
-            "worldspace_id": worldspace_id,
+            "worldspace": worldspace_name,
             "editor_id": editor_id,
             "status": "ready",
             "origin": [origin.grid_x, origin.grid_y],
@@ -5114,7 +5143,7 @@ async fn compile_lod_chunks_inline(
             .await;
             continue;
         }
-        let lookup: std::collections::HashMap<u32, (i32, i32)> = cells
+        let lookup: std::collections::HashMap<u64, (i32, i32)> = cells
             .iter()
             .map(|(grid_x, grid_y, cell_id)| (*cell_id, (*grid_x, *grid_y)))
             .collect();
@@ -5441,6 +5470,7 @@ async fn compile_lod_chunks_inline(
         &lod_configuration,
         &world_settings,
         &terrain_sources,
+        &pack_identity.digest_hex(),
     )?;
     connection.execute(
         "INSERT OR REPLACE INTO lod_build(id, build_identity) VALUES (1, ?1)",
@@ -5450,6 +5480,7 @@ async fn compile_lod_chunks_inline(
         report.artifacts.push(PathBuf::from("lod-manifest.json"));
         let manifest = LodManifest {
             build_identity: identity,
+            plugin_table_digest: pack_identity.digest_hex(),
             converter_schema: CONVERTER_SCHEMA_VERSION,
             world_database_schema: shared::WORLD_DATABASE_SCHEMA_VERSION,
             chunks: report.lod_chunks,
@@ -5580,10 +5611,12 @@ fn build_identity(
     configuration_hash: &str,
     world_settings: &[serde_json::Value],
     terrain_sources: &BTreeMap<String, String>,
+    plugin_table_digest: &str,
 ) -> Result<String> {
     let canonical = serde_json::json!({
         "converter_schema": CONVERTER_SCHEMA_VERSION,
         "terrain_compiler": crate::lod::TERRAIN_COMPILER_VERSION,
+        "plugin_table_digest": plugin_table_digest,
         "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
         "configuration": configuration_hash,
         "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
@@ -6807,6 +6840,7 @@ mod tests {
         });
         let recorded = hash_bytes(&serde_json::to_vec(&historical).unwrap());
         let manifest = ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             configuration_hash: recorded.clone(),
             entries: [
@@ -6947,6 +6981,7 @@ mod tests {
                 })
                 .collect();
                 let manifest = ConversionManifest {
+                    plugin_table_digest: None,
                     schema_version: CONVERTER_SCHEMA_VERSION,
                     configuration_hash: recorded.clone(),
                     entries,
@@ -7029,6 +7064,7 @@ mod tests {
             output_size: 1,
         };
         let manifest = ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             entries: [
                 ("meshes/prior.nif".into(), entry("meshes/prior.glb")),
@@ -7102,7 +7138,15 @@ mod tests {
         changed.lod_origins.insert("Tamriel".to_owned(), [-64, 32]);
         assert_eq!(configuration_hash(&changed).unwrap(), cache_identity);
 
-        let first = build_identity(&[], &[], &cache_identity, &[], &BTreeMap::new()).unwrap();
+        let first = build_identity(
+            &[],
+            &[],
+            &cache_identity,
+            &[],
+            &BTreeMap::new(),
+            "fixture-table",
+        )
+        .unwrap();
         let second = build_identity(
             &[],
             &[],
@@ -7115,6 +7159,7 @@ mod tests {
                 "sidecar": null,
             })],
             &BTreeMap::new(),
+            "fixture-table",
         )
         .unwrap();
         assert_ne!(first, second);
@@ -7163,6 +7208,7 @@ mod tests {
             .unwrap();
         let defaulted = TerrainCellInput {
             cell_id: 1,
+            cell_name: "000800:Fixture.esm".into(),
             grid_x: 0,
             grid_y: 0,
             heights: vec![0.0; 33 * 33],
@@ -7171,6 +7217,7 @@ mod tests {
         };
         let grass = TerrainCellInput {
             cell_id: 2,
+            cell_name: "000800:Fixture.esm".into(),
             grid_x: 64,
             grid_y: 0,
             heights: vec![0.0; 33 * 33],
@@ -7234,10 +7281,18 @@ mod tests {
             }
             chunk_hashes.sort();
             let terrain_sources = textures.source_hashes.clone();
-            let identity =
-                build_identity(&[], &chunk_hashes, &asset_identity, &[], &terrain_sources).unwrap();
+            let identity = build_identity(
+                &[],
+                &chunk_hashes,
+                &asset_identity,
+                &[],
+                &terrain_sources,
+                "fixture-table",
+            )
+            .unwrap();
             let manifest = crate::lod::reuse::LodManifest {
                 build_identity: identity.clone(),
+                plugin_table_digest: "fixture-table".into(),
                 converter_schema: CONVERTER_SCHEMA_VERSION,
                 world_database_schema: shared::WORLD_DATABASE_SCHEMA_VERSION,
                 chunks: chunk_hashes.len() as u64,
@@ -7330,6 +7385,7 @@ mod tests {
         fs::create_dir_all(&backup).unwrap();
         fs::write(backup.join("sentinel"), b"last good").unwrap();
         let manifest = ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             complete: true,
             entries: BTreeMap::from([(
@@ -7364,6 +7420,7 @@ mod tests {
         fs::create_dir_all(root.join("scripts")).unwrap();
         fs::write(root.join("scripts/papyrus_runtime.luau"), b"return {}").unwrap();
         ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             configuration_hash: configuration.to_owned(),
             complete: true,
@@ -7740,6 +7797,7 @@ mod tests {
         fs::create_dir_all(backup.join("scripts")).unwrap();
         fs::write(backup.join("scripts/papyrus_runtime.luau"), b"return {}").unwrap();
         ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             complete: true,
             ..Default::default()
@@ -7760,6 +7818,7 @@ mod tests {
         fs::create_dir_all(backup.join("scripts")).unwrap();
         fs::write(backup.join("scripts/papyrus_runtime.luau"), b"return {}").unwrap();
         ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             complete: true,
             ..Default::default()
@@ -7785,6 +7844,7 @@ mod tests {
         fs::create_dir_all(backup.join("scripts")).unwrap();
         fs::write(backup.join("scripts/papyrus_runtime.luau"), b"return {}").unwrap();
         ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             complete: true,
             ..Default::default()
@@ -8292,6 +8352,7 @@ mod tests {
         let backup = directory.path().join("Skyrim.Old.backup-12345");
         fs::create_dir(&backup).unwrap();
         ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             complete: true,
             ..Default::default()
@@ -8314,6 +8375,7 @@ mod tests {
         let backup = output.with_extension("backup-12345");
         fs::create_dir(&backup).unwrap();
         let manifest = ConversionManifest {
+            plugin_table_digest: None,
             schema_version: CONVERTER_SCHEMA_VERSION,
             complete: true,
             entries: BTreeMap::from([(

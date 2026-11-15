@@ -274,7 +274,7 @@ fn table() -> LandTextureTable {
 }
 
 /// The colour of each probe texture, by LTEX FormID.
-fn colour(ltex: u32) -> [u8; 3] {
+fn colour(ltex: u64) -> [u8; 3] {
     match ltex {
         0x100 => [255, 0, 0],
         0x101 => [0, 255, 0],
@@ -307,7 +307,7 @@ fn screen_grey(value: u8, colour_srgb: bool) -> u8 {
 
 /// One quadrant to put in a cell: its slot textures and the weight of each slot above 0.
 struct Quad {
-    slots: Vec<u32>,
+    slots: Vec<u64>,
     weights: Vec<u8>,
 }
 

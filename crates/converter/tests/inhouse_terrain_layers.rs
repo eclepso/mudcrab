@@ -7,7 +7,7 @@ use converter::{
     config::RecordReader,
     esm::types::ArchivedRecordData,
     records::history_source::{SourceQuery, visit_source_history},
-    shared::{CachedLand, CellCache, TerrainLayer, TerrainWeight},
+    shared::{CachedLand, TerrainLayer, TerrainWeight},
 };
 use dummy_content::{
     inhouse_magic::{record, subrecord},
@@ -220,7 +220,7 @@ fn frame_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 /// Construct literal expected layers, independently of production normalization or trimming.
 fn expected_layer(id: u32, quadrant: u8, slot: u16, values: &[(u16, f32)]) -> TerrainLayer {
     TerrainLayer {
-        texture_form_id: id,
+        texture_form_id: u64::from(id),
         quadrant,
         layer: slot,
         is_base: values.is_empty(),
@@ -275,13 +275,11 @@ fn expected_runtime_layers() -> Vec<TerrainLayer> {
 
 /// Inspect the real published archive by stable CELL identity.
 fn cached_land(output: &Path, name: &str) -> CachedLand {
-    let cache =
-        rkyv::from_bytes::<CellCache, rkyv::rancor::Error>(&fs::read(output.join(name)).unwrap())
-            .unwrap();
+    let cache = common::runtime_cache(output, name);
     cache
         .cells
         .into_iter()
-        .find(|cell| cell.cell_id == CELL_ID)
+        .find(|cell| cell.cell_id == u64::from(CELL_ID))
         .unwrap()
 }
 

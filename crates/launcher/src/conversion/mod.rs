@@ -380,50 +380,55 @@ pub fn output_is_safe_target(output: &Path) -> Result<(), String> {
     })
 }
 
-/// Whether `output` holds a complete conversion the engine can start on: a manifest that says it is
-/// complete at a converter schema the engine loads (from [`shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION`]
-/// through this converter's), the world database and cell cache beside it, and an integration
-/// report that passed at a world database schema the engine reads
-/// ([`shared::supports_runtime_world_database_schema`]).
-///
-/// The manifest is read as written: [`converter::cache::ConversionManifest::load`] marks an older
-/// schema's manifest incomplete, because the next conversion rebuilds from it, but the engine still
-/// starts on that output.
-///
-/// Database schema and advertised LOD identity are checked by the runtime's shared read-only
-/// validator, and the database schema must match the integration report. Check and Full check
-/// additionally verify individual artifact bytes.
+/// Readiness with the concrete refusal reason displayed beside the disabled Play button.
+/// World identity is authenticated before manifests or identity-bearing cache payloads.
+pub fn output_readiness(output: &Path) -> Result<(), String> {
+    let database_schema =
+        shared::world_assets::validate_world_database(&output.join("skyrim_world.db"))
+            .map_err(|error| format!("{error:#}"))?;
+    let bytes = std::fs::read(output.join(MANIFEST_FILE))
+        .map_err(|error| format!("conversion manifest is unavailable: {error}"))?;
+    let manifest: converter::cache::ConversionManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("conversion manifest is invalid: {error}"))?;
+    if !(shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter::cache::CONVERTER_SCHEMA_VERSION)
+        .contains(&manifest.schema_version)
+    {
+        return Err(format!(
+            "converted assets use unsupported converter schema {}; convert again",
+            manifest.schema_version
+        ));
+    }
+    manifest
+        .validate_world_generation(output)
+        .map_err(|error| format!("{error:#}"))?;
+    if !manifest.complete || !manifest.failures.is_empty() {
+        return Err("conversion did not finish successfully; resume or convert again".into());
+    }
+    shared::world_assets::validate_runtime_cell_cache(output)
+        .map_err(|error| format!("{error:#}"))?;
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(output.join("integration-report.json"))
+            .map_err(|error| format!("integration report is unavailable: {error}"))?,
+    )
+    .map_err(|error| format!("integration report is invalid: {error}"))?;
+    if report.get("passed").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("integration report did not pass".into());
+    }
+    let reported_schema = report
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
+    if reported_schema != Some(database_schema) {
+        return Err("integration report does not match the world database; convert again".into());
+    }
+    shared::world_assets::validate_lod_build_contract(output, shared::LOD_CONVERTER_SCHEMA_VERSION)
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(())
+}
+
+/// Whether the selected output passes the runtime's authenticated startup contract.
 pub fn output_is_complete(output: &Path) -> bool {
-    std::fs::read(output.join(MANIFEST_FILE))
-        .ok()
-        .and_then(|bytes| {
-            serde_json::from_slice::<converter::cache::ConversionManifest>(&bytes).ok()
-        })
-        .is_some_and(|manifest| {
-            manifest.complete
-                && manifest.failures.is_empty()
-                && (shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION
-                    ..=converter::cache::CONVERTER_SCHEMA_VERSION)
-                    .contains(&manifest.schema_version)
-                && output.join("cell_cache.rkyv").is_file()
-                && std::fs::read(output.join("integration-report.json"))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .is_some_and(|report| {
-                        report.get("passed").and_then(serde_json::Value::as_bool) == Some(true)
-                            && report
-                                .get("schema_version")
-                                .and_then(serde_json::Value::as_u64)
-                                .and_then(|version| u32::try_from(version).ok())
-                                .is_some_and(|schema| {
-                                    shared::world_assets::validate_lod_build_contract(
-                                        output,
-                                        shared::LOD_CONVERTER_SCHEMA_VERSION,
-                                    )
-                                    .is_ok_and(|actual| actual == schema)
-                                })
-                    })
-        })
+    output_readiness(output).is_ok()
 }
 
 /// Keeps [`OutputReady`] and [`OutputHasManifest`] up to date. The check reads the output's
@@ -459,7 +464,8 @@ pub fn refresh_output_ready(
     if has_manifest.0 != manifest {
         has_manifest.0 = manifest;
     }
-    let complete = chosen && output_is_complete(output);
+    let readiness = chosen.then(|| output_readiness(output));
+    let complete = readiness.as_ref().is_some_and(Result::is_ok);
     if ready.0 != complete {
         ready.0 = complete;
     }
@@ -475,13 +481,23 @@ pub fn refresh_output_ready(
             output.display()
         ));
     } else if run_ended {
-        status.push_notice(
-            "The run finished, but the output does not pass the launcher's check (manifest, world database, cell cache and a passed integration report), so Play stays off.",
-        );
+        status.push_notice(&format!(
+            "Play stays off: {}.",
+            readiness
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(String::as_str)
+                .unwrap_or("output folder is not selected")
+        ));
     } else if chosen && !offer_leftover_staging(&mut state.0, &mut status, output) {
         status.push_notice(&format!(
-            "No complete conversion in {} yet: Start converts one.",
-            output.display()
+            "Play stays off for {}: {}. Start converts one.",
+            output.display(),
+            readiness
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(String::as_str)
+                .unwrap_or("output folder is not selected")
         ));
     }
 }
@@ -992,7 +1008,6 @@ pub(crate) mod tests {
     pub(crate) fn complete_output(name: &str) -> PathBuf {
         let output = tiny_output(name, false);
         write_world_database(&output, shared::WORLD_DATABASE_SCHEMA_VERSION);
-        std::fs::write(output.join("cell_cache.rkyv"), b"").unwrap();
         write_integration_report(&output, true);
         output
     }
@@ -1006,6 +1021,30 @@ pub(crate) mod tests {
         )).unwrap();
         if version >= shared::WORLD_DATABASE_LOD_SCHEMA_VERSION {
             database.execute_batch("CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY); CREATE TABLE lod_build(id INTEGER PRIMARY KEY,build_identity TEXT NOT NULL);").unwrap();
+        }
+        if version == shared::WORLD_DATABASE_SCHEMA_VERSION {
+            let table = shared::plugin_table::PluginTable::fresh(vec![(
+                "Fixture.esm".into(),
+                shared::plugin_table::PluginFacts {
+                    content_hash: Some([0x74; 32]),
+                    ..Default::default()
+                },
+            )])
+            .unwrap();
+            let owner = table.id("Fixture.esm").unwrap();
+            let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+            let transaction = database.unchecked_transaction().unwrap();
+            identity.write_sql(&transaction).unwrap();
+            transaction.commit().unwrap();
+            let cache = shared::CellCache {
+                version: shared::CELL_CACHE_VERSION,
+                cells: Vec::new(),
+            };
+            std::fs::write(
+                output.join("cell_cache.rkyv"),
+                shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
+            )
+            .unwrap();
         }
     }
 
@@ -1036,8 +1075,13 @@ pub(crate) mod tests {
         for version in [3, 4, 5] {
             set_schemas(&output, converter::cache::CONVERTER_SCHEMA_VERSION, version);
             assert!(
-                output_is_complete(&output),
-                "legacy {version} needs no LOD tables"
+                !output_is_complete(&output),
+                "legacy {version} must be converted again"
+            );
+            assert!(
+                output_readiness(&output)
+                    .unwrap_err()
+                    .contains("convert again")
             );
         }
         set_schemas(&output, converter::cache::CONVERTER_SCHEMA_VERSION, 5);
@@ -1066,6 +1110,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut lod = serde_json::json!({
             "converter_schema": shared::LOD_CONVERTER_SCHEMA_VERSION,
+            "plugin_table_digest": shared::pack_identity::PackIdentity::read_sql(&database).unwrap().digest_hex(),
             "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
             "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
             "build_identity": identity, "chunks": 0

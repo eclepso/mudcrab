@@ -435,6 +435,7 @@ async fn metadata_identity_drift_preserves_verified_assets_and_archives() {
     assert_eq!(stale_tables, 0, "the database must be freshly rebuilt");
     for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
         assert_ne!(fs::read(fixture.output.join(name)).unwrap(), stale_cache);
+        crate::esm::cell_cache::read_form_key_cell_cache(&fixture.output.join(name)).unwrap();
     }
 }
 

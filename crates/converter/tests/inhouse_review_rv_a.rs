@@ -583,10 +583,9 @@ fn terrain_case(bad: BadLayer) -> TerrainCase {
     }
 }
 
-/// Deserialize the actual cache artifact without normalizing away authored layer differences.
+/// Read authenticated caches with checked gameplay IDs, retaining every authored layer difference.
 fn cache(output: &Path, name: &str) -> CellCache {
-    rkyv::from_bytes::<CellCache, rkyv::rancor::Error>(&fs::read(output.join(name)).unwrap())
-        .unwrap()
+    common::runtime_cache(output, name)
 }
 
 /// Both runtime and preserved caches must retain exactly the predecessor's alpha weights.

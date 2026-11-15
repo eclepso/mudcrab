@@ -6,9 +6,19 @@ from prepare_skyrim_comparison import prepare
 
 class PresetTests(unittest.TestCase):
     def setUp(self):
-        self.shots = {"width": 1920, "height": 1080, "shots": [{"name": "terrace", "worldspace_id": 60, "position": [23400, -47100, 400], "pitch": 7, "yaw": 315, "hfov": 75}]}
+        self.shots = {"schema_version": 2, "width": 1920, "height": 1080, "shots": [{"name": "terrace", "worldspace_id": "00003C:Skyrim.esm", "position": [23400, -47100, 400], "pitch": 7, "yaw": 315, "hfov": 75}]}
         self.template = {"name": "native", "timestamp": "native", "position": [0, 0, 0], "rotation": [1, 1], "fov": 80, "viewRoll": 3, "pcPosition": [11, 22, 33], "pcRotation": [1, 2, 3], "pcCell": [1, 2, 3], "future_field": {"keep": True}}
         self.calibration = {"runtime_sha256": "a" * 64, "evidence": "synthetic test only", "pitch_sign": -1, "yaw_sign": -1, "yaw_offset_degrees": 90, "fov_axis": "vertical"}
+
+    def test_numeric_or_unversioned_identity_requests_are_refused(self):
+        for value in (60, 73014446780):
+            self.shots["shots"][0]["worldspace_id"] = value
+            with self.assertRaisesRegex(ValueError, "numeric"):
+                prepare(self.shots, self.template, self.calibration)
+        self.shots["shots"][0]["worldspace_id"] = "00003C:Skyrim.esm"
+        del self.shots["schema_version"]
+        with self.assertRaisesRegex(ValueError, "regenerated"):
+            prepare(self.shots, self.template, self.calibration)
 
     def test_mapping_and_preservation(self):
         original = copy.deepcopy(self.template)

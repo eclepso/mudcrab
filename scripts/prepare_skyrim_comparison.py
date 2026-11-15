@@ -8,12 +8,17 @@ import math
 from pathlib import Path
 import re
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from form_key_identity import PackIdentity, TAMRIEL, named, require_schema
+
 
 def finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def prepare(shots, template, calibration):
+    require_schema(shots)
     required = {"name", "timestamp", "position", "rotation", "fov", "viewRoll", "pcPosition", "pcRotation", "pcCell"}
     if not required.issubset(template):
         raise ValueError("Use a complete native Photo Mode camera export as the template")
@@ -41,9 +46,9 @@ def prepare(shots, template, calibration):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in names:
             raise ValueError("Shot names must be unique plain file stems")
         names.add(name)
-        if shot.get("interior_cell_id") is not None or not isinstance(shot.get("worldspace_id"), int):
-            raise ValueError("This exporter requires explicit exterior worldspace IDs")
-        worldspaces.add(shot["worldspace_id"])
+        if shot.get("interior_cell_id") is not None or shot.get("worldspace_id") is None:
+            raise ValueError("This exporter requires explicit named exterior worldspace identities")
+        worldspaces.add(named(shot["worldspace_id"]))
         position = shot.get("position")
         if not isinstance(position, list) or len(position) != 3 or not all(map(finite, position)):
             raise ValueError("Shot position must contain three finite values")
@@ -81,7 +86,7 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     args.output.mkdir(parents=True, exist_ok=False)
-    manifest = {"kind": "mudcrab-photo-mode-inputs", "native_capture_verified": False,
+    manifest = {"schema_version": 2, "kind": "mudcrab-photo-mode-inputs", "native_capture_verified": False,
                 "inputs": {k: hashlib.sha256(v).hexdigest() for k, v in sources.items()},
                 "calibration": inputs["calibration"], "shots": inputs["shots"], "presets": []}
     for name, preset in presets:

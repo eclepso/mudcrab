@@ -106,10 +106,10 @@ pub fn find_cell_by_editor_id(
 ) -> Result<Option<CellRow>, String> {
     connection
         .query_row(
-            "SELECT id, worldspace_id, grid_x, grid_y FROM cells \
+            "SELECT runtime_id(id), runtime_id(worldspace_id), grid_x, grid_y FROM cells \
              WHERE interior_name = ?1 COLLATE NOCASE \
-             ORDER BY (worldspace_id IS ?2 AND grid_x IS NOT NULL AND grid_y IS NOT NULL) DESC, \
-                      worldspace_id IS ?2 DESC, id LIMIT 1",
+             ORDER BY (worldspace_id IS stored_key(?2) AND grid_x IS NOT NULL AND grid_y IS NOT NULL) DESC, \
+                      worldspace_id IS stored_key(?2) DESC, ((SELECT flags FROM pack_plugins WHERE id=(cells.id >> 24)) & 2), (SELECT supplier_priority FROM pack_plugins WHERE id=(cells.id >> 24)), (cells.id & 16777215) LIMIT 1",
             params![name, streaming_worldspace],
             |row| {
                 let grid_x: Option<i32> = row.get(2)?;
@@ -171,6 +171,8 @@ fn open_world(world: &World) -> Result<(u32, Connection), String> {
     let path = config.assets_dir.join("skyrim_world.db");
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    shared::world_assets::install_runtime_identity_functions(&connection)
+        .map_err(|error| format!("world identity unavailable: {error}; convert again"))?;
     Ok((config.worldspace_id, connection))
 }
 

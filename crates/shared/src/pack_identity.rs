@@ -26,6 +26,7 @@ pub struct PackIdentity {
     table: PluginTable,
     order: Vec<PluginId>,
     digest: [u8; 32],
+    runtime: std::sync::Arc<crate::legacy_id_view::LegacyIdView<'static>>,
 }
 
 impl PackIdentity {
@@ -54,10 +55,14 @@ impl PackIdentity {
             );
         }
         let digest = mapping_digest(&table, &order);
+        let runtime = std::sync::Arc::new(
+            crate::legacy_id_view::LegacyIdView::from_load_order(&table, &order)?.into_owned(),
+        );
         Ok(Self {
             table,
             order,
             digest,
+            runtime,
         })
     }
 
@@ -74,6 +79,53 @@ impl PackIdentity {
     /// Exact table, facts, content and priority proof for every reusable pack member.
     pub fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    /// Build the checked transient runtime view without assigning any stand-in slots.
+    /// Stored keys and portable names remain independent of these session handles.
+    pub fn legacy_view(&self) -> Result<crate::legacy_id_view::LegacyIdView<'static>> {
+        Ok(
+            crate::legacy_id_view::LegacyIdView::from_load_order(&self.table, &self.order)?
+                .into_owned(),
+        )
+    }
+
+    /// Resolve an existing gameplay handle through this world's authenticated allocation.
+    /// Zero is explicit absence; requests outside the legacy slot space are refused.
+    pub fn runtime_key(&self, value: u32) -> Result<Option<FormKey>> {
+        Ok(self.runtime.from_legacy_u32(value)?)
+    }
+
+    /// Expose one representable transient gameplay handle, never a stored identity.
+    pub fn runtime_id(&self, key: FormKey) -> Result<u32> {
+        self.required_key(key.to_sql_i64())?;
+        Ok(self.runtime.to_legacy_u32(key)?)
+    }
+
+    /// Catalog scans may omit valid owners that have no supported transient handle yet.
+    /// Invalid stored keys remain format errors; this never assigns a replacement slot.
+    pub fn runtime_id_if_available(&self, key: FormKey) -> Result<Option<u32>> {
+        use crate::legacy_id_view::LegacyError;
+        self.required_key(key.to_sql_i64())?;
+        match self.runtime.to_legacy_u32(key) {
+            Ok(id) => Ok(Some(id)),
+            Err(
+                LegacyError::NoFullSlot(_)
+                | LegacyError::NoLightSlot(_)
+                | LegacyError::LightLocalTooWide(_)
+                | LegacyError::MissingPlugin(_)
+                | LegacyError::NullCollision,
+            ) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Stable text proof used by independently reusable named-identity catalogs.
+    pub fn digest_hex(&self) -> String {
+        self.digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Validate a stored required key and its membership before exposing it to callers.

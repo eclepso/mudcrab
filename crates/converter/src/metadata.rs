@@ -14,7 +14,7 @@ use crate::{
         can_reuse_meshes_for_producer, configuration_hash, default_gait_inputs, hash_bytes,
         hash_file, recover_script_abi,
     },
-    esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database},
+    esm::{EsmParser, cell_cache::write_form_key_cell_cache, exporter::validate_database},
     integration::finalize_world_database,
     lod::albedo::terrain_diffuse_paths,
     mesh::{MeshConverter, nif_source_hash, nif_unrepaired_source_hash, prune_glb_texture_bytes},
@@ -145,6 +145,8 @@ impl AssetPipeline {
         // Read the original version; normal cache loading deliberately invalidates
         // incompatible assets during migration, which this explicit route verifies instead.
         let mut manifest: ConversionManifest = serde_json::from_slice(&source_manifest)?;
+        // A metadata-only rebuild can retain current-generation assets, never upgrade an old pack.
+        manifest.validate_world_generation(&source)?;
         let source_reader = source_reader_identity(&source)?;
         let retained_reader = retained_reader_identity(&source, &source_reader)?;
         let source_lineage = crate::records::schema_lineage::lineage_digest(&source_reader);
@@ -176,7 +178,7 @@ impl AssetPipeline {
         ensure!(
             manifest.schema_version == CONVERTER_SCHEMA_VERSION,
             "metadata rebuild requires converter schema {CONVERTER_SCHEMA_VERSION} textures, but this source is schema {}; \
-             its KTX2 textures predate the current texture layout. Run normal conversion to regenerate them",
+             convert again from the original sources",
             manifest.schema_version
         );
         ensure!(
@@ -249,6 +251,7 @@ impl AssetPipeline {
         let plugins = matched_plugins(&source, &config.data_dir)?;
         let staging = staging_path(&config.output_dir);
         fs::create_dir(&staging)?;
+        crate::cache::write_staging_generation(&staging)?;
         let result = rebuild_into(
             &config,
             &source,
@@ -761,41 +764,62 @@ async fn rebuild_into(
     report.warnings.extend(conversion.warnings);
     report.notices.extend(conversion.notices);
     let phases = conversion.phases;
-    let merged = conversion.records;
+    drop(conversion.records);
+    let native = Arc::new(conversion.native.ok_or_else(|| {
+        color_eyre::eyre::eyre!("metadata source conversion returned no native FormKey generation")
+    })?);
+    let source_offsets = conversion.source_offsets;
+    let scope = native.order.pack_identity()?;
+    ensure!(
+        manifest.plugin_table_digest.as_deref() == Some(scope.digest_hex().as_str()),
+        "matched metadata source plugins produced a different owner allocation; convert again"
+    );
+    manifest.plugin_table_digest = Some(scope.digest_hex());
     validate_database(&Connection::open(&database)?)?;
     if config.record_reader == crate::config::RecordReader::Inhouse {
         crate::esm::inhouse::write_database_profile(staging, &database, &phases)?;
-        crate::esm::inhouse::write_terrain_caches(&merged, &database, staging)?;
-    } else {
-        write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
+    }
+    let (_, mut cache_warnings) = write_form_key_cell_cache(
+        &native,
+        &source_offsets,
+        &staging.join("cell_cache.rkyv"),
+        false,
+    )?;
+    if config.record_reader == crate::config::RecordReader::Inhouse {
+        let (_, preserved_warnings) = write_form_key_cell_cache(
+            &native,
+            &source_offsets,
+            &staging.join("cell_cache_preserved.rkyv"),
+            true,
+        )?;
+        cache_warnings.extend(preserved_warnings);
+    }
+    cache_warnings.sort();
+    cache_warnings.dedup();
+    if !cache_warnings.is_empty() {
+        manifest.record_data_complete = Some(false);
+        report.warnings.extend(cache_warnings);
     }
     crate::esm::inhouse::write_configured_reader_identity(staging, config)?;
     report.artifacts.push(PathBuf::from("record-reader.json"));
     if config.record_reader == crate::config::RecordReader::Inhouse {
-        report
-            .artifacts
-            .push(PathBuf::from(crate::esm::inhouse::DATABASE_PROFILE_FILE));
-        report
-            .artifacts
-            .push(PathBuf::from("inhouse-reader-diagnostics.json"));
-        report
-            .artifacts
-            .push(PathBuf::from("cell_cache_preserved.rkyv"));
+        report.artifacts.extend([
+            PathBuf::from(crate::esm::inhouse::DATABASE_PROFILE_FILE),
+            PathBuf::from("inhouse-reader-diagnostics.json"),
+            PathBuf::from("cell_cache_preserved.rkyv"),
+        ]);
     }
-    // Merged terrain (#215) keeps only the records its stage reads. The LAND each cell keeps is
-    // checked here, before the texture, mesh and LOD stages, so a bad load order fails in minutes;
-    // the positions are the ones the cell cache above was ordered by.
+    // Native cache validation already omits malformed LAND candidates with bounded warnings.
+    let terrain_native = if config.merged_terrain {
+        Some(native)
+    } else {
+        drop(native);
+        None
+    };
     let source_offsets = if config.merged_terrain {
-        crate::terrain_pipeline::cell_cache_source_offsets(config.record_reader, &database)?
+        source_offsets
     } else {
         HashMap::new()
-    };
-    let merged_records = if config.merged_terrain {
-        crate::esm::cell_cache::merged_terrain_lands(&merged, &source_offsets)?;
-        Some(crate::terrain_pipeline::terrain_records(merged))
-    } else {
-        drop(merged);
-        None
     };
     let diffuse_paths = terrain_diffuse_paths(&Connection::open(&database)?)?;
     for archive in &archives {
@@ -853,11 +877,10 @@ async fn rebuild_into(
     // Merged terrain (#215) is rebuilt from the records like the database and the LOD chunks
     // are, so a rebuild with the option on produces it instead of ignoring the option.
     if config.merged_terrain {
-        crate::terrain_pipeline::run_merged_terrain_stage(
+        crate::terrain_pipeline::run_form_key_merged_terrain_stage(
             staging,
-            merged_records,
+            terrain_native.expect("merged terrain keeps its native source generation"),
             source_offsets,
-            plugins,
             &crate::terrain_pipeline::TerrainOptions::from_config(config),
             progress,
             &mut report,

@@ -6,13 +6,155 @@
 //! The converter resolves it once; the runtime only reads rows and never decodes records.
 //! A pack without the file spawns actors exactly as before.
 
+use crate::{form_key::NamedFormKey, pack_identity::PackIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Where the catalog lives, relative to the converted-assets root.
 pub const PATH: &str = "actor-outfits.json";
 /// Catalog format version. A different version is rejected as a whole.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+/// Published named identities are portable; the digest binds this derived catalog to its pack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorOutfitCatalogFile {
+    pub version: u32,
+    pub pack_identity: String,
+    pub outfits: Vec<ActorOutfitFile>,
+    #[serde(default)]
+    pub skipped: BTreeMap<String, usize>,
+}
+
+/// A stored outfit never exposes a pack-local integer or transient runtime handle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorOutfitFile {
+    pub npc_id: NamedFormKey,
+    pub outfit_id: NamedFormKey,
+    pub parts: Vec<OutfitPartFile>,
+}
+
+/// Model and identity source facts for one published worn part.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutfitPartFile {
+    pub armo_id: NamedFormKey,
+    pub armature_id: NamedFormKey,
+    pub biped_mask: u32,
+    pub armature_race_id: NamedFormKey,
+    pub scene: String,
+}
+
+/// Convert a required transient handle only at an explicit runtime boundary.
+fn named_runtime(identity: &PackIdentity, value: u32) -> color_eyre::Result<NamedFormKey> {
+    let key = identity
+        .runtime_key(value)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing required outfit identity"))?;
+    Ok(identity.table().named(key)?)
+}
+
+/// Authenticate a required portable key before producing a transient gameplay handle.
+fn runtime_named(identity: &PackIdentity, value: &NamedFormKey) -> color_eyre::Result<u32> {
+    let key = identity
+        .table()
+        .intern(value)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing required outfit identity"))?;
+    identity.runtime_id(key)
+}
+
+impl ActorOutfitCatalogFile {
+    /// Check the generation before resolving any named rows or scene paths.
+    pub fn validate_for(&self, identity: &PackIdentity) -> color_eyre::Result<()> {
+        color_eyre::eyre::ensure!(
+            self.version == VERSION,
+            "unsupported actor outfit catalog; convert again"
+        );
+        color_eyre::eyre::ensure!(
+            self.pack_identity == identity.digest_hex(),
+            "actor outfit catalog belongs to another conversion; convert again"
+        );
+        let mut seen = BTreeSet::new();
+        for row in &self.outfits {
+            let key = identity
+                .table()
+                .intern(&row.npc_id)?
+                .ok_or_else(|| color_eyre::eyre::eyre!("outfit has no NPC identity"))?;
+            color_eyre::eyre::ensure!(
+                seen.insert(key) && !row.parts.is_empty(),
+                "empty or duplicate actor outfit"
+            );
+            color_eyre::eyre::ensure!(
+                identity.table().intern(&row.outfit_id)?.is_some(),
+                "outfit has no source identity"
+            );
+            for part in &row.parts {
+                color_eyre::eyre::ensure!(
+                    part.biped_mask != 0
+                        && crate::actor_idle_catalog::canonical_mesh_key(&part.scene, ".glb"),
+                    "invalid actor outfit part"
+                );
+                for id in [&part.armo_id, &part.armature_id, &part.armature_race_id] {
+                    color_eyre::eyre::ensure!(
+                        identity.table().intern(id)?.is_some(),
+                        "outfit part has no identity"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve usable neighboring outfits while declining handles unavailable before step 4.
+    pub fn to_runtime(&self, identity: &PackIdentity) -> color_eyre::Result<ActorOutfitCatalog> {
+        self.validate_for(identity)?;
+        let mut catalog = ActorOutfitCatalog {
+            version: VERSION,
+            outfits: Vec::new(),
+            skipped: self.skipped.clone(),
+        };
+        for row in &self.outfits {
+            let mapped = (|| -> color_eyre::Result<ActorOutfit> {
+                let npc_id = runtime_named(identity, &row.npc_id)?;
+                let outfit_id = runtime_named(identity, &row.outfit_id)?;
+                let mut parts = Vec::new();
+                for part in &row.parts {
+                    let mapped = (|| -> color_eyre::Result<OutfitPart> {
+                        Ok(OutfitPart {
+                            armo_id: runtime_named(identity, &part.armo_id)?,
+                            armature_id: runtime_named(identity, &part.armature_id)?,
+                            armature_race_id: runtime_named(identity, &part.armature_race_id)?,
+                            biped_mask: part.biped_mask,
+                            scene: part.scene.clone(),
+                        })
+                    })();
+                    match mapped {
+                        Ok(part) => parts.push(part),
+                        Err(_) => {
+                            *catalog
+                                .skipped
+                                .entry("runtime_part_identity_unavailable".into())
+                                .or_default() += 1
+                        }
+                    }
+                }
+                Ok(ActorOutfit {
+                    npc_id,
+                    outfit_id,
+                    parts,
+                })
+            })();
+            match mapped {
+                Ok(row) if !row.parts.is_empty() => catalog.outfits.push(row),
+                _ => {
+                    *catalog
+                        .skipped
+                        .entry("runtime_outfit_identity_unavailable".into())
+                        .or_default() += 1
+                }
+            }
+        }
+        catalog.outfits.sort_by_key(|row| row.npc_id);
+        Ok(catalog)
+    }
+}
 
 /// `ARMA/BOD2` biped slot bits. The slot number minus 30.
 pub const BIPED_BODY: u32 = 1 << 2;
@@ -68,6 +210,43 @@ impl OutfitPart {
 }
 
 impl ActorOutfitCatalog {
+    /// Serialize only named identities, bound to the authenticated producing generation.
+    pub fn to_file(&self, identity: &PackIdentity) -> color_eyre::Result<ActorOutfitCatalogFile> {
+        let file = ActorOutfitCatalogFile {
+            version: VERSION,
+            pack_identity: identity.digest_hex(),
+            outfits: self
+                .outfits
+                .iter()
+                .map(|row| {
+                    Ok(ActorOutfitFile {
+                        npc_id: named_runtime(identity, row.npc_id)?,
+                        outfit_id: named_runtime(identity, row.outfit_id)?,
+                        parts: row
+                            .parts
+                            .iter()
+                            .map(|part| {
+                                Ok(OutfitPartFile {
+                                    armo_id: named_runtime(identity, part.armo_id)?,
+                                    armature_id: named_runtime(identity, part.armature_id)?,
+                                    armature_race_id: named_runtime(
+                                        identity,
+                                        part.armature_race_id,
+                                    )?,
+                                    biped_mask: part.biped_mask,
+                                    scene: part.scene.clone(),
+                                })
+                            })
+                            .collect::<color_eyre::Result<_>>()?,
+                    })
+                })
+                .collect::<color_eyre::Result<_>>()?,
+            skipped: self.skipped.clone(),
+        };
+        file.validate_for(identity)?;
+        Ok(file)
+    }
+
     /// Reject the whole catalog if a key or identity is ambiguous. An optional sidecar must not
     /// turn a malformed row into an unrelated actor's clothing.
     pub fn validate(&self) -> Result<(), &'static str> {

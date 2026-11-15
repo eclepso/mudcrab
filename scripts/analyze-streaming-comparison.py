@@ -13,6 +13,9 @@ import statistics
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from form_key_identity import named, require_schema
+
 
 DEFAULT_COMPARISONS = (
     ("fixed64", "adaptive128"),
@@ -48,7 +51,7 @@ COMPLETION_NAMES = (
 )
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 LOG_ERRORS = re.compile(r"\bERROR\b|thread .*panicked|Validation Error|Shader compilation error", re.IGNORECASE)
-CELL_KEY = re.compile(r"Exterior \{ worldspace_id: (\d+), grid_x: (-?\d+), grid_y: (-?\d+) \}")
+CELL_KEY = re.compile(r"Exterior \{ worldspace_id: ([^,]+), grid_x: (-?\d+), grid_y: (-?\d+) \}")
 LIMITATIONS = [
     "Main-frame Time<Real> intervals include waits, controller and profiling overhead; they do not isolate CPU or GPU cost.",
     "CPU spans can overlap. Completed-latency frame values are sums, not CPU durations or individual latency samples.",
@@ -395,12 +398,14 @@ def validate_route(record, run, route, samples, errors, warnings):
 def cell_coverage(samples, timeline, catalog):
     if not catalog:
         return None
+    require_schema(catalog)
     existing = {tuple(cell) for cell in catalog["existing_cells"]}
     worldspace, size, radius = (catalog[k] for k in ("worldspace_id", "cell_size_units", "stream_radius"))
+    worldspace = named(worldspace)
     events = []
     for event in timeline:
         match = CELL_KEY.fullmatch(str(event.get("subject", "")))
-        if match and int(match[1]) == worldspace and event.get("stage") in ("committed", "unloaded") and number(event.get("elapsed_ms")):
+        if match and named(match[1]) == worldspace and event.get("stage") in ("committed", "unloaded") and number(event.get("elapsed_ms")):
             events.append((event["elapsed_ms"], event["stage"], (int(match[2]), int(match[3]))))
     events.sort(key=lambda event: event[0])
     resident, index, observations = set(), 0, {}
@@ -414,7 +419,7 @@ def cell_coverage(samples, timeline, catalog):
             index += 1
         camera = sample.get("camera") or {}
         position = camera.get("world_position")
-        if camera.get("worldspace_id") != worldspace or not isinstance(position, list) or len(position) != 3:
+        if named(camera.get("worldspace_id")) != worldspace or not isinstance(position, list) or len(position) != 3:
             return None
         center = (math.floor(position[0] / size), math.floor(-position[2] / size))
         desired = {(center[0] + x, center[1] + y) for x in range(-radius, radius + 1)
@@ -616,7 +621,14 @@ def analyze_run(experiment, record):
     for key in ("run_id", "pair_id", "mode"):
         if metadata and metadata.get(key) is not None and record.get(key) != metadata[key]:
             errors.append(f"profile provenance mismatch: {key}")
-    if trace.get("format_version") != 1 or trace.get("dropped_samples") != 0:
+    if metadata is not None:
+        if metadata.get("format_version") != 3:
+            errors.append("profile identity format is unsupported; regenerate the capture")
+        try:
+            named(metadata.get("worldspace_id"))
+        except ValueError as error:
+            errors.append(f"profile worldspace identity invalid: {error}")
+    if trace.get("format_version") != 2 or trace.get("dropped_samples") != 0:
         errors.append("trace format unsupported or frames were dropped")
     samples = trace.get("samples")
     if not isinstance(samples, list) or not samples:
@@ -718,7 +730,11 @@ def analyze_run(experiment, record):
         censored.append("recorded downstream work remains pending at trace end")
     result.update(expected_startup=expected, milestones=milestones, initial_request_elapsed_ms=initial_ms, route_boundaries=boundaries)
     result["phases"] = {key: frame_metrics(value, experiment["target_frame_ms"]) for key, value in phases.items()}
-    coverage = cell_coverage(samples, timeline, experiment.get("_route_cell_catalog_data"))
+    try:
+        coverage = cell_coverage(samples, timeline, experiment.get("_route_cell_catalog_data"))
+    except (ValueError, KeyError, TypeError) as error:
+        errors.append(f"cell coverage identity invalid: {error}")
+        coverage = None
     result["cell_coverage"] = {key: coverage_summary(value, coverage) for key, value in phases.items()}
     if coverage is None:
         warnings.append("desired-cell CPU committed coverage unavailable")

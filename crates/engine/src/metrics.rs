@@ -1374,6 +1374,9 @@ mod tests {
                 benchmark_duration_secs: Some(1.0),
                 benchmark_output: report_path.clone(),
                 profile_output_dir: Some(directory.path().join("profile")),
+                bound_identity: Some(std::sync::Arc::new(
+                    crate::config::identity_request_fixture(),
+                )),
                 ..default()
             })
             .insert_resource(StreamingBenchmarkRoute::default())
@@ -1442,6 +1445,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = EngineConfig {
             profile_output_dir: Some(directory.path().join("profile")),
+            bound_identity: Some(std::sync::Arc::new(
+                crate::config::identity_request_fixture(),
+            )),
             profile_gpu_inventory: gpu_inventory_enabled,
             benchmark_output: directory.path().join("report.json"),
             benchmark_frames: Some(1),
@@ -1568,6 +1574,9 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .insert_resource(EngineConfig {
                 profile_output_dir: Some(directory.path().join("profile")),
+                bound_identity: Some(std::sync::Arc::new(
+                    crate::config::identity_request_fixture(),
+                )),
                 ..default()
             })
             .insert_resource(RenderOrigin(IVec2::new(4, -3)))

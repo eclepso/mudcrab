@@ -1,7 +1,7 @@
 //! Builds the merged terrain mesh of one exterior cell from its LAND record (#215).
 //!
-//! The mesh is the in-memory `shared::terrain_mesh::TerrainCellMesh` (format v3): four unwelded
-//! 17x17 quadrants, each with its own list of LTEX FormID slots and per-vertex weights. Writing
+//! The mesh is the in-memory `shared::terrain_mesh::TerrainCellMesh` (format v2): four unwelded
+//! 17x17 quadrants, each with its own list of LTEX FormKey slots and per-vertex weights. Writing
 //! it to disk, the texture arrays and the pipeline wiring are separate steps.
 //!
 //! Nothing is dropped silently. A layer that cannot be used (a null or unknown LTEX, or no
@@ -14,10 +14,7 @@ use crate::esm::{
     extractors::SubrecordView,
     records::RawRecord,
 };
-use color_eyre::{
-    Result,
-    eyre::{WrapErr, ensure},
-};
+use color_eyre::{Result, eyre::ensure};
 use shared::{
     LAND_SIDE,
     terrain_mesh::{
@@ -50,7 +47,7 @@ pub struct SkippedLayer {
     /// The ATXT layer index; 0 for a base.
     pub layer: u16,
     pub is_base: bool,
-    pub texture_form_id: u32,
+    pub texture_form_id: u64,
     pub reason: SkipReason,
 }
 
@@ -60,7 +57,7 @@ pub struct SkippedLayer {
 pub struct OverriddenLayer {
     pub quadrant: u8,
     pub layer: u16,
-    pub texture_form_id: u32,
+    pub texture_form_id: u64,
 }
 
 /// What the cell build changed or left out, for the converter report.
@@ -81,7 +78,7 @@ pub struct CellMeshReport {
 
 /// A quadrant's slot list and, per slot 1.., the sparse weights.
 struct QuadrantSlots {
-    textures: Vec<u32>,
+    textures: Vec<u64>,
     /// (slot, VTXT position, opacity) for slots 1 and up.
     weights: Vec<(usize, u16, f32)>,
 }
@@ -97,6 +94,38 @@ pub fn build_cell_mesh(
     record: &RawRecord,
     known_ltex: &HashSet<u32>,
     key: [u8; 32],
+) -> Result<(TerrainCellMesh, CellMeshReport)> {
+    let known = known_ltex.iter().copied().map(u64::from).collect();
+    let (layers, duplicates) = extract_texture_layers(&record.subrecords)?;
+    build_cell_mesh_layers(u64::from(cell_id), record, &known, key, layers, duplicates)
+}
+
+/// Build a native FormKey mesh using physical resolved sites, independently of legacy slots.
+pub fn build_form_key_cell_mesh(
+    cell_id: shared::form_key::FormKey,
+    record: &super::form_key_merge::FormKeyRecord,
+    known_ltex: &HashSet<u64>,
+    key: [u8; 32],
+) -> Result<(TerrainCellMesh, CellMeshReport)> {
+    let (layers, duplicates) = super::cell_cache::form_key_texture_layers_with_report(record)?;
+    build_cell_mesh_layers(
+        cell_id.to_packed(),
+        record.canonical_record(),
+        known_ltex,
+        key,
+        layers,
+        duplicates,
+    )
+}
+
+/// Share geometry and sparse-weight handling after the caller resolves semantic keys.
+fn build_cell_mesh_layers(
+    cell_id: u64,
+    record: &RawRecord,
+    known_ltex: &HashSet<u64>,
+    key: [u8; 32],
+    layers: Vec<shared::TerrainLayer>,
+    duplicates: Vec<super::cell_cache::DroppedLayer>,
 ) -> Result<(TerrainCellMesh, CellMeshReport)> {
     let side = usize::from(LAND_SIDE);
     let view = SubrecordView::new(&record.subrecords);
@@ -156,8 +185,6 @@ pub fn build_cell_mesh(
         }
     }
 
-    let (layers, duplicates) = extract_texture_layers(&record.subrecords)
-        .wrap_err_with(|| format!("invalid LAND layers for cell {cell_id:08X}"))?;
     let mut report = CellMeshReport {
         overridden_layers: duplicates
             .iter()
@@ -262,7 +289,7 @@ pub fn build_cell_mesh(
     };
     report.needed_stride_16 = stride > NARROW_STRIDE;
 
-    let mut quadrant_slots = vec![0u32; 4 * stride];
+    let mut quadrant_slots = vec![0u64; 4 * stride];
     let mut quadrant_slot_counts = [0u8; 4];
     let mut weights = vec![0u8; stride * CELL_MESH_VERTICES];
     for (quadrant, slots) in quadrants.iter().enumerate() {
@@ -292,7 +319,7 @@ pub fn build_cell_mesh(
         weights,
     };
     // Every slot texture is known by construction; the map only lets the shared check run.
-    let ids: HashMap<u32, u16> = mesh
+    let ids: HashMap<u64, u16> = mesh
         .quadrant_slots
         .iter()
         .map(|&ltex| (ltex, 0))

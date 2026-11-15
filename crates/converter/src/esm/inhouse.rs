@@ -352,17 +352,47 @@ pub fn export_record_bundle_typed_with_options(
     }
     strings_stage.finish(plugins.len());
     drop(paths);
-    let records = convert_plugins_with_dump(
+    let mut converted = super::form_key_world::convert_with_dump(
         &plugins,
         &database_path,
-        &strings_root,
+        RecordReader::Inhouse,
+        StringSources::default_language(StringRoots::PluginLooseFirst(&strings_root)),
+        None,
         (!signatures.is_empty()).then_some((output, signatures)),
         mode,
     )?;
-    drop(plugins);
+    let native = converted
+        .native
+        .take()
+        .ok_or_else(|| color_eyre::eyre::eyre!("native record bundle lost its FormKey context"))?;
+    write_database_profile(output, &database_path, &converted.phases)?;
+    let record_count = native.records.len();
     let terrain_stage = records::profile::ProfileStage::start("terrain_cache_pair");
-    let count = write_terrain_caches(&records, &database_path, output)?;
-    terrain_stage.finish(records.len());
+    let (count, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
+        &native,
+        &converted.source_offsets,
+        &output.join("cell_cache.rkyv"),
+        false,
+    )?;
+    let (_, preserved_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
+        &native,
+        &converted.source_offsets,
+        &output.join("cell_cache_preserved.rkyv"),
+        true,
+    )?;
+    for warning in converted
+        .warnings
+        .iter()
+        .chain(&cache_warnings)
+        .chain(&preserved_warnings)
+    {
+        eprintln!("{warning}");
+    }
+    for notice in &converted.notices {
+        eprintln!("{notice}");
+    }
+    terrain_stage.finish(record_count);
+    drop(plugins);
     if let Some(work) = separate_work {
         let copy_stage = records::profile::ProfileStage::start("database_work_dir_publish_copy");
         // Conversion has returned and its SQLite connection is closed; caches read the same DB.
@@ -371,9 +401,8 @@ pub fn export_record_bundle_typed_with_options(
     }
     write_reader_identity(output, RecordReader::Inhouse)?;
     fs::write(output.join("records-schema.json"), records::SCHEMA_BYTES)?;
-    let record_count = records.len();
     let runtime_release_stage = records::profile::ProfileStage::start("runtime_master_release");
-    drop(records);
+    drop(native);
     runtime_release_stage.finish(record_count);
     if mode == RecordBundleMode::RecordArchiveOnly {
         let mut identity = reader_identity(RecordReader::Inhouse);
@@ -781,15 +810,12 @@ pub(crate) fn convert_plugins_with_string_sources_report(
     string_sources: StringSources<'_>,
     schemas: Option<&records::addons::RuntimeSchemas>,
 ) -> Result<RecordConversion> {
-    convert_plugins_with_text_sources_report_impl(
+    super::form_key_world::convert(
         plugin_paths,
         db_path,
+        RecordReader::Inhouse,
         string_sources,
-        None,
-        RecordBundleMode::Full,
         schemas,
-        #[cfg(test)]
-        None,
     )
 }
 
@@ -1336,6 +1362,8 @@ fn convert_plugins_with_text_sources_report_impl(
         records: master,
         warnings: report_warnings,
         notices: report_notices,
+        native: None,
+        source_offsets: HashMap::new(),
     })
 }
 

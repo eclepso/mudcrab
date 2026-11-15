@@ -729,10 +729,7 @@ mod tests {
         for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
             let path = output.join(name);
             assert!(path.is_file());
-            let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(
-                &fs::read(path).unwrap(),
-            )
-            .unwrap();
+            let cache = crate::esm::cell_cache::read_form_key_cell_cache(&path).unwrap();
             assert!(cache.cells.is_empty(), "unusable LAND entered {name}");
         }
         let typed: Vec<serde_json::Value> = fs::read_to_string(output.join("typed-records.jsonl"))

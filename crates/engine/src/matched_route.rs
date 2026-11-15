@@ -19,6 +19,43 @@ pub(crate) struct MatchedRoute {
 }
 
 impl MatchedRoute {
+    /// Bind named route identities, or explicitly validate legacy numeric request input.
+    pub(crate) fn load_with_identity(
+        path: &Path,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Self, ShotsError> {
+        let text = fs::read_to_string(path).map_err(|error| ShotsError(error.to_string()))?;
+        Self::parse_with_identity(&text, identity)
+    }
+
+    /// Geometry stays unchanged while request identities are resolved through the pack table.
+    fn parse_with_identity(
+        text: &str,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Self, ShotsError> {
+        let mut document: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| ShotsError(error.to_string()))?;
+        let version = document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ShotsError("matched route has no identity schema".into()))?;
+        if !matches!(version, 1 | 2) {
+            return Err(ShotsError("unsupported matched route schema".into()));
+        }
+        let source = document
+            .get("worldspace_id")
+            .ok_or_else(|| ShotsError("matched route has no worldspace".into()))?;
+        let worldspace = crate::config::external_request(source, version, identity)
+            .map_err(|error| ShotsError(error.to_string()))?
+            .ok_or_else(|| ShotsError("matched route worldspace cannot be null".into()))?;
+        document["worldspace_id"] = worldspace.into();
+        // The internal expansion is a gameplay request, not a persisted native integer.
+        document["schema_version"] = 1.into();
+        Self::parse(
+            &serde_json::to_string(&document).map_err(|error| ShotsError(error.to_string()))?,
+        )
+    }
     pub(crate) fn load(path: &Path) -> Result<Self, ShotsError> {
         let text = fs::read_to_string(path).map_err(|e| ShotsError(e.to_string()))?;
         Self::parse(&text)
@@ -125,6 +162,20 @@ impl MatchedRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named route v2 and legacy numeric v1 requests use the exact same checked world view.
+    #[test]
+    fn named_matched_route_binds_before_expanding_gameplay_poses() {
+        let identity = crate::config::identity_request_fixture();
+        let mut document: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        document["schema_version"] = 2.into();
+        document["worldspace_id"] = "00003C:Zulu.esm".into();
+        let route = MatchedRoute::parse_with_identity(&document.to_string(), &identity).unwrap();
+        let (file, _) = route.expand().unwrap();
+        assert_eq!(file.shots[0].worldspace_id, Some(0x3c));
+        document["worldspace_id"] = 0x0100_003cu32.into();
+        assert!(MatchedRoute::parse_with_identity(&document.to_string(), &identity).is_err());
+    }
     const FIXTURE: &str = include_str!("../../../scripts/profiling/fixtures/matched-route.json");
     #[test]
     fn exact_fixture_traversal_and_returns() {

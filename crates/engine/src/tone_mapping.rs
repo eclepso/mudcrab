@@ -364,7 +364,7 @@ impl SceneToneMapSource {
 mod tests {
     use super::*;
     use crate::world::imagespace::{
-        ImageSpaceCinematic, ImageSpaceHdr, ImageSpaceSelection, ImageSpaceTint, LoadedImageSpace,
+        ImageSpaceCinematic, ImageSpaceHdr, ImageSpaceTint, LoadedImageSpace,
     };
 
     fn parameters(curve: RetailCurveKind) -> RetailCurveParameters {
@@ -382,9 +382,11 @@ mod tests {
     fn grade_source(white: Option<f32>) -> SceneGradeSource {
         let mut source = SceneGradeSource::default();
         source.record = Some(LoadedImageSpace {
-            selection: ImageSpaceSelection::Direct(0x12F87),
+            selection: crate::world::imagespace::NamedImageSpaceSelection::Direct(
+                "012F87:Skyrim.esm".parse().unwrap(),
+            ),
             source_weather: None,
-            form_id: 0x12F87,
+            form_id: "012F87:Skyrim.esm".parse().unwrap(),
             editor_id: Some("test-authored-image-space".into()),
             load_order: 1,
             winner_plugin: Some("test-winner.esm".into()),

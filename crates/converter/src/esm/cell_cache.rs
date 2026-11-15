@@ -57,6 +57,297 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
     write_cell_cache_with_source_order(records, &HashMap::new(), path)
 }
 
+/// Resolve retained LAND assignments by their authored quadrant/slot and exact source occurrence.
+/// Source NULL assignments disappear before clearing; cleared non-null assignments retain weights.
+pub(crate) fn form_key_texture_layers(
+    record: &super::form_key_merge::FormKeyRecord,
+) -> Result<Vec<TerrainLayer>> {
+    form_key_texture_layers_with_report(record).map(|(layers, _)| layers)
+}
+
+/// Preserve the exact superseded occurrence as a resolved diagnostic identity.
+pub(crate) fn form_key_texture_layers_with_report(
+    record: &super::form_key_merge::FormKeyRecord,
+) -> Result<(Vec<TerrainLayer>, Vec<DroppedLayer>)> {
+    form_key_texture_layers_with_context(record, None)
+}
+
+fn retained_texture_key(
+    record: &super::form_key_merge::FormKeyRecord,
+    ordinal: usize,
+    source_order: Option<&super::form_keys::FormKeyOrder>,
+) -> Result<Option<shared::form_key::FormKey>> {
+    let key = record.resolved_at(ordinal, 0)?;
+    if key.is_some() || source_order.is_none() {
+        return Ok(key);
+    }
+    let site = record
+        .links
+        .iter()
+        .find(|site| site.subrecord == ordinal && site.byte_offset == 0)
+        .expect("resolved_at checked the retained physical site");
+    Ok(source_order
+        .expect("source preservation context")
+        .resolve(
+            record.source.load_order as usize,
+            site.source_word,
+            shared::source_form_id::ZeroPolicy::Null,
+        )
+        .ok()
+        .flatten())
+}
+
+/// The preservation member keeps resolvable source owner/local identities before target clearing.
+fn form_key_texture_layers_with_context(
+    record: &super::form_key_merge::FormKeyRecord,
+    source_order: Option<&super::form_keys::FormKeyOrder>,
+) -> Result<(Vec<TerrainLayer>, Vec<DroppedLayer>)> {
+    let canonical = record.canonical_record();
+    let mut fields = canonical.subrecords.clone();
+    let mut origins = HashMap::new();
+    let mut dropped = Vec::new();
+    for (index, (tag, data)) in fields.iter_mut().enumerate() {
+        if !matches!(tag.as_slice(), b"BTXT" | b"ATXT") {
+            continue;
+        }
+        let source_index = record.source_ordinal(index)?;
+        let source = &record
+            .source
+            .subrecords
+            .get(source_index)
+            .ok_or_else(|| color_eyre::eyre::eyre!("LAND occurrence has no bounded source"))?
+            .1;
+        color_eyre::eyre::ensure!(
+            data.len() >= 8 && source.len() >= 8,
+            "truncated retained LAND assignment"
+        );
+        // Canonical recovery can clear a word. Source normalization still needs its original NULL status.
+        data[..4].copy_from_slice(&source[..4]);
+        if data[..4] != [0; 4] {
+            let base = tag.as_slice() == b"BTXT";
+            let layer = if base {
+                0
+            } else {
+                u16::from_le_bytes(data[6..8].try_into()?)
+            };
+            if let Some(previous) = origins.insert((data[4], base, layer), source_index) {
+                if !base {
+                    dropped.push(DroppedLayer {
+                        quadrant: data[4],
+                        layer,
+                        texture_form_id: retained_texture_key(record, previous, source_order)?
+                            .map_or(0, shared::form_key::FormKey::to_packed),
+                    });
+                }
+            }
+        }
+    }
+    let (mut layers, _) = extract_texture_layers(&fields)?;
+    normalize_texture_layers(&mut layers);
+    for layer in &mut layers {
+        if layer.texture_form_id == 0 {
+            continue;
+        }
+        let ordinal = origins[&(layer.quadrant, layer.is_base, layer.layer)];
+        layer.texture_form_id = retained_texture_key(record, ordinal, source_order)?
+            .map_or(0, shared::form_key::FormKey::to_packed);
+    }
+    layers.sort_by_key(|layer| {
+        (
+            layer.quadrant,
+            !layer.is_base,
+            layer.layer,
+            layer.texture_form_id,
+        )
+    });
+    validate_preserved_layers(&layers)?;
+    Ok((layers, dropped))
+}
+
+/// A safely retained link is selected by physical field occurrence, never by its numeric word.
+pub(crate) fn form_key_field(
+    record: &super::form_key_merge::FormKeyRecord,
+    tag: &[u8; 4],
+    byte_offset: usize,
+) -> Result<Option<shared::form_key::FormKey>> {
+    let Some(index) = record
+        .canonical_record()
+        .subrecords
+        .iter()
+        .position(|(found, _)| found.as_slice() == tag)
+    else {
+        return Ok(None);
+    };
+    record.resolved_at(record.source_ordinal(index)?, byte_offset)
+}
+
+/// Select the same native LAND projection for SQL, cache and derived terrain.
+/// An ambiguous winning supplier group is omitted locally while neighboring cells survive.
+pub(crate) fn native_land_winners(
+    conversion: &super::form_key_merge::FormKeyConversion,
+    source_offsets: &HashMap<shared::form_key::FormKey, u64>,
+) -> Result<(
+    Vec<(shared::form_key::FormKey, shared::form_key::FormKey)>,
+    Vec<String>,
+)> {
+    use shared::form_key::FormKey;
+    let identity = conversion.order.pack_identity()?;
+    let mut groups = HashMap::<FormKey, Vec<FormKey>>::new();
+    for (&key, record) in &conversion.records {
+        if record.canonical_record().record_type == *b"LAND"
+            && !record.canonical_record().is_deleted()
+        {
+            groups
+                .entry(record.cell.unwrap_or(key))
+                .or_default()
+                .push(key);
+        }
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(cell, _)| {
+        conversion
+            .order
+            .identity_sort_tuple(*cell)
+            .expect("allocated CELL owner")
+    });
+    let mut chosen = Vec::new();
+    let mut warnings = Vec::new();
+    for (cell, mut lands) in groups {
+        lands.sort_by_key(|key| {
+            (
+                conversion.records[key].source.load_order,
+                source_offsets.get(key).copied().unwrap_or(0),
+                conversion
+                    .order
+                    .identity_sort_tuple(*key)
+                    .expect("allocated LAND owner"),
+            )
+        });
+        let kept = *lands.last().expect("nonempty LAND group");
+        let supplier = conversion.records[&kept].source.load_order;
+        let tied = lands
+            .iter()
+            .copied()
+            .filter(|key| conversion.records[key].source.load_order == supplier)
+            .collect::<Vec<_>>();
+        let positions = tied
+            .iter()
+            .filter_map(|key| source_offsets.get(key).copied())
+            .collect::<std::collections::HashSet<_>>();
+        if tied.len() > 1 && positions.len() != tied.len() {
+            warnings.push(format!("warning: skipped ambiguous LAND group for CELL {} from source priority {supplier}: native record positions are absent or repeated",identity.table().named(cell)?));
+            continue;
+        }
+        for dropped in lands.into_iter().filter(|key| *key != kept) {
+            warnings.push(format!("warning: CELL {}: LAND {} from source priority {supplier} wins; dropped LAND {} from source priority {}",identity.table().named(cell)?,identity.table().named(kept)?,identity.table().named(dropped)?,conversion.records[&dropped].source.load_order));
+        }
+        chosen.push((cell, kept));
+    }
+    Ok((chosen, warnings))
+}
+
+/// Build both cell cache generations directly from native FormKey winners.
+/// Bad LAND candidates are reported and omitted locally; usable neighboring cells remain publishable.
+pub fn write_form_key_cell_cache(
+    conversion: &super::form_key_merge::FormKeyConversion,
+    source_offsets: &HashMap<shared::form_key::FormKey, u64>,
+    path: &Path,
+    preserved: bool,
+) -> Result<(usize, Vec<String>)> {
+    use shared::form_key::FormKey;
+    let identity = conversion.order.pack_identity()?;
+    let (ordered, mut warnings) = native_land_winners(conversion, source_offsets)?;
+    let mut cells = Vec::new();
+    for (cell_key, land_key) in ordered {
+        let record = &conversion.records[&land_key];
+        let build = (|| -> Result<CachedLand> {
+            let canonical = record.canonical_record();
+            validate_inhouse_land(canonical)?;
+            let view = SubrecordView::new(&canonical.subrecords);
+            let heights = decode_vhgt(view.find(b"VHGT").unwrap_or_default());
+            let normals = decode_normals(view.find(b"VNML").unwrap_or_default(), &heights);
+            let vertex_colors = view.find(b"VCLR").unwrap_or_default().to_vec();
+            let mut layers = if preserved {
+                form_key_texture_layers_with_context(record, Some(&conversion.order))?.0
+            } else {
+                form_key_texture_layers(record)?
+            };
+            if !preserved {
+                limit_runtime_texture_layers(&mut layers);
+            }
+            let cell = conversion.records.get(&cell_key);
+            let world = cell
+                .and_then(|cell| cell.worldspace)
+                .and_then(|key| conversion.records.get(&key));
+            let world_height = world
+                .and_then(|world| {
+                    SubrecordView::new(&world.canonical_record().subrecords).find(b"DNAM")
+                })
+                .and_then(|data| data.get(4..8))
+                .map(|bytes| {
+                    f32::from_le_bytes(bytes.try_into().expect("four-byte world water height"))
+                })
+                .and_then(normalize_default_water_height);
+            let own_height = cell
+                .and_then(|cell| {
+                    SubrecordView::new(&cell.canonical_record().subrecords).find(b"XCLW")
+                })
+                .and_then(|data| data.get(..4))
+                .map(|bytes| {
+                    f32::from_le_bytes(bytes.try_into().expect("four-byte cell water height"))
+                })
+                .and_then(normalize_water_height);
+            let own_water = cell
+                .map(|cell| form_key_field(cell, b"XCWT", 0))
+                .transpose()?
+                .flatten();
+            let world_water = world
+                .map(|world| form_key_field(world, b"NAM2", 0))
+                .transpose()?
+                .flatten();
+            Ok(CachedLand {
+                cell_id: cell_key.to_packed(),
+                width: LAND_SIDE,
+                height: LAND_SIDE,
+                heights,
+                normals,
+                vertex_colors,
+                layers,
+                water_height: own_height.or(world_height),
+                water_type_form_id: own_water.or(world_water).map(FormKey::to_packed),
+            })
+        })();
+        match build {
+            Ok(cell) => cells.push(cell),
+            Err(error) => warnings.push(format!(
+                "warning: skipped unusable LAND {} for CELL {}: {error}",
+                identity.table().named(land_key)?,
+                identity.table().named(cell_key)?
+            )),
+        }
+    }
+    let count = cells.len();
+    let bytes = shared::cache_identity::encode_cell_cache(
+        &identity,
+        &CellCache {
+            version: CELL_CACHE_VERSION,
+            cells,
+        },
+        preserved,
+    )?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .wrap_err("cell cache destination exists; convert into a fresh generation")?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok((count, warnings))
+}
+
 /// Rank a winning LAND by plugin priority, native position, and a deterministic fallback.
 fn land_source_priority(record: &RawRecord, source_offsets: &HashMap<u32, u64>) -> (u32, u64, u32) {
     (
@@ -210,6 +501,10 @@ fn write_cell_cache_layers(
     path: &Path,
     runtime: bool,
 ) -> Result<usize> {
+    color_eyre::eyre::ensure!(
+        cfg!(test),
+        "native FormKey context is required for cell-cache publication; convert again"
+    );
     let water_by_cell = water_by_cell(records);
     let winners = land_winners_by_cell(records, source_offsets);
     let mut rejected_overrides: HashMap<u32, (usize, String)> = HashMap::new();
@@ -306,7 +601,7 @@ fn write_cell_cache_layers(
         cells_by_id.insert(
             cell_id,
             CachedLand {
-                cell_id,
+                cell_id: u64::from(cell_id),
                 width: LAND_SIDE,
                 height: LAND_SIDE,
                 heights,
@@ -314,7 +609,7 @@ fn write_cell_cache_layers(
                 vertex_colors,
                 layers,
                 water_height,
-                water_type_form_id,
+                water_type_form_id: water_type_form_id.map(u64::from),
             },
         );
     }
@@ -344,7 +639,9 @@ fn write_cell_cache_layers(
     let mut file = File::create(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    validate_cell_cache(path)?;
+    // Historical geometry fixtures exercise this source-only helper. Production admission
+    // above requires the native producer, which always writes an authenticated envelope.
+    rkyv::access::<shared::ArchivedCellCache, Error>(&bytes)?;
     Ok(count)
 }
 
@@ -496,7 +793,7 @@ pub(crate) fn decode_normals(bytes: &[u8], heights: &[f32]) -> Vec<i8> {
 pub(crate) struct DroppedLayer {
     pub(crate) quadrant: u8,
     pub(crate) layer: u16,
-    pub(crate) texture_form_id: u32,
+    pub(crate) texture_form_id: u64,
 }
 
 /// Validate every LAND payload and return retained layers plus discarded duplicate assignments.
@@ -513,7 +810,7 @@ pub(crate) fn extract_texture_layers(
                     "{} subrecord is truncated",
                     String::from_utf8_lossy(tag)
                 );
-                let texture_form_id = u32::from_le_bytes(data[..4].try_into().unwrap());
+                let texture_form_id = u64::from(u32::from_le_bytes(data[..4].try_into().unwrap()));
                 let quadrant = data[4];
                 color_eyre::eyre::ensure!(
                     quadrant < 4,
@@ -752,19 +1049,72 @@ fn copy_texture_layers(layers: &[TerrainLayer]) -> Vec<TerrainLayer> {
         .collect()
 }
 
-pub fn validate_cell_cache(path: &Path) -> Result<Mmap> {
+fn open_authenticated_cell_cache(
+    path: &Path,
+) -> Result<(Mmap, shared::pack_identity::PackIdentity)> {
+    let database = rusqlite::Connection::open_with_flags(
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .wrap_err("cell cache has no authenticated world allocation; convert again")?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&database)?;
     let file = File::open(path)?;
     // SAFETY: read-only mapping of the cell cache this process does not write while it is mapped.
     // An outside truncation or in-place rewrite would fault reads of the map; that
     // risk is accepted here (#633).
     let mmap = unsafe { Mmap::map(&file)? };
-    let archived =
-        rkyv::access::<shared::ArchivedCellCache, Error>(&mmap).wrap_err("invalid cell cache")?;
-    color_eyre::eyre::ensure!(
-        archived.version == CELL_CACHE_VERSION,
-        "unsupported cell cache version"
-    );
-    Ok(mmap)
+    shared::cache_identity::cell_cache_payload(
+        &identity,
+        &mmap,
+        path.file_name()
+            .is_some_and(|name| name == "cell_cache_preserved.rkyv"),
+    )?;
+    Ok((mmap, identity))
+}
+
+/// Validate an immutable cache's kind, format and world allocation before exposing its bytes.
+pub fn validate_cell_cache(path: &Path) -> Result<Mmap> {
+    open_authenticated_cell_cache(path).map(|(mmap, _)| mmap)
+}
+
+/// Deserialize the current paired format through its authenticated adjacent world context.
+pub fn read_form_key_cell_cache(path: &Path) -> Result<CellCache> {
+    let (mmap, identity) = open_authenticated_cell_cache(path)?;
+    let payload = shared::cache_identity::cell_cache_payload(
+        &identity,
+        &mmap,
+        path.file_name()
+            .is_some_and(|name| name == "cell_cache_preserved.rkyv"),
+    )?;
+    Ok(rkyv::from_bytes::<CellCache, Error>(payload)?)
+}
+
+/// Current-format test presentation for inherited gameplay/geometry assertions.
+#[cfg(test)]
+pub(crate) fn runtime_fixture_cache(path: &Path) -> CellCache {
+    let database =
+        rusqlite::Connection::open(path.parent().unwrap().join("skyrim_world.db")).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&database).unwrap();
+    let mut cache = read_form_key_cell_cache(path).unwrap();
+    let runtime = |key| {
+        u64::from(
+            identity
+                .runtime_id(shared::cache_identity::required(&identity, key).unwrap())
+                .unwrap(),
+        )
+    };
+    for cell in &mut cache.cells {
+        cell.cell_id = runtime(cell.cell_id);
+        cell.water_type_form_id = cell.water_type_form_id.map(runtime);
+        for layer in &mut cell.layers {
+            if layer.texture_form_id != 0 {
+                layer.texture_form_id = runtime(layer.texture_form_id);
+            }
+        }
+    }
+    cache
 }
 
 #[cfg(test)]
@@ -772,6 +1122,147 @@ mod tests {
     use super::*;
     use crate::test_strategies::{arbitrary_bytes, config};
     use proptest::prelude::*;
+
+    /// Plain source-only archives remain local geometry fixtures, never pack readers.
+    fn validate_cell_cache(path: &Path) -> Result<Mmap> {
+        let file = File::open(path)?;
+        // SAFETY: these fixture files are not changed while their maps are held.
+        let mmap = unsafe { Mmap::map(&file)? };
+        rkyv::access::<shared::ArchivedCellCache, Error>(&mmap)?;
+        Ok(mmap)
+    }
+
+    #[test]
+    fn native_cache_uses_physical_links_and_keeps_valid_neighbor_of_bad_land() {
+        use super::super::{
+            form_key_merge::{FormKeyConversion, FormKeyRecord, LinkOutcome, ResolvedLink},
+            form_keys::FormKeyOrder,
+        };
+        use shared::{form_key::FormKey, plugin_table::PluginFacts};
+        let order = FormKeyOrder::from_facts(vec![
+            (
+                "Zulu.esm".into(),
+                PluginFacts {
+                    content_hash: Some([0x71; 32]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "Alpha.esm".into(),
+                PluginFacts {
+                    content_hash: Some([0x29; 32]),
+                    ..Default::default()
+                },
+            ),
+        ])
+        .unwrap();
+        let zulu = order.table.id("Zulu.esm").unwrap();
+        let alpha = order.table.id("Alpha.esm").unwrap();
+        let key = |owner, local| FormKey::new(owner, local).unwrap();
+        let cell = key(zulu, 0x5678);
+        let bad_cell = key(alpha, 0x4567);
+        let mut source = preservation_land();
+        // Equal numeric words at separate physical sites have independent resolved owners.
+        source.subrecords[0].1[..4].copy_from_slice(&0x844u32.to_le_bytes());
+        let native_record = FormKeyRecord {
+            source,
+            canonical: None,
+            canonical_ordinals: vec![],
+            localized_text: Default::default(),
+            runtime_omitted: Default::default(),
+            cell: Some(cell),
+            worldspace: None,
+            links: vec![
+                ResolvedLink {
+                    subrecord: 0,
+                    signature: *b"BTXT",
+                    byte_offset: 0,
+                    source_word: 0x844,
+                    key: Some(key(zulu, 0x844)),
+                    outcome: LinkOutcome::Resolved,
+                },
+                ResolvedLink {
+                    subrecord: 1,
+                    signature: *b"ATXT",
+                    byte_offset: 0,
+                    source_word: 0x2200,
+                    key: Some(key(alpha, 0x2200)),
+                    outcome: LinkOutcome::Resolved,
+                },
+                ResolvedLink {
+                    subrecord: 3,
+                    signature: *b"ATXT",
+                    byte_offset: 0,
+                    source_word: 0x844,
+                    key: None,
+                    outcome: LinkOutcome::Cleared,
+                },
+                ResolvedLink {
+                    subrecord: 5,
+                    signature: *b"ATXT",
+                    byte_offset: 0,
+                    source_word: 0,
+                    key: None,
+                    outcome: LinkOutcome::Null,
+                },
+            ],
+        };
+        let mut broken = record(0x3333, b"LAND", None, &[(b"VHGT", vec![1, 2, 3])]);
+        broken.cell_form_id = Some(0x4567);
+        let broken = FormKeyRecord {
+            source: broken,
+            canonical: None,
+            canonical_ordinals: vec![],
+            localized_text: Default::default(),
+            runtime_omitted: Default::default(),
+            cell: Some(bad_cell),
+            worldspace: None,
+            links: vec![],
+        };
+        let conversion = FormKeyConversion {
+            order,
+            records: HashMap::from([
+                (key(zulu, 0x1234), native_record),
+                (key(alpha, 0x3333), broken),
+            ]),
+            warnings: vec![],
+            notices: vec![],
+        };
+        let identity = conversion.order.pack_identity().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cell_cache.rkyv");
+        let (count, warnings) =
+            write_form_key_cell_cache(&conversion, &HashMap::new(), &path, false).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("003333:Alpha.esm"));
+        let file = std::fs::read(&path).unwrap();
+        let mut bytes = rkyv::util::AlignedVec::<16>::with_capacity(file.len());
+        bytes.extend_from_slice(&file);
+        let payload = shared::cache_identity::cell_cache_payload(&identity, &bytes, false).unwrap();
+        let cache = rkyv::access::<shared::ArchivedCellCache, Error>(payload).unwrap();
+        assert_eq!(u64::from(cache.cells[0].cell_id), 0x0200_5678);
+        assert_eq!(
+            u64::from(cache.cells[0].layers[0].texture_form_id),
+            0x0200_0844
+        );
+        assert_eq!(u64::from(cache.cells[0].layers[1].texture_form_id), 0);
+        assert_eq!(u16::from(cache.cells[0].layers[1].weights[0].vertex), 9);
+        assert_eq!(f32::from(cache.cells[0].layers[1].weights[0].opacity), 0.75);
+        let preserved = directory.path().join("cell_cache_preserved.rkyv");
+        write_form_key_cell_cache(&conversion, &HashMap::new(), &preserved, true).unwrap();
+        let file = std::fs::read(preserved).unwrap();
+        let mut bytes = rkyv::util::AlignedVec::<16>::with_capacity(file.len());
+        bytes.extend_from_slice(&file);
+        let payload = shared::cache_identity::cell_cache_payload(&identity, &bytes, true).unwrap();
+        let cache = rkyv::access::<shared::ArchivedCellCache, Error>(payload).unwrap();
+        assert_eq!(
+            u64::from(cache.cells[0].layers[1].texture_form_id),
+            0x0200_0844
+        );
+        assert_eq!(u16::from(cache.cells[0].layers[1].weights[0].vertex), 9);
+        assert_eq!(f32::from(cache.cells[0].layers[1].weights[0].opacity), 0.75);
+    }
 
     /// Native duplicate and NULL assignments exercise source normalization before clearing.
     fn preservation_land() -> RawRecord {
@@ -1265,12 +1756,12 @@ mod tests {
                     DroppedLayer {
                         quadrant: 0,
                         layer: 2,
-                        texture_form_id: textures[1],
+                        texture_form_id: u64::from(textures[1]),
                     },
                     DroppedLayer {
                         quadrant: 0,
                         layer: 2,
-                        texture_form_id: textures[0],
+                        texture_form_id: u64::from(textures[0]),
                     },
                 ]
             );
@@ -1287,7 +1778,7 @@ mod tests {
                 assert!(!kept.is_base);
                 assert_eq!(kept.quadrant, 0);
                 assert_eq!(kept.layer, 2);
-                assert_eq!(kept.texture_form_id, textures[2]);
+                assert_eq!(kept.texture_form_id, u64::from(textures[2]));
                 assert_eq!(kept.weights.len(), 1);
                 assert_eq!(kept.weights[0].vertex, 7);
                 assert_eq!(kept.weights[0].opacity, 0.75);
@@ -1792,7 +2283,7 @@ mod tests {
     fn preserves_implicit_base_and_excess_overlays_before_runtime_capacity() {
         let mut layers = (0..6)
             .map(|layer| TerrainLayer {
-                texture_form_id: u32::from(layer) + 1,
+                texture_form_id: u64::from(layer) + 1,
                 quadrant: 2,
                 layer,
                 is_base: false,
@@ -1819,7 +2310,7 @@ mod tests {
         let mut layers = Vec::new();
         for quadrant in [0, 2] {
             layers.push(TerrainLayer {
-                texture_form_id: 0x2000 + u32::from(quadrant),
+                texture_form_id: 0x2000 + u64::from(quadrant),
                 quadrant,
                 layer: 0,
                 is_base: true,
@@ -1832,7 +2323,7 @@ mod tests {
                     texture_form_id: if slot == 1 {
                         0
                     } else {
-                        0x3000 + u32::from(slot)
+                        0x3000 + u64::from(slot)
                     },
                     quadrant,
                     layer: slot,

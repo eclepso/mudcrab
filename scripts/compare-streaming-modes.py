@@ -16,6 +16,10 @@ import subprocess
 import threading
 import time
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from form_key_identity import PackIdentity, TAMRIEL, named, require_schema
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -153,7 +157,7 @@ def engine_deadline(timeout):
 
 def command(args, run, directory):
     mode = MODES[run["mode"]]
-    result = [str(args.engine), "--assets", str(args.assets), "--worldspace", "0x3c",
+    result = [str(args.engine), "--assets", str(args.assets), "--worldspace", TAMRIEL,
               "--grid-x", "5", "--grid-y", "-12", "--stream-radius", "2",
               "--prioritize-streaming", "--max-scene-loads", str(mode["jobs"]),
               "--max-model-spawns-per-frame", str(mode["activations"]),
@@ -377,10 +381,11 @@ def new_experiment(args, hashes):
     if receipt.is_file():
         experiment["build_receipt"] = json.loads(receipt.read_text())
     with sqlite3.connect(f"file:{args.assets / 'skyrim_world.db'}?mode=ro", uri=True) as database:
+        identity = PackIdentity(database)
         cells = database.execute(
             "SELECT DISTINCT grid_x, grid_y FROM cells WHERE worldspace_id = ? "
-            "AND grid_x IS NOT NULL AND grid_y IS NOT NULL", (0x3c,)).fetchall()
-    cell_catalog = {"worldspace_id": 0x3c, "cell_size_units": 4096, "stream_radius": 2,
+            "AND grid_x IS NOT NULL AND grid_y IS NOT NULL", (identity.stored_key(TAMRIEL),)).fetchall()
+    cell_catalog = {"schema_version": 2, "worldspace_id": TAMRIEL, "pack_identity_digest": identity.digest, "cell_size_units": 4096, "stream_radius": 2,
                     "existing_cells": sorted([list(cell) for cell in cells]),
                     "database_sha256": experiment["input_hashes"]["skyrim_world.db"],
                     "meaning": "Database cell existence; CPU committed cell coverage does not certify drawable assets"}

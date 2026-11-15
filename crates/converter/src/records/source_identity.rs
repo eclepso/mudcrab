@@ -83,6 +83,84 @@ pub(crate) fn resolve(
     }
 }
 
+/// Describe original native ownership from an authenticated pack without runtime slot packing.
+/// Permissive supplier-self keys remain distinct from proven original-MAST ownership.
+pub(crate) fn resolve_native(
+    signature: &[u8; 4],
+    raw: u32,
+    supplier: usize,
+    identity: &shared::pack_identity::PackIdentity,
+) -> SourceIdentity {
+    if raw == 0 {
+        return SourceIdentity {
+            original_owner: None,
+            full_local: None,
+            state: SourceIdentityState::NullRawWord,
+        };
+    }
+    let local = Some(raw & 0x00ff_ffff);
+    let Some(entry) = identity
+        .order()
+        .get(supplier)
+        .and_then(|id| identity.table().entry(*id))
+    else {
+        return SourceIdentity {
+            original_owner: None,
+            full_local: local,
+            state: SourceIdentityState::OwnerUnavailable,
+        };
+    };
+    let selector = (raw >> 24) as usize;
+    if selector > entry.facts.masters.len() {
+        return SourceIdentity {
+            original_owner: None,
+            full_local: local,
+            state: if signature == b"GMST" {
+                SourceIdentityState::GmstEditorIdConvention
+            } else {
+                SourceIdentityState::MasterIndexOutOfRange
+            },
+        };
+    }
+    let owner = if selector == entry.facts.masters.len() {
+        entry.normalized_name.clone()
+    } else {
+        crate::esm::load_order::normalize_plugin_name(&entry.facts.masters[selector])
+    };
+    let available = identity
+        .table()
+        .id(&owner)
+        .and_then(|id| identity.table().entry(id))
+        .is_some_and(|entry| entry.loaded);
+    SourceIdentity {
+        original_owner: Some(owner),
+        full_local: local,
+        state: if available {
+            SourceIdentityState::Resolved
+        } else {
+            SourceIdentityState::OwnerUnavailable
+        },
+    }
+}
+
+/// Resolve a source word with native converter policy, including low and wide light locals.
+pub(crate) fn native_key(
+    raw: u32,
+    supplier: usize,
+    identity: &shared::pack_identity::PackIdentity,
+) -> Option<shared::form_key::FormKey> {
+    if raw == 0 {
+        return None;
+    }
+    let supplier = *identity.order().get(supplier)?;
+    let entry = identity.table().entry(supplier)?;
+    let owner = match entry.facts.masters.get((raw >> 24) as usize) {
+        Some(name) => identity.table().id(name)?,
+        None => supplier,
+    };
+    shared::form_key::FormKey::new(owner, raw & 0x00ff_ffff).ok()
+}
+
 /// Project source headers and opaque links with the common self rule and checked u32 width.
 pub(crate) fn header_runtime_id(
     signature: &[u8; 4],

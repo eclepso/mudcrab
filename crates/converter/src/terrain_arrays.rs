@@ -101,7 +101,7 @@ const MAX_MIP_DEPTH: u32 = u32::BITS;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandTextureSource {
     /// The LTEX FormID in load-order numbering; 0 names the default texture and is not a source.
-    pub ltex_form_id: u32,
+    pub ltex_form_id: u64,
     /// The converted diffuse texture.
     pub diffuse: PathBuf,
     /// The converted normal map, when the texture set has one.
@@ -140,7 +140,7 @@ impl Default for ArrayOptions {
 pub enum DefaultTexture {
     /// The caller's default source; its own LTEX is named, entry 0's slot is
     /// [`DEFAULT_LAND_TEXTURE_FORM_ID`].
-    Provided { ltex_form_id: u32 },
+    Provided { ltex_form_id: u64 },
     /// No usable default source (none given, or the given one was skipped, see
     /// [`ArrayReport::skipped`]): entry 0 is a generated 4 x 4 white diffuse with no normal map,
     /// upscaled into the smallest diffuse class the content uses.
@@ -186,7 +186,7 @@ pub struct TextureReport {
     /// The table id, entry 0 being the default texture.
     pub id: u16,
     /// The LTEX FormID the entry carries ([`DEFAULT_LAND_TEXTURE_FORM_ID`] for the default).
-    pub ltex_form_id: u32,
+    pub ltex_form_id: u64,
     pub usage: LandTextureUsage,
     /// The source file, or `None` for the generated white default texture.
     pub source: Option<String>,
@@ -225,7 +225,7 @@ pub struct ArrayClassReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedTexture {
     /// The LTEX FormID of the source the texture belongs to.
-    pub ltex_form_id: u32,
+    pub ltex_form_id: u64,
     pub usage: LandTextureUsage,
     /// The source file.
     pub source: String,
@@ -248,6 +248,38 @@ pub struct ArrayReport {
 }
 
 impl ArrayReport {
+    /// Bind diagnostic identities to portable owner/local names for published reports.
+    pub fn named_warnings(
+        &self,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Vec<String>> {
+        let mut ids = self
+            .textures
+            .iter()
+            .map(|texture| texture.ltex_form_id)
+            .chain(self.skipped.iter().map(|texture| texture.ltex_form_id))
+            .collect::<std::collections::BTreeSet<_>>();
+        if let DefaultTexture::Provided { ltex_form_id } = self.default_texture {
+            ids.insert(ltex_form_id);
+        }
+        let mut lines = self.warnings();
+        for id in ids {
+            let name = match shared::cache_identity::optional(identity, id)? {
+                Some(key) => identity.table().named(key)?.to_string(),
+                None => "default".into(),
+            };
+            for line in &mut lines {
+                *line = line
+                    .replace(
+                        &format!("land texture {id:08X} "),
+                        &format!("land texture {name} "),
+                    )
+                    .replace(&format!("LTEX {id:08X}"), &format!("LTEX {name}"));
+            }
+        }
+        Ok(lines)
+    }
+
     /// The report lines the conversion should show: where the default came from, every texture
     /// that was skipped, and every texture that was not copied block for block.
     pub fn warnings(&self) -> Vec<String> {
@@ -373,14 +405,43 @@ pub fn build_land_texture_arrays(
     output_root: &Path,
     options: &ArrayOptions,
 ) -> Result<(LandTextureTable, ArrayReport)> {
+    let connection = rusqlite::Connection::open_with_flags(
+        output_root.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .wrap_err("land texture publication requires authenticated world context; convert again")?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    build_form_key_land_texture_arrays(&identity, sources, default, output_root, options)
+}
+
+/// Build the one portable table generation using authenticated pack-scoped source keys.
+pub fn build_form_key_land_texture_arrays(
+    identity: &shared::pack_identity::PackIdentity,
+    sources: &[LandTextureSource],
+    default: Option<LandTextureSource>,
+    output_root: &Path,
+    options: &ArrayOptions,
+) -> Result<(LandTextureTable, ArrayReport)> {
     check_options(options)?;
     check_sources(sources)?;
+    for source in sources {
+        shared::cache_identity::required(identity, source.ltex_form_id)?;
+    }
+    if let Some(source) = &default {
+        shared::cache_identity::optional(identity, source.ltex_form_id)?;
+    }
 
     // One table entry per LTEX, the sources by FormID; the default is entry 0 and is planned
     // after them, because a generated white texture needs the classes the sources define.
     let mut skipped: Vec<SkippedTexture> = Vec::new();
     let mut sorted: Vec<&LandTextureSource> = sources.iter().collect();
-    sorted.sort_by_key(|source| source.ltex_form_id);
+    sorted.sort_by_key(|source| {
+        shared::cache_identity::owner_order(
+            identity,
+            shared::cache_identity::required(identity, source.ltex_form_id)
+                .expect("validated LTEX key"),
+        )
+    });
     let mut planned: Vec<PlannedEntry> = Vec::new();
     for source in sorted {
         if let Some(entry) = plan_entry(source, source.ltex_form_id, options, &mut skipped)? {
@@ -395,7 +456,7 @@ pub fn build_land_texture_arrays(
             .map(|entry| (source.ltex_form_id, entry)),
         None => None,
     };
-    let (default_texture, default_entry) = match provided {
+    let (mut default_texture, default_entry) = match provided {
         Some((ltex_form_id, entry)) => (DefaultTexture::Provided { ltex_form_id }, entry),
         None => (
             DefaultTexture::White,
@@ -464,13 +525,39 @@ pub fn build_land_texture_arrays(
         let mut first: Option<Vec<Vec<u8>>> = None;
         let mut placed: Vec<(usize, u16, TextureAction)> = Vec::new();
         for &index in indexes {
+            if members[index].failed.is_some() {
+                continue;
+            }
             if let Some(owner) = members[index].depends_on
                 && members[owner].failed.is_some()
             {
                 members[index].failed = Some("its diffuse texture was skipped".to_string());
                 continue;
             }
-            match build_member(&members[index]) {
+            let built = match build_member(&members[index]) {
+                Err(error) if index == 0 && members[index].path.is_some() => {
+                    skipped.push(SkippedTexture {
+                        ltex_form_id: members[index].source_ltex_form_id,
+                        usage: members[index].usage,
+                        source: members[index]
+                            .path
+                            .as_ref()
+                            .expect("provided default path")
+                            .display()
+                            .to_string(),
+                        reason: format!("{error:#}"),
+                    });
+                    members[index] = MemberPlan::white(*key);
+                    default_texture = DefaultTexture::White;
+                    if let Some(normal) = entries[0].normal.take() {
+                        members[normal].failed =
+                            Some("default diffuse texture was replaced by white".into());
+                    }
+                    build_member(&members[index])
+                }
+                result => result,
+            };
+            match built {
                 Ok(BuiltMember { levels, action }) => {
                     writer.push_layer(&levels)?;
                     let layer = u16::try_from(placed.len())
@@ -600,7 +687,7 @@ pub fn build_land_texture_arrays(
             .map_err(|error| eyre!("the built land texture table is invalid: {error}"))?;
     }
     let table_file = staging.path().join(LAND_TEXTURE_TABLE_PATH);
-    fs::write(&table_file, serde_json::to_vec_pretty(&table)?)
+    fs::write(&table_file, table.to_portable_json(identity)?)
         .wrap_err_with(|| format!("failed to write {}", table_file.display()))?;
 
     let array_paths: Vec<&str> = table
@@ -623,14 +710,14 @@ pub fn build_land_texture_arrays(
 
 /// The table row being planned, with its members.
 struct PlannedEntry {
-    ltex_form_id: u32,
+    ltex_form_id: u64,
     diffuse: MemberPlan,
     normal: Option<MemberPlan>,
 }
 
 /// The table row being built, with the member indexes of its textures.
 struct EntryPlan {
-    ltex_form_id: u32,
+    ltex_form_id: u64,
     diffuse: usize,
     normal: Option<usize>,
 }
@@ -681,7 +768,7 @@ struct Placement {
 /// One texture on its way into an array.
 struct MemberPlan {
     /// The LTEX FormID of the source it was read from, for the skipped list.
-    source_ltex_form_id: u32,
+    source_ltex_form_id: u64,
     class: ClassKey,
     /// The source file, or `None` for the generated white default texture.
     path: Option<PathBuf>,
@@ -755,7 +842,7 @@ enum Planned {
 /// skipped normal only drops the normal map. Only a size-limit error is returned as an error.
 fn plan_entry(
     source: &LandTextureSource,
-    entry_form_id: u32,
+    entry_form_id: u64,
     options: &ArrayOptions,
     skipped: &mut Vec<SkippedTexture>,
 ) -> Result<Option<PlannedEntry>> {
@@ -816,7 +903,7 @@ fn plan_entry(
 /// Reads one source's header and works out the class it belongs to.
 fn plan_source(
     path: &Path,
-    source_form_id: u32,
+    source_form_id: u64,
     usage: LandTextureUsage,
     options: &ArrayOptions,
 ) -> Result<Planned> {
@@ -1798,7 +1885,7 @@ fn report_of(
     member: &MemberPlan,
     placed: &Placement,
     id: u16,
-    ltex_form_id: u32,
+    ltex_form_id: u64,
     arrays: &[LandTextureArray],
 ) -> Result<TextureReport> {
     let array = arrays.get(placed.array).ok_or_else(|| {
@@ -1853,7 +1940,7 @@ fn check_options(options: &ArrayOptions) -> Result<()> {
 
 /// Refuses a source list that cannot become a dense table.
 fn check_sources(sources: &[LandTextureSource]) -> Result<()> {
-    let mut seen: BTreeMap<u32, &Path> = BTreeMap::new();
+    let mut seen: BTreeMap<u64, &Path> = BTreeMap::new();
     for source in sources {
         ensure!(
             source.ltex_form_id != DEFAULT_LAND_TEXTURE_FORM_ID,
@@ -1874,6 +1961,69 @@ fn check_sources(sources: &[LandTextureSource]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Image-algorithm fixtures allocate real keys, then compare their local IDs with existing image oracles.
+    fn build_land_texture_arrays(
+        sources: &[super::LandTextureSource],
+        default: Option<super::LandTextureSource>,
+        output: &std::path::Path,
+        options: &super::ArrayOptions,
+    ) -> color_eyre::Result<(shared::terrain_mesh::LandTextureTable, super::ArrayReport)> {
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x49; 32]),
+                ..Default::default()
+            },
+        )])?;
+        let owner = table.id("Fixture.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![owner])?;
+        let convert = |mut source: super::LandTextureSource| {
+            if source.ltex_form_id != 0 {
+                source.ltex_form_id |= 0x0100_0000;
+            }
+            source
+        };
+        let sources = sources.iter().cloned().map(convert).collect::<Vec<_>>();
+        let (mut table, mut report) = super::build_form_key_land_texture_arrays(
+            &identity,
+            &sources,
+            default.map(convert),
+            output,
+            options,
+        )?;
+        for entry in &mut table.entries {
+            entry.ltex_form_id &= 0x00ff_ffff;
+        }
+        if let super::DefaultTexture::Provided { ltex_form_id } = &mut report.default_texture {
+            *ltex_form_id &= 0x00ff_ffff;
+        }
+        for texture in &mut report.textures {
+            texture.ltex_form_id &= 0x00ff_ffff;
+        }
+        for texture in &mut report.skipped {
+            texture.ltex_form_id &= 0x00ff_ffff;
+        }
+        Ok((table, report))
+    }
+
+    /// Decode portable names independently for image assertions, including deliberately tiny non-runtime classes.
+    fn read_fixture_table(bytes: &[u8]) -> shared::terrain_mesh::LandTextureTable {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        for entry in value["entries"].as_array_mut().unwrap() {
+            let local = if entry["ltex_form_id"].is_null() {
+                0
+            } else {
+                let text = entry["ltex_form_id"]
+                    .as_str()
+                    .expect("portable LTEX must be named");
+                let (local, owner) = text.split_once(':').unwrap();
+                assert_eq!(owner, "Fixture.esm");
+                u64::from_str_radix(local, 16).unwrap()
+            };
+            entry["ltex_form_id"] = serde_json::json!(local);
+        }
+        serde_json::from_value(value).unwrap()
+    }
     use super::*;
     use crate::texture::{TextureConverter, TextureEncoding};
 
@@ -2116,7 +2266,7 @@ mod tests {
 
         // The table JSON the build wrote round-trips, at the shared path.
         let json = fs::read(dir.path().join(LAND_TEXTURE_TABLE_PATH)).unwrap();
-        let written: LandTextureTable = serde_json::from_slice(&json).unwrap();
+        let written: LandTextureTable = read_fixture_table(&json);
         assert_eq!(written, table);
         assert_no_staging(dir.path());
     }
@@ -2168,8 +2318,7 @@ mod tests {
             "legacy folders are not touched"
         );
         let written: LandTextureTable =
-            serde_json::from_slice(&fs::read(dir.path().join(LAND_TEXTURE_TABLE_PATH)).unwrap())
-                .unwrap();
+            read_fixture_table(&fs::read(dir.path().join(LAND_TEXTURE_TABLE_PATH)).unwrap());
         assert_eq!(written, table);
     }
 
@@ -2446,7 +2595,7 @@ mod tests {
                 centre(&image)
             );
         }
-        let by_ltex = |ltex_form_id: u32| {
+        let by_ltex = |ltex_form_id: u64| {
             report
                 .textures
                 .iter()
@@ -2702,6 +2851,65 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_default_payload_falls_back_and_keeps_valid_neighbor() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = solid_bc1_fixture(dir.path(), "broken-default.ktx2", 8, 4, RED);
+        let neighbor = solid_bc1_fixture(dir.path(), "valid-neighbor.ktx2", 8, 4, GREEN);
+        let mut bytes = fs::read(&broken).unwrap();
+        let offset =
+            usize::try_from(u64::from_le_bytes(bytes[80..88].try_into().unwrap())).unwrap();
+        let length =
+            usize::try_from(u64::from_le_bytes(bytes[88..96].try_into().unwrap())).unwrap();
+        bytes[44..48].copy_from_slice(&2u32.to_le_bytes());
+        bytes[offset..offset + length].fill(0);
+        fs::write(&broken, bytes).unwrap();
+        let (table, report) = build_land_texture_arrays(
+            &[LandTextureSource {
+                ltex_form_id: 0x2468,
+                diffuse: neighbor,
+                normal: None,
+            }],
+            Some(LandTextureSource {
+                ltex_form_id: 0x1357,
+                diffuse: broken,
+                normal: None,
+            }),
+            dir.path(),
+            &tiny(),
+        )
+        .unwrap();
+        assert_eq!(report.default_texture, DefaultTexture::White);
+        assert_eq!(
+            table
+                .entries
+                .iter()
+                .map(|entry| entry.ltex_form_id)
+                .collect::<Vec<_>>(),
+            vec![0, 0x2468]
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|entry| entry.ltex_form_id == 0x1357)
+        );
+        let (_, levels) = read_ktx2(&dir.path().join(&table.arrays[0].path));
+        assert!(near(
+            centre(
+                &decode_blocks(
+                    ktx2::Format::BC1_RGBA_SRGB_BLOCK,
+                    8,
+                    8,
+                    layer_slice(&levels, 0, 2, 1)
+                )
+                .unwrap()
+            ),
+            [0, 255, 0],
+            12
+        ));
+    }
+
+    #[test]
     fn a_source_it_cannot_read_is_skipped_by_name_and_does_not_stop_the_build() {
         let dir = tempfile::tempdir().unwrap();
         let good = solid_bc1_fixture(dir.path(), "good.ktx2", 8, 4, RED);
@@ -2731,7 +2939,7 @@ mod tests {
 
         // Entry 0 (white) and 0x100's diffuse; 0x100's normal, 0x200 (diffuse, and its good normal
         // with it) and 0x300 were skipped.
-        let ids: Vec<u32> = table
+        let ids: Vec<u64> = table
             .entries
             .iter()
             .map(|entry| entry.ltex_form_id)
@@ -2739,7 +2947,7 @@ mod tests {
         assert_eq!(ids, [0, 0x100]);
         assert_eq!(table.entries[1].normal, None);
         assert_eq!(report.skipped.len(), 4, "{:?}", report.skipped);
-        let skipped = |ltex_form_id: u32, usage: LandTextureUsage| {
+        let skipped = |ltex_form_id: u64, usage: LandTextureUsage| {
             report
                 .skipped
                 .iter()
@@ -2944,8 +3152,7 @@ mod tests {
         let (table, _) = build(&green);
         assert_no_staging(dir.path());
         let written: LandTextureTable =
-            serde_json::from_slice(&fs::read(dir.path().join(LAND_TEXTURE_TABLE_PATH)).unwrap())
-                .unwrap();
+            read_fixture_table(&fs::read(dir.path().join(LAND_TEXTURE_TABLE_PATH)).unwrap());
         assert_eq!(written, table);
         let (_, levels) = read_ktx2(&dir.path().join(&table.arrays[0].path));
         let blocks = layer_slice(&levels, 0, 2, 1);

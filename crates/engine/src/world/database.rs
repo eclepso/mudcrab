@@ -15,10 +15,10 @@ use std::{
     time::Instant,
 };
 
-pub(crate) const EXTERIOR_CELL_ID_SQL: &str = "SELECT c.id FROM cells c
+pub(crate) const EXTERIOR_CELL_ID_SQL: &str = "SELECT runtime_id(c.id) FROM cells c
      LEFT JOIN land l ON l.cell_id=c.id
-     WHERE c.worldspace_id=?1 AND c.grid_x=?2 AND c.grid_y=?3
-     ORDER BY (l.cell_id IS NOT NULL) DESC, c.id DESC
+     WHERE c.worldspace_id=stored_key(?1) AND c.grid_x=?2 AND c.grid_y=?3
+     ORDER BY (l.cell_id IS NOT NULL) DESC, ((SELECT flags FROM pack_plugins WHERE id=(c.id >> 24)) & 2) DESC, (SELECT supplier_priority FROM pack_plugins WHERE id=(c.id >> 24)) DESC, (c.id & 16777215) DESC
      LIMIT 1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,6 +227,7 @@ pub struct WorldDatabaseFeatures {
 
 #[derive(Resource)]
 pub struct WorldDatabase {
+    identity: Arc<shared::pack_identity::PackIdentity>,
     requests: Sender<DatabaseRequest>,
     responses: Receiver<DatabaseResponse>,
     lod_responses: Receiver<LodChunkResponse>,
@@ -266,8 +267,11 @@ pub struct AssetCatalog {
 impl AssetCatalog {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        shared::world_assets::install_runtime_identity_functions(&connection)?;
+        report_runtime_capacity(&connection, "landscape_textures", &["id"])?;
+        report_runtime_capacity(&connection, "waters", &["id"])?;
         let mut statement = connection.prepare(
-            "SELECT l.id,t.diffuse_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id WHERE t.diffuse_path IS NOT NULL",
+            "SELECT runtime_id_or_null(l.id),t.diffuse_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id WHERE t.diffuse_path IS NOT NULL",
         )?;
         let landscape_diffuse = statement
             .query_map([], |row| {
@@ -282,7 +286,7 @@ impl AssetCatalog {
         // terrain then draws with the geometric normal alone.
         let landscape_normal = connection
             .prepare(
-                "SELECT l.id,t.normal_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id WHERE t.normal_path IS NOT NULL AND t.normal_path <> ''",
+                "SELECT runtime_id_or_null(l.id),t.normal_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id WHERE t.normal_path IS NOT NULL AND t.normal_path <> ''",
             )
             .map(|mut statement| {
                 statement
@@ -296,7 +300,7 @@ impl AssetCatalog {
             })
             .unwrap_or_default();
         let mut statement = connection.prepare(
-            "SELECT id,flow_normal_path FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> ''",
+            "SELECT runtime_id_or_null(id),flow_normal_path FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> ''",
         )?;
         let water_flow = statement
             .query_map([], |row| {
@@ -311,7 +315,7 @@ impl AssetCatalog {
         // the same as no water colours at all instead of refusing to open the catalog.
         let water_colors = connection
             .prepare(
-                "SELECT id,shallow_color,deep_color,reflection_color,fresnel,reflectivity FROM waters \
+                "SELECT runtime_id_or_null(id),shallow_color,deep_color,reflection_color,fresnel,reflectivity FROM waters \
                  WHERE shallow_color IS NOT NULL AND deep_color IS NOT NULL \
                  AND reflection_color IS NOT NULL AND fresnel IS NOT NULL AND reflectivity IS NOT NULL",
             )
@@ -366,6 +370,29 @@ impl AssetCatalog {
     pub fn water_colors(&self, form_id: u32) -> Option<WaterColors> {
         self.water_colors.get(&form_id).copied()
     }
+}
+
+/// Report one bounded capacity notice per catalog scan while retaining usable neighbors.
+/// Identifiers are static internal schema names, never user input.
+pub(crate) fn report_runtime_capacity(
+    connection: &Connection,
+    table: &str,
+    columns: &[&str],
+) -> Result<()> {
+    for column in columns {
+        let query = format!(
+            "SELECT count(*),min(named_key({column})) FROM {table} WHERE {column} IS NOT NULL AND runtime_id_or_null({column}) IS NULL"
+        );
+        let (count, example): (usize, Option<String>) =
+            connection.query_row(&query, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        if count != 0 {
+            bevy::log::warn!(
+                "{table}.{column}: {count} valid identities have no supported runtime handle yet; first {}",
+                example.as_deref().unwrap_or("unavailable")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Maps a texture path stored in the world database to the converted `.ktx2` under `textures/`.
@@ -433,6 +460,12 @@ impl WorldDatabase {
     /// Opens the ordinary database with a validated door capability policy.
     pub fn open_with(path: &Path, features: WorldDatabaseFeatures) -> Result<Self> {
         validate(path)?;
+        let identity_connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let identity = Arc::new(shared::pack_identity::PackIdentity::read_sql(
+            &identity_connection,
+        )?);
+        drop(identity_connection);
         if features.door_links == DoorLinksAccess::LegacyExtension {
             require_table(path, "door_links", crate::extensions::Feature::DoorLinks)?;
             let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -457,12 +490,26 @@ impl WorldDatabase {
             })
             .wrap_err("failed to start world database worker")?;
         Ok(Self {
+            identity,
             requests: request_tx,
             responses: response_rx,
             lod_responses: lod_response_rx,
             worker: Some(worker),
             worker_stopped,
         })
+    }
+
+    /// Convert an existing runtime request to this database's authenticated stored key.
+    pub fn storage_worldspace(&self, runtime: u32) -> Result<u64> {
+        self.identity
+            .runtime_key(runtime)?
+            .map(shared::form_key::FormKey::to_packed)
+            .ok_or_else(|| color_eyre::eyre::eyre!("worldspace request has no identity"))
+    }
+
+    /// Identity is shared by SQL, cell-cache and terrain requests for this opened world.
+    pub fn identity(&self) -> &shared::pack_identity::PackIdentity {
+        &self.identity
     }
 
     pub fn request(&self, request: DatabaseRequest) -> Result<()> {
@@ -671,9 +718,13 @@ fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<
         return Ok(Vec::new());
     }
 
+    let stored_worldspace: u64 =
+        connection.query_row("SELECT stored_key(?1)", [query.worldspace_id], |row| {
+            row.get(0)
+        })?;
     let (origin_x, origin_y): (Option<i32>, Option<i32>) = connection
         .query_row(
-            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=?1",
+            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=stored_key(?1)",
             [query.worldspace_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -716,7 +767,7 @@ fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<
          c.source_cells FROM lod_chunks_spatial r \
          JOIN lod_chunks c ON c.worldspace_id=r.worldspace_id AND c.tier=r.tier \
          AND c.anchor_x=r.anchor_x AND c.anchor_y=r.anchor_y \
-         WHERE r.worldspace_id=?1 AND r.tier=?2 \
+         WHERE r.worldspace_id=stored_key(?1) AND r.tier=?2 \
          AND r.minX<=?4 AND r.maxX>=?3 AND r.minY<=?6 AND r.maxY>=?5",
     )?;
     let rows = statement.query_map(
@@ -733,7 +784,7 @@ fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<
 
     rows.map(|row| {
         let raw = row?;
-        validate_lod_chunk(raw, query.worldspace_id, origin, &build_identity)
+        validate_lod_chunk(raw, stored_worldspace, origin, &build_identity)
     })
     .collect()
 }
@@ -789,12 +840,13 @@ impl RawLodChunk {
 
 fn validate_lod_chunk(
     raw: RawLodChunk,
-    requested_worldspace: u32,
+    requested_worldspace: u64,
     origin: LodOrigin,
     build_identity: &str,
 ) -> Result<LodChunkMetadata> {
-    let worldspace_id = u32::try_from(raw.worldspace_id)
-        .wrap_err_with(|| format!("LOD chunk has invalid worldspace id {}", raw.worldspace_id))?;
+    let worldspace_id = shared::form_key::FormKey::from_sql_i64(raw.worldspace_id)
+        .wrap_err_with(|| format!("LOD chunk has invalid worldspace key {}", raw.worldspace_id))?
+        .to_packed();
     color_eyre::eyre::ensure!(
         worldspace_id == requested_worldspace,
         "LOD chunk worldspace {worldspace_id} does not match requested worldspace {requested_worldspace}"
@@ -877,7 +929,7 @@ fn is_canonical_sha256(value: &str) -> bool {
 /// The reference columns [`map_reference`] reads, in order: the placement itself and the base
 /// object's model and bounds. Every table this query can be missing is joined on after them, so the
 /// indices below are the same whichever tables a database has.
-const REFERENCE_COLUMNS: &str = "r.id,r.cell_id,r.base_form_id,s.model_path,r.pos_x,r.pos_y,r.pos_z,\
+const REFERENCE_COLUMNS: &str = "runtime_id(r.id),runtime_id(r.cell_id),runtime_id(r.base_form_id),s.model_path,r.pos_x,r.pos_y,r.pos_z,\
      r.rot_x,r.rot_y,r.rot_z,r.scale,\
      COALESCE(s.bounds_min_x,-64),COALESCE(s.bounds_min_y,-64),COALESCE(s.bounds_min_z,-64),\
      COALESCE(s.bounds_max_x,64),COALESCE(s.bounds_max_y,64),COALESCE(s.bounds_max_z,64),\
@@ -886,7 +938,7 @@ const REFERENCE_COLUMNS: &str = "r.id,r.cell_id,r.base_form_id,s.model_path,r.po
 const REFERENCE_JOIN: &str = " LEFT JOIN statics s ON s.id=r.base_form_id";
 
 /// The `door_links` row of the reference, in the order [`map_reference`] reads them.
-const DOOR_COLUMNS: &str = "d.destination_ref_id,d.destination_cell_id,d.destination_worldspace_id,\
+const DOOR_COLUMNS: &str = "runtime_id(d.destination_ref_id),runtime_id(d.destination_cell_id),runtime_id(d.destination_worldspace_id),\
      d.pos_x,d.pos_y,d.pos_z,d.rot_x,d.rot_y,d.rot_z";
 
 /// Stand-in for [`DOOR_COLUMNS`] in a database without the `door_links` table: every reference
@@ -1027,6 +1079,7 @@ struct ReferenceQuery {
 
 impl ReferenceQuery {
     fn for_connection(connection: &Connection, features: WorldDatabaseFeatures) -> Result<Self> {
+        shared::world_assets::install_runtime_identity_functions(connection)?;
         let has_records = has_records(connection)?;
         let record_column = if has_records { "b.record_type" } else { "NULL" };
         let has_lights = has_lights(connection)?;
@@ -1080,14 +1133,14 @@ impl ReferenceQuery {
                 );
                 "0,NULL,0"
             }
-            3 => "header_flags,enable_parent_id,enable_parent_flags",
+            3 => "header_flags,runtime_id(enable_parent_id),enable_parent_flags",
             _ => color_eyre::eyre::bail!(
                 "incomplete reference enable-state columns: expected header_flags, enable_parent_id and enable_parent_flags"
             ),
         };
         let reference_enable_columns = match enable_column_count {
             0 => "0,NULL,0",
-            _ => "r.header_flags,r.enable_parent_id,r.enable_parent_flags",
+            _ => "r.header_flags,runtime_id(r.enable_parent_id),r.enable_parent_flags",
         };
         Ok(Self {
             columns: format!(
@@ -1096,7 +1149,9 @@ impl ReferenceQuery {
                  {STATIC_FLAGS_COLUMN}"
             ),
             joins,
-            parent_sql: format!("SELECT {enable_columns} FROM \"references\" WHERE id=?1"),
+            parent_sql: format!(
+                "SELECT {enable_columns} FROM \"references\" WHERE id=stored_key(?1)"
+            ),
             enable_states: EnableStateResolver::default(),
             enable_errors: HashSet::new(),
         })
@@ -1131,7 +1186,7 @@ fn load_cell(
         } => {
             let sql = format!(
                 "SELECT {columns} FROM exterior_spatial x JOIN \"references\" r ON r.id=x.id{joins} \
-                 WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<?5"
+                 WHERE x.worldspace_id=stored_key(?1) AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<?5"
             );
             let min_x = grid_x as f32 * 4096.0;
             let min_y = grid_y as f32 * 4096.0;
@@ -1144,7 +1199,9 @@ fn load_cell(
                 .collect::<rusqlite::Result<Vec<_>>>()?
         }
         CellKey::Interior(_) => {
-            let sql = format!("SELECT {columns} FROM \"references\" r{joins} WHERE r.cell_id=?1");
+            let sql = format!(
+                "SELECT {columns} FROM \"references\" r{joins} WHERE r.cell_id=stored_key(?1)"
+            );
             connection
                 .prepare_cached(&sql)?
                 .query_map([cell_id], map_reference)?

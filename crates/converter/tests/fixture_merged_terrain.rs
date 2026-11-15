@@ -31,7 +31,7 @@ async fn convert_config(config: converter::PipelineConfig) -> converter::Pipelin
 }
 
 /// Every exterior cell of the converted fixture with a LAND row, and its chunk path.
-fn expected_chunks(output: &Path) -> Vec<(u32, i32, i32)> {
+fn expected_chunks(output: &Path) -> Vec<(u64, i32, i32)> {
     let connection = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     connection
         .prepare(
@@ -41,7 +41,7 @@ fn expected_chunks(output: &Path) -> Vec<(u32, i32, i32)> {
         )
         .unwrap()
         .query_map([], |row| {
-            let worldspace: u32 = row.get(0)?;
+            let worldspace: u64 = row.get(0)?;
             let cell: (i32, i32) = (row.get(1)?, row.get(2)?);
             Ok((worldspace, cell))
         })
@@ -80,11 +80,16 @@ async fn merged_terrain_writes_the_table_arrays_and_chunk_files() {
     );
 
     // The table, at the shared path, is the one the engine validates.
-    let table: LandTextureTable =
-        serde_json::from_slice(&fs::read(output.join(LAND_TEXTURE_TABLE_PATH)).unwrap()).unwrap();
+    let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&database).unwrap();
+    let table = LandTextureTable::from_portable_json(
+        &fs::read(output.join(LAND_TEXTURE_TABLE_PATH)).unwrap(),
+        &identity,
+    )
+    .unwrap();
     assert_eq!(table.format_version, TERRAIN_MESH_FORMAT_VERSION);
     table.validate().unwrap();
-    let ltex: u32 = {
+    let ltex: u64 = {
         let connection = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
         connection
             .query_row("SELECT id FROM landscape_textures LIMIT 1", [], |row| {
@@ -145,7 +150,7 @@ async fn merged_terrain_writes_the_table_arrays_and_chunk_files() {
             "every cell carries its derived-data key"
         );
         // The file sits under the worldspace whose cells it holds.
-        let worldspace = u32::from_str_radix(&path["terrain/".len()..][..8], 16).unwrap();
+        let worldspace = u64::from_str_radix(&path["terrain/".len()..][..16], 16).unwrap();
         assert_eq!(chunk.worldspace_id, worldspace);
         cells += chunk.cells.len();
     }

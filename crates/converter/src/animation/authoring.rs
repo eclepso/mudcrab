@@ -139,18 +139,29 @@ pub(crate) fn read_race_authoring_fields<'a>(
 /// this from their new winners; a retained catalog cannot animate a race whose
 /// project or skeleton was replaced while its body filename stayed the same.
 pub(crate) fn project_races(connection: &rusqlite::Connection) -> Result<()> {
+    let reader = shared::records::RecordContextReader::new(connection)?;
+    let identity = reader.identity();
     let mut statement =
-        connection.prepare("SELECT form_id,data FROM records WHERE record_type='RACE'")?;
+        connection.prepare("SELECT form_id FROM records WHERE record_type='RACE'")?;
     let mut rows = Vec::new();
-    for row in statement.query_map([], |row| {
-        Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })? {
-        let (id, bytes) = row?;
-        let record =
-            rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-                .map_err(|error| eyre!("RACE {id:08X}: {error}"))?;
-        if let Ok(authoring) = read_race_authoring(&record.subrecords) {
-            rows.push((id, authoring));
+    for row in statement.query_map([], |row| row.get::<_, i64>(0))? {
+        let key = identity.required_key(row?)?;
+        let authoring = reader.record(key).and_then(|record| {
+            let fields: Vec<_> = record
+                .runtime_subrecords()
+                .map(|field| shared::records::ArchivedSubRecord {
+                    tag: field.tag,
+                    data: field.data.clone(),
+                })
+                .collect();
+            read_race_authoring(&fields)
+        });
+        match authoring {
+            Ok(authoring) => rows.push((key.to_sql_i64(), authoring)),
+            Err(error) => log::warn!(
+                "RACE {} has unusable canonical authoring: {error}; race projection omitted",
+                identity.table().named(key)?
+            ),
         }
     }
     drop(statement);
@@ -166,9 +177,9 @@ pub(crate) const RACE_ANIMATION_SOURCES_SQL: &str =
     race_id INTEGER NOT NULL, sex TEXT NOT NULL, skeleton_nif TEXT, project_hkx TEXT,
     PRIMARY KEY (race_id, sex));";
 
-pub(crate) fn replace_race_projection(
+pub(crate) fn replace_race_projection<I: rusqlite::ToSql>(
     connection: &rusqlite::Connection,
-    rows: Vec<(u32, RaceAuthoring)>,
+    rows: Vec<(I, RaceAuthoring)>,
 ) -> rusqlite::Result<()> {
     connection.execute_batch(RACE_ANIMATION_SOURCES_SQL)?;
     connection.execute_batch("DELETE FROM race_animation_sources;")?;

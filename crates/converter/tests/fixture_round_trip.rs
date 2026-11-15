@@ -473,7 +473,11 @@ async fn generated_data_directory_converts_end_to_end() {
         assert_eq!(report.converted, 7, "schema {schema}");
         assert!(report.cache_hits >= 2, "schema {schema}: {report:?}");
         let mmap = converter::esm::cell_cache::validate_cell_cache(&cache_path).unwrap();
-        let cache = rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(&mmap).unwrap();
+        let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&database).unwrap();
+        let payload = shared::cache_identity::cell_cache_payload(&identity, &mmap, false).unwrap();
+        let cache =
+            rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(payload).unwrap();
         assert_eq!(
             cache.cells.len(),
             9,

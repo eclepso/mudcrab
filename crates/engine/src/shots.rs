@@ -39,6 +39,8 @@ use std::{
 /// and the frames right after that are the ones in which the terrain's textures, the sun's shadow
 /// cascades and the renderer's indirect draw buffers catch up with the cells that just arrived.
 pub const SETTLE_QUIET_FRAMES: u32 = 10;
+/// Portable camera/route identity contract; semantic identities are names rather than numbers.
+pub const EXTERNAL_IDENTITY_SCHEMA_VERSION: u32 = 2;
 
 /// Seconds after start-up before any shot is taken, as for the acceptance screenshot: the first
 /// frames compile pipelines, and a mesh whose pipeline is not ready yet is simply not drawn.
@@ -82,6 +84,53 @@ pub struct ShotsFile {
 }
 
 impl ShotsFile {
+    /// Read portable poses, resolving every request through this authenticated world's table.
+    pub fn load_with_identity(
+        path: &Path,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Self, ShotsError> {
+        let text = fs::read_to_string(path)
+            .map_err(|error| ShotsError(format!("could not read {}: {error}", path.display())))?;
+        Self::parse_with_identity(&text, identity)
+            .map_err(|error| ShotsError(format!("in {}: {error}", path.display())))
+    }
+
+    /// Version 2 names identities; numeric version 1 input is a checked legacy request only.
+    pub fn parse_with_identity(
+        text: &str,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<Self, ShotsError> {
+        let mut document: serde_json::Value = serde_json::from_str(text)
+            .map_err(|error| ShotsError(format!("not a shots file: {error}")))?;
+        let version = document
+            .get("schema_version")
+            .map_or(Some(1), serde_json::Value::as_u64)
+            .ok_or_else(|| ShotsError("invalid shots schema version".into()))?;
+        if !matches!(version, 1 | 2) {
+            return Err(ShotsError(
+                "unsupported shots schema; use schema 2 and named identities".into(),
+            ));
+        }
+        if let Some(shots) = document
+            .get_mut("shots")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for shot in shots {
+                for field in ["worldspace_id", "interior_cell_id"] {
+                    if let Some(value) = shot.get_mut(field) {
+                        let resolved =
+                            crate::config::external_request(value, version as u32, identity)
+                                .map_err(|error| ShotsError(format!("{field}: {error}")))?;
+                        *value = resolved.map_or(serde_json::Value::Null, serde_json::Value::from);
+                    }
+                }
+            }
+        }
+        let file: Self = serde_json::from_value(document)
+            .map_err(|error| ShotsError(format!("not a shots file: {error}")))?;
+        file.validate()?;
+        Ok(file)
+    }
     /// Reads and checks a shots file. The failure carries the path, because a run that cannot read
     /// its poses has nothing to fall back on.
     pub fn load(path: &Path) -> Result<Self, ShotsError> {
@@ -591,6 +640,7 @@ pub struct ShotsRun {
     pub output_dir: PathBuf,
     /// The worldspace the run streams; shots in another one are skipped.
     pub worldspace_id: u32,
+    identity: Option<std::sync::Arc<shared::pack_identity::PackIdentity>>,
     pub(crate) settle_timeout_seconds: f32,
     pub(crate) route_checkpoints: Option<BTreeSet<usize>>,
     transition_capture: bool,
@@ -640,11 +690,34 @@ enum Phase {
 }
 
 impl ShotsRun {
+    /// Name captured poses only through the same allocation that bound their gameplay requests.
+    fn pose_metadata(&self, shot: &Shot) -> Result<serde_json::Value, String> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or("capture metadata has no authenticated world identity")?;
+        let worldspace = crate::config::named_runtime_request(
+            identity,
+            shot.worldspace_id.unwrap_or(self.worldspace_id),
+        )
+        .map_err(|error| error.to_string())?;
+        let interior = shot
+            .interior_cell_id
+            .map(|value| crate::config::named_runtime_request(identity, value))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(
+            serde_json::json!({"worldspace_id":worldspace,"interior_cell_id":interior,
+            "position":shot.position,"yaw":shot.yaw,"pitch":shot.pitch,"hfov":shot.hfov}),
+        )
+    }
+
     pub fn new(file: ShotsFile, output_dir: PathBuf, worldspace_id: u32) -> Self {
         Self {
             file,
             output_dir,
             worldspace_id,
+            identity: None,
             settle_timeout_seconds: SETTLE_TIMEOUT_SECONDS,
             route_checkpoints: None,
             transition_capture: false,
@@ -666,6 +739,26 @@ impl ShotsRun {
             failed: false,
             frames_without_camera: 0,
         }
+    }
+
+    /// Capture metadata always uses names from this same authenticated gameplay boundary.
+    pub fn bind_identity(
+        &mut self,
+        identity: std::sync::Arc<shared::pack_identity::PackIdentity>,
+    ) -> Result<(), ShotsError> {
+        crate::config::named_runtime_request(&identity, self.worldspace_id)
+            .map_err(|error| ShotsError(error.to_string()))?;
+        for shot in &self.file.shots {
+            for value in [shot.worldspace_id, shot.interior_cell_id]
+                .into_iter()
+                .flatten()
+            {
+                crate::config::named_runtime_request(&identity, value)
+                    .map_err(|error| ShotsError(error.to_string()))?;
+            }
+        }
+        self.identity = Some(identity);
+        Ok(())
     }
 
     pub fn shot_path(&self, shot: &Shot) -> PathBuf {
@@ -1265,21 +1358,15 @@ impl ShotsRun {
             .enumerate()
             .map(|(index, (sample, point))| stage_row(point, sample, output.output.get(index)))
             .collect::<Result<Vec<_>, String>>()?;
+        let pose = self.pose_metadata(shot)?;
         let receipt = serde_json::json!({
-            "schema": 1,
+            "schema": EXTERNAL_IDENTITY_SCHEMA_VERSION,
             "side": "mudcrab",
             "visual_profile": output.visual_profile,
             "build": option_env!("MUDCRAB_BUILD_GIT_COMMIT"),
             "build_dirty": build_dirty(),
             "viewport": capture.viewport,
-            "pose": {
-                "worldspace_id": shot.worldspace_id.unwrap_or(self.worldspace_id),
-                "interior_cell_id": shot.interior_cell_id,
-                "position": shot.position,
-                "yaw": shot.yaw,
-                "pitch": shot.pitch,
-                "hfov": shot.hfov,
-            },
+            "pose": pose,
             "image": self.shot_path(shot),
             "probes": probes,
         });
@@ -1439,6 +1526,26 @@ fn finish_log(run: &mut ShotsRun) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Versioned named input and capture output preserve owner identity across allocation order.
+    #[test]
+    fn named_shots_and_capture_pose_use_authenticated_portable_identities() {
+        let identity = crate::config::identity_request_fixture();
+        let input = serde_json::json!({"schema_version":2,"width":640,"height":360,"shots":[{
+            "name":"named","worldspace_id":"00003C:Zulu.esm","position":[0,0,120],"yaw":0,"pitch":0,"hfov":75
+        }]}).to_string();
+        let file = ShotsFile::parse_with_identity(&input, &identity).unwrap();
+        assert_eq!(file.shots[0].worldspace_id, Some(0x3c));
+        let shot = file.shots[0].clone();
+        let mut run = ShotsRun::new(file, PathBuf::from("unused"), 0x3c);
+        assert!(run.pose_metadata(&shot).is_err());
+        run.bind_identity(std::sync::Arc::new(identity)).unwrap();
+        let pose = run.pose_metadata(&shot).unwrap();
+        assert_eq!(pose["worldspace_id"], "00003C:Zulu.esm");
+        assert!(pose["interior_cell_id"].is_null());
+        let bad = input.replace("\"00003C:Zulu.esm\"", "4294967356");
+        assert!(ShotsFile::parse_with_identity(&bad, run.identity.as_ref().unwrap()).is_err());
+    }
     use bevy::{
         asset::RenderAssetUsages,
         render::render_resource::{Extent3d, TextureDimension, TextureFormat},

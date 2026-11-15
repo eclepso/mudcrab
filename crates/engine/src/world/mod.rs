@@ -6,3 +6,6 @@ mod enable_state;
 pub mod environment;
 pub mod imagespace;
 pub mod water;
+
+#[cfg(test)]
+pub(crate) mod test_support;

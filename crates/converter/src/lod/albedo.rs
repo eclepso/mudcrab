@@ -34,13 +34,13 @@ const GUTTER: usize = 2;
 const WEIGHT_SIDE: usize = 17;
 const QUADRANT_ORIGINS: [(usize, usize); 4] = [(0, 0), (16, 0), (0, 16), (16, 16)];
 
-fn diffuse_catalog(connection: &Connection) -> Result<BTreeMap<u32, String>> {
+fn diffuse_catalog(connection: &Connection) -> Result<BTreeMap<u64, String>> {
     connection.prepare(
         "SELECT l.id, t.diffuse_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id \
          WHERE t.diffuse_path IS NOT NULL AND t.diffuse_path <> '' ORDER BY l.id"
     )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .map(|row| {
-            let (id, path): (u32, String) = row?;
+            let (id, path): (u64, String) = row?;
             Ok((id, canonical_asset_path(&path, AssetKind::Texture, "dds")?))
         }).collect()
 }
@@ -81,8 +81,8 @@ fn any_uses_default<'a>(cells: impl IntoIterator<Item = &'a TerrainCellInput>) -
 
 #[derive(Default)]
 pub struct TerrainTextures {
-    textures: BTreeMap<u32, Arc<[LinearImage; 3]>>,
-    sources: BTreeMap<u32, (String, String)>,
+    textures: BTreeMap<u64, Arc<[LinearImage; 3]>>,
+    sources: BTreeMap<u64, (String, String)>,
     /// Exact winning DDS bytes, included in the LOD build identity.
     pub source_hashes: BTreeMap<String, String>,
 }
@@ -239,9 +239,9 @@ impl TerrainTextures {
     pub(crate) fn sources_for(
         &self,
         cells: &[&TerrainCellInput],
-    ) -> BTreeMap<u32, &(String, String)> {
+    ) -> BTreeMap<u64, &(String, String)> {
         // Zero IDs are never keyed by layer: a null base draws the default, which is keyed below.
-        let mut sources: BTreeMap<u32, _> = cells
+        let mut sources: BTreeMap<u64, _> = cells
             .iter()
             .flat_map(|cell| &cell.layers)
             .filter(|layer| layer.texture_form_id != DEFAULT_TEXTURE_KEY)
@@ -1449,6 +1449,7 @@ mod tests {
     fn cell(layers: Vec<TerrainLayer>) -> TerrainCellInput {
         TerrainCellInput {
             cell_id: 1,
+            cell_name: "000001:Fixture.esm".into(),
             grid_x: 0,
             grid_y: 0,
             heights: vec![0.0; 33 * 33],
@@ -1893,12 +1894,12 @@ mod tests {
             assert_eq!(reason, None);
             let textures =
                 TerrainTextures::load(&connection, vfs.path(), &cells, &default).unwrap();
-            let defaulted_sources: BTreeMap<u32, (String, String)> = textures
+            let defaulted_sources: BTreeMap<u64, (String, String)> = textures
                 .sources_for(&[&cells[0]])
                 .into_iter()
                 .map(|(id, source)| (id, source.clone()))
                 .collect();
-            let grass_sources: BTreeMap<u32, (String, String)> = textures
+            let grass_sources: BTreeMap<u64, (String, String)> = textures
                 .sources_for(&[&cells[1]])
                 .into_iter()
                 .map(|(id, source)| (id, source.clone()))

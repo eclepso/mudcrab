@@ -14,7 +14,12 @@ use color_eyre::{
 };
 use rusqlite::Connection;
 use shared::actor_idle_catalog::{
-    ActorIdleBinding, ActorIdleCatalog, PATH, UnresolvedIdle, VERSION,
+    ActorIdleBindingFile as ActorIdleBinding, ActorIdleCatalogFile as ActorIdleCatalog, PATH,
+    UnresolvedIdleFile as UnresolvedIdle, VERSION,
+};
+use shared::{
+    form_key::{FormKey, NamedFormKey},
+    pack_identity::PackIdentity,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,8 +28,8 @@ use std::{
 };
 
 pub(crate) const RECIPE: &str = "authored-actor-idle-v2";
-pub(crate) const CATALOG_RECIPE: &str = "actor-idle-catalog-v1";
-pub(crate) const CONTEXT: &str = "recipes/actor-idle-catalog-v1/context.json";
+pub(crate) const CATALOG_RECIPE: &str = "actor-idle-catalog-v2-formkeys";
+pub(crate) const CONTEXT: &str = "recipes/actor-idle-catalog-v2-formkeys/context.json";
 
 const TREE_PREFIX: &str = "recipes/authored-actor-idle-v2/tree/";
 
@@ -130,6 +135,7 @@ fn preflight(staging: &Path, path: &Path) -> Result<()> {
 
 #[derive(Debug, Default)]
 struct ContractSet {
+    identity: Option<PackIdentity>,
     contracts: Vec<Contract>,
     rejected: Vec<UnresolvedIdle>,
     /// Bodies whose RACE project is the shared character project. They stay on the human
@@ -139,7 +145,8 @@ struct ContractSet {
 
 #[derive(Debug)]
 struct Contract {
-    race: u32,
+    race: FormKey,
+    race_name: NamedFormKey,
     sex: String,
     body: String,
     skeleton: Option<String>,
@@ -152,38 +159,58 @@ struct Contract {
 /// alone can return the same body twice. A path that cannot name a mesh is reported,
 /// never fatal: one malformed modded record must not stop the whole conversion.
 fn contracts(connection: &Connection) -> Result<ContractSet> {
+    let reader = shared::records::RecordContextReader::new(connection)?;
+    let identity = reader.identity().clone();
     let mut races = BTreeMap::new();
     let mut statement =
-        connection.prepare("SELECT form_id,data FROM records WHERE record_type='RACE'")?;
-    for row in statement.query_map([], |row| {
-        Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })? {
-        let (id, bytes) = row?;
-        let race =
-            rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-                .map_err(|error| eyre!("RACE {id:08X}: {error}"))?;
-        races.insert(id, authoring::read_race_authoring(&race.subrecords));
+        connection.prepare("SELECT form_id FROM records WHERE record_type='RACE'")?;
+    for row in statement.query_map([], |row| row.get::<_, i64>(0))? {
+        let key = identity.required_key(row?)?;
+        let race = reader
+            .record(key)
+            .and_then(|record| {
+                let fields: Vec<_> = record
+                    .runtime_subrecords()
+                    .map(|field| shared::records::ArchivedSubRecord {
+                        tag: field.tag,
+                        data: field.data.clone(),
+                    })
+                    .collect();
+                authoring::read_race_authoring(&fields)
+            })
+            .map_err(|error| format!("invalid canonical RACE authoring: {error:#}"));
+        races.insert(key, race);
     }
     let mut statement = connection.prepare("SELECT DISTINCT a.race_id,a.sex,p.model_path FROM actor_models a JOIN actor_model_parts p ON p.npc_id=a.id WHERE p.slot='body' ORDER BY a.race_id,a.sex,p.model_path")?;
-    let mut set = ContractSet::default();
+    let mut set = ContractSet {
+        identity: Some(identity.clone()),
+        ..Default::default()
+    };
     let mut seen = BTreeSet::new();
     for row in statement.query_map([], |row| {
         Ok((
-            row.get::<_, u32>(0)?,
+            row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
         ))
     })? {
-        let (race, sex, authored) = row?;
-        ensure!(
-            matches!(sex.as_str(), "male" | "female"),
-            "invalid actor sex {sex}"
-        );
+        let (raw_race, sex, authored) = row?;
+        let race = identity.required_key(raw_race)?;
+        let race_name = identity.table().named(race)?;
+        if !matches!(sex.as_str(), "male" | "female") {
+            set.rejected.push(UnresolvedIdle {
+                race_id: race_name,
+                sex,
+                body_scene: authored,
+                reason: "invalid actor sex".into(),
+            });
+            continue;
+        }
         let body = match shared::actor_idle_catalog::canonical_body_path(&authored, "nif") {
             Ok(body) => body,
             Err(error) => {
                 set.rejected.push(UnresolvedIdle {
-                    race_id: race,
+                    race_id: race_name.clone(),
                     sex,
                     body_scene: authored,
                     reason: format!("invalid authored body path: {error:#}"),
@@ -198,7 +225,7 @@ fn contracts(connection: &Connection) -> Result<ContractSet> {
             Some(Ok(authoring)) => Some(authoring),
             Some(Err(error)) => {
                 set.rejected.push(UnresolvedIdle {
-                    race_id: race,
+                    race_id: race_name.clone(),
                     sex,
                     body_scene: Path::new(&body)
                         .with_extension("glb")
@@ -229,12 +256,32 @@ fn contracts(connection: &Connection) -> Result<ContractSet> {
         }
         set.contracts.push(Contract {
             race,
+            race_name,
             sex,
             body,
             skeleton,
             project,
         });
     }
+    let ranks: BTreeMap<_, _> = identity
+        .order()
+        .iter()
+        .enumerate()
+        .map(|(priority, &owner)| {
+            (
+                owner,
+                (u8::from(identity.table().is_light(owner)), priority),
+            )
+        })
+        .collect();
+    set.contracts.sort_by_cached_key(|row| {
+        (
+            ranks[&row.race.plugin()],
+            row.race.local(),
+            row.sex.clone(),
+            row.body.clone(),
+        )
+    });
     Ok(set)
 }
 
@@ -391,7 +438,7 @@ pub(super) fn convert(
     report: &mut PipelineReport,
     manifest: &mut ConversionManifest,
 ) -> Result<()> {
-    use shared::actor_idle_catalog::{ActorIdleClip, IdleClipIssue};
+    use shared::actor_idle_catalog::{ActorIdleClip, IdleClipIssueFile as IdleClipIssue};
     let catalog_path = staging.join(PATH);
     let old: Vec<_> = manifest
         .derived_outputs
@@ -424,19 +471,13 @@ pub(super) fn convert(
         Default::default()
     };
     let ContractSet {
+        identity,
         contracts: rows,
         rejected,
         character_project_bodies,
     } = set;
-    if fail_fast && let Some(issue) = rejected.first() {
-        return Err(eyre!(
-            "RACE {:08X} {} {}: {}",
-            issue.race_id,
-            issue.sex,
-            issue.body_scene,
-            issue.reason
-        ));
-    }
+    // Rejected record metadata is local mod-data recovery even when asset fail-fast is selected.
+    // Its catalog entry and persisted warning preserve the loss without discarding neighbors.
     let winning = |key: &str| {
         let logical = staging.join("vfs").join(key);
         sources.get(&logical).cloned().unwrap_or(logical)
@@ -502,6 +543,10 @@ pub(super) fn convert(
     remove(&catalog_path)?;
     let mut catalog = ActorIdleCatalog {
         version: VERSION,
+        pack_identity: identity
+            .as_ref()
+            .map(PackIdentity::digest_hex)
+            .unwrap_or_default(),
         unresolved: rejected,
         ..Default::default()
     };
@@ -584,7 +629,7 @@ pub(super) fn convert(
                             return Err(error);
                         }
                         catalog.clip_issues.push(IdleClipIssue {
-                            race_id: row.race,
+                            race_id: row.race_name.clone(),
                             sex: row.sex.clone(),
                             body_scene: body_scene.clone(),
                             source: source.clone(),
@@ -598,7 +643,7 @@ pub(super) fn convert(
             }
             let default = &clips[&plan.default];
             let binding = ActorIdleBinding {
-                race_id: row.race,
+                race_id: row.race_name.clone(),
                 sex: row.sex.clone(),
                 body_scene: body_scene.clone(),
                 project: row.project.clone().unwrap(),
@@ -615,12 +660,19 @@ pub(super) fn convert(
             // body, not an invalid catalog that would abort the whole conversion.
             ActorIdleCatalog {
                 version: VERSION,
+                pack_identity: identity
+                    .as_ref()
+                    .map(PackIdentity::digest_hex)
+                    .unwrap_or_default(),
                 bindings: vec![binding.clone()],
                 ..Default::default()
             }
-            .validate()
-            .map_err(|message| eyre!(message))?;
-            context.push(serde_json::json!({"race":row.race,"sex":row.sex,"body":row.body,"skeleton":row.skeleton,"project":row.project,"metadata":plan.metadata,"inputs":inputs,"clips":clips}));
+            .validate_for(
+                identity
+                    .as_ref()
+                    .ok_or_else(|| eyre!("actor idle source identity is unavailable"))?,
+            )?;
+            context.push(serde_json::json!({"race":row.race_name,"sex":row.sex,"body":row.body,"skeleton":row.skeleton,"project":row.project,"metadata":plan.metadata,"inputs":inputs,"clips":clips}));
             Ok(binding)
         })();
         match attempt {
@@ -639,13 +691,13 @@ pub(super) fn convert(
                         manifest.derived_outputs.remove(key);
                     }
                     return Err(eyre!(
-                        "RACE {:08X} {} {body_scene}: {reason}",
-                        row.race,
+                        "RACE {} {} {body_scene}: {reason}",
+                        row.race_name,
                         row.sex
                     ));
                 }
                 let issue = UnresolvedIdle {
-                    race_id: row.race,
+                    race_id: row.race_name.clone(),
                     sex: row.sex,
                     body_scene,
                     reason,
@@ -663,10 +715,15 @@ pub(super) fn convert(
     }
     catalog.discovery_issues.sort();
     catalog.discovery_issues.dedup();
-    catalog.validate().map_err(|message| eyre!(message))?;
+    catalog.validate_for(
+        identity
+            .as_ref()
+            .ok_or_else(|| eyre!("actor idle source identity is unavailable"))?,
+    )?;
     let bytes = serde_json::to_vec_pretty(&catalog)?;
     let context = hash_bytes(&serde_json::to_vec(&(
         VERSION,
+        &catalog.pack_identity,
         context,
         &catalog.unresolved,
         &catalog.excluded,
@@ -697,7 +754,7 @@ pub(super) fn convert(
         || !catalog.clip_issues.is_empty()
         || !catalog.discovery_issues.is_empty()
     {
-        report.notices.push(message);
+        report.warnings.push(message);
     }
     Ok(())
 }
@@ -825,7 +882,7 @@ mod tests {
         let keys: Vec<_> = set
             .contracts
             .iter()
-            .map(|row| (row.race, row.sex.as_str(), row.body.as_str()))
+            .map(|row| (row.race.local(), row.sex.as_str(), row.body.as_str()))
             .collect();
         assert_eq!(
             keys,
@@ -930,7 +987,9 @@ mod tests {
         .unwrap();
         let catalog: ActorIdleCatalog =
             serde_json::from_slice(&fs::read(directory.path().join(PATH)).unwrap()).unwrap();
-        catalog.validate().unwrap();
+        catalog
+            .validate_for(&PackIdentity::read_sql(&Connection::open(&database).unwrap()).unwrap())
+            .unwrap();
         assert!(catalog.bindings.is_empty());
         assert_eq!(catalog.unresolved.len(), 1);
         assert!(

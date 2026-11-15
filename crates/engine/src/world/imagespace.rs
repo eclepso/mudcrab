@@ -10,7 +10,10 @@ use color_eyre::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use shared::records::ArchivedRecordData;
+use shared::{
+    form_key::NamedFormKey,
+    records::{ContextualRecord, RecordContextReader},
+};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +60,7 @@ impl ImageSpaceSlot {
 #[serde(rename_all = "kebab-case")]
 pub enum ImageSpaceSelection {
     Direct(u32),
-    /// Legacy archives can retain file-relative IMSP links. This path accepts
-    /// only the identity case verified by the stored origin metadata.
+    /// Resolve an authored slot through its stored physical source context.
     Weather {
         form_id: u32,
         slot: ImageSpaceSlot,
@@ -91,19 +93,30 @@ pub struct ImageSpaceTint {
     pub rgb: [f32; 3],
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Portable description of an explicit request; transient gameplay handles never escape.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NamedImageSpaceSelection {
+    Direct(NamedFormKey),
+    Weather {
+        form_id: NamedFormKey,
+        slot: ImageSpaceSlot,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImageSpaceWeatherSource {
-    pub form_id: u32,
+    pub form_id: NamedFormKey,
     pub editor_id: Option<String>,
     pub load_order: u32,
     pub winner_plugin: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LoadedImageSpace {
-    pub selection: ImageSpaceSelection,
+    pub selection: NamedImageSpaceSelection,
     pub source_weather: Option<ImageSpaceWeatherSource>,
-    pub form_id: u32,
+    pub form_id: NamedFormKey,
     pub editor_id: Option<String>,
     /// Winning override priority from `records`, not the form's origin plugin.
     pub load_order: u32,
@@ -118,7 +131,7 @@ struct Record {
     form_id: u32,
     load_order: u32,
     winner_plugin: Option<String>,
-    data: ArchivedRecordData,
+    data: ContextualRecord,
 }
 
 /// Load one explicitly selected IMGS, optionally following a WTHR authored slot.
@@ -137,21 +150,37 @@ pub fn load_image_space(
     let snapshot = connection
         .unchecked_transaction()
         .wrap_err("cannot start image-space read snapshot")?;
+    let reader = RecordContextReader::new(&snapshot)?;
+    let named = |runtime| -> Result<NamedFormKey> {
+        let key = reader
+            .identity()
+            .runtime_key(runtime)?
+            .ok_or_else(|| eyre!("a null image-space request has no record"))?;
+        Ok(reader.identity().table().named(key)?)
+    };
+    let named_selection = match selection {
+        ImageSpaceSelection::Direct(id) => NamedImageSpaceSelection::Direct(named(id)?),
+        ImageSpaceSelection::Weather { form_id, slot } => NamedImageSpaceSelection::Weather {
+            form_id: named(form_id)?,
+            slot,
+        },
+    };
     let (form_id, source_weather) = match selection {
         ImageSpaceSelection::Direct(form_id) => (form_id, None),
         ImageSpaceSelection::Weather { form_id, slot } => {
-            let weather = read_record(&snapshot, form_id, "WTHR")?;
-            let links = required_block(&weather, b"IMSP", 16)?;
-            let offset = slot.index() * 4;
-            let image_space_id = u32::from_le_bytes(links[offset..offset + 4].try_into()?);
+            let weather = read_record(&snapshot, &reader, form_id, "WTHR")?;
+            required_block(&weather, b"IMSP", 16)?;
+            let target = weather.data.first_link(*b"IMSP", slot.index() * 4)?;
             ensure!(
-                image_space_id != 0,
+                target.is_some(),
                 "WTHR {form_id:08X} has no image space for authored {} slot",
                 slot.name()
             );
-            ensure_identity_weather_link(&snapshot, &weather, image_space_id)?;
+            let image_space_id = reader
+                .identity()
+                .runtime_id(target.expect("checked non-null slot"))?;
             let source = ImageSpaceWeatherSource {
-                form_id,
+                form_id: named(form_id)?,
                 editor_id: editor_id(&weather)?,
                 load_order: weather.load_order,
                 winner_plugin: weather.winner_plugin,
@@ -159,7 +188,7 @@ pub fn load_image_space(
             (image_space_id, Some(source))
         }
     };
-    let record = read_record(&snapshot, form_id, "IMGS")?;
+    let record = read_record(&snapshot, &reader, form_id, "IMGS")?;
     if block(&record, b"ENAM")?.is_some() {
         bail!(
             "IMGS {form_id:08X} uses unsupported legacy ENAM image-space layout; it is not HNAM/CNAM/TNAM"
@@ -179,9 +208,9 @@ pub fn load_image_space(
         eye_adaptation_strength: values[8],
     });
     Ok(LoadedImageSpace {
-        selection,
+        selection: named_selection,
         source_weather,
-        form_id,
+        form_id: named(form_id)?,
         editor_id: editor_id(&record)?,
         load_order: record.load_order,
         winner_plugin: record.winner_plugin,
@@ -198,90 +227,50 @@ pub fn load_image_space(
     })
 }
 
-fn ensure_identity_weather_link(
+fn read_record(
     connection: &Connection,
-    weather: &Record,
-    image_space_id: u32,
-) -> Result<()> {
-    // The older converter does not remap WTHR/IMSP. Database schema 3..9 alone
-    // cannot tell global IDs from source-plugin master indices. Base-plugin
-    // slot-zero forms have the same identity in either representation; a
-    // priority-one override of its weather can only have that earlier plugin as
-    // master. Later overrides and mod-owned links need a future normalization
-    // contract, even if a same-numbered global record happens to exist.
-    let candidates_are_identity =
-        weather.form_id >> 24 == 0 && image_space_id >> 24 == 0 && weather.load_order <= 1;
-    let identities_match = candidates_are_identity
-        && origin_priority(connection, weather.form_id)? == Some(0)
-        && origin_priority(connection, image_space_id)? == Some(0);
-    ensure!(
-        identities_match,
-        "WTHR {:08X} at winning priority {} has unverified IMSP link normalization for {image_space_id:08X}; older archives may store file-relative IDs. Authored weather lookup currently requires slot-zero base-plugin forms and winner priority 0 or 1 with matching origin metadata; select the canonical IMGS directly for other cases",
-        weather.form_id,
-        weather.load_order
-    );
-    Ok(())
-}
-
-fn origin_priority(connection: &Connection, form_id: u32) -> Result<Option<u32>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT p.priority FROM formid_map f JOIN plugins p \
-             ON p.name=f.plugin_name COLLATE NOCASE WHERE f.form_id=?1",
-        )
-        .wrap_err("cannot verify IMSP link origins; select the canonical IMGS directly")?;
-    let priorities = statement
-        .query_map([form_id], |row| row.get::<_, u32>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    ensure!(
-        priorities.len() <= 1,
-        "record {form_id:08X} has ambiguous origin metadata for IMSP lookup; select the canonical IMGS directly"
-    );
-    Ok(priorities.into_iter().next())
-}
-
-fn read_record(connection: &Connection, form_id: u32, expected_type: &str) -> Result<Record> {
-    let row: Option<(String, u32, Vec<u8>)> = connection
+    reader: &RecordContextReader<'_>,
+    form_id: u32,
+    expected_type: &str,
+) -> Result<Record> {
+    let key = reader
+        .identity()
+        .runtime_key(form_id)?
+        .ok_or_else(|| eyre!("a null {expected_type} request has no record"))?;
+    let row: Option<(String, u32)> = connection
         .query_row(
-            "SELECT record_type,load_order,data FROM records WHERE form_id=?1",
-            [form_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT record_type,load_order FROM records WHERE form_id=?1",
+            [key.to_sql_i64()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .wrap_err_with(|| format!("cannot read canonical record {form_id:08X}"))?;
-    let (record_type, load_order, bytes) = row.ok_or_else(|| {
+    let (record_type, load_order) = row.ok_or_else(|| {
         eyre!("selected {expected_type} {form_id:08X} is absent from canonical records")
     })?;
     ensure!(
         record_type == expected_type,
         "record {form_id:08X} is {record_type}, expected {expected_type}"
     );
-    // SQLite returns a Vec<u8> without an archive-alignment guarantee. Copy into
-    // aligned storage before checked rkyv validation/deserialization.
-    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
-    aligned.extend_from_slice(&bytes);
-    let data = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&aligned)
-        .wrap_err_with(|| format!("invalid canonical archive for {expected_type} {form_id:08X}"))?;
-    let mut query = connection
-        .prepare("SELECT name FROM plugins WHERE priority=?1")
-        .wrap_err("cannot resolve winning plugin metadata")?;
-    let plugins = query
-        .query_map([load_order], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    ensure!(
-        plugins.len() <= 1,
-        "record {form_id:08X} winning priority {load_order} matches multiple plugins"
-    );
+    let data = reader.record(key)?;
+    let winner_plugin = reader
+        .identity()
+        .table()
+        .entry(data.supplier)
+        .map(|entry| entry.display_name.clone());
     Ok(Record {
         form_id,
         load_order,
-        winner_plugin: plugins.into_iter().next(),
+        winner_plugin,
         data,
     })
 }
 
 fn block<'a>(record: &'a Record, tag: &[u8; 4]) -> Result<Option<&'a [u8]>> {
-    let mut matches = record.data.subrecords.iter().filter(|sub| &sub.tag == tag);
+    let mut matches = record
+        .data
+        .runtime_subrecords()
+        .filter(|sub| &sub.tag == tag);
     let found = matches.next().map(|sub| sub.data.as_slice());
     ensure!(
         matches.next().is_none(),
@@ -351,7 +340,7 @@ mod tests {
 
     fn database() -> (TempDir, Connection) {
         let directory = tempfile::tempdir().unwrap();
-        let connection = Connection::open(directory.path().join("world.db")).unwrap();
+        let mut connection = Connection::open(directory.path().join("world.db")).unwrap();
         connection.execute_batch(
             "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(9);
              CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,load_order INTEGER NOT NULL,data BLOB NOT NULL);
@@ -359,6 +348,13 @@ mod tests {
              INSERT INTO plugins VALUES(91,'Winning.esm',7),(12,'Weather.esm',1),(44,'Base.esm',0);
              CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);")
             .unwrap();
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        crate::world::test_support::install(&mut connection);
         (directory, connection)
     }
 
@@ -397,14 +393,8 @@ mod tests {
         priority: u32,
         subrecords: Vec<ArchivedSubRecord>,
     ) {
-        let bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&ArchivedRecordData { subrecords }).unwrap();
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO records VALUES(?1,?2,?3,?4)",
-                rusqlite::params![id, kind, priority, bytes.as_slice()],
-            )
-            .unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(connection).unwrap();
+        crate::world::test_support::insert(connection, &identity, id, kind, priority, subrecords);
     }
 
     #[test]
@@ -423,7 +413,7 @@ mod tests {
             ImageSpaceSelection::Direct(100),
         )
         .unwrap();
-        assert_eq!(loaded.form_id, 100);
+        assert_eq!(loaded.form_id.parts().unwrap().1, 100);
         assert_eq!(loaded.editor_id.as_deref(), Some("AsymmetricGrade"));
         assert_eq!(loaded.winner_plugin.as_deref(), Some("Winning.esm"));
         assert_eq!(loaded.load_order, 7);
@@ -501,10 +491,16 @@ mod tests {
         {
             let selection = ImageSpaceSelection::Weather { form_id: 50, slot };
             let loaded = load_image_space(&directory.path().join("world.db"), selection).unwrap();
-            assert_eq!(loaded.form_id, 200 + index as u32);
-            assert_eq!(loaded.selection, selection);
+            assert_eq!(loaded.form_id.parts().unwrap().1, 200 + index as u32);
+            assert_eq!(
+                loaded.selection,
+                NamedImageSpaceSelection::Weather {
+                    form_id: NamedFormKey::new("Base.esm", 50).unwrap(),
+                    slot
+                }
+            );
             let weather = loaded.source_weather.unwrap();
-            assert_eq!(weather.form_id, 50);
+            assert_eq!(weather.form_id.parts().unwrap().1, 50);
             assert_eq!(weather.load_order, 1);
             assert_eq!(weather.winner_plugin.as_deref(), Some("Weather.esm"));
             assert_eq!(ImageSpaceSlot::parse(slot.name()), Some(slot));
@@ -540,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_hdr_is_explicit_and_supported_older_schema_still_loads() {
+    fn missing_hdr_is_explicit_and_old_world_is_refused() {
         let (directory, connection) = database();
         connection
             .execute("UPDATE schema_info SET version=3", [])
@@ -548,11 +544,20 @@ mod tests {
         let mut without_hdr = fields();
         without_hdr.retain(|sub| sub.tag != *b"HNAM");
         insert(&connection, 100, "IMGS", 7, without_hdr);
-        let loaded = load_image_space(
-            &directory.path().join("world.db"),
-            ImageSpaceSelection::Direct(100),
-        )
-        .unwrap();
+        let path = directory.path().join("world.db");
+        assert!(
+            load_image_space(&path, ImageSpaceSelection::Direct(100))
+                .unwrap_err()
+                .to_string()
+                .contains("convert again")
+        );
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        let loaded = load_image_space(&path, ImageSpaceSelection::Direct(100)).unwrap();
         assert!(loaded.hdr.is_none());
     }
 
@@ -658,17 +663,17 @@ mod tests {
                 .to_string()
                 .contains("expected IMGS")
         );
-        connection.execute("UPDATE records SET record_type='IMGS',data=x'ffffffffffffffffffffffffffffffff' WHERE form_id=100",[]).unwrap();
+        connection.execute("UPDATE records SET record_type='IMGS',data=x'ffffffffffffffffffffffffffffffff' WHERE form_id=?1",[crate::world::test_support::key(&shared::pack_identity::PackIdentity::read_sql(&connection).unwrap(),100)]).unwrap();
         assert!(
             load_image_space(&path, ImageSpaceSelection::Direct(100))
                 .unwrap_err()
                 .to_string()
-                .contains("invalid canonical archive")
+                .contains("invalid canonical record payload")
         );
     }
 
     #[test]
-    fn invalid_weather_links_and_ambiguous_winner_fail_clearly() {
+    fn invalid_weather_links_and_forged_pack_proof_fail_clearly() {
         let (directory, connection) = database();
         let path = directory.path().join("world.db");
         let selection = ImageSpaceSelection::Weather {
@@ -709,91 +714,107 @@ mod tests {
         );
         insert(&connection, 100, "IMGS", 7, fields());
         connection
-            .execute("INSERT INTO plugins VALUES(92,'Ambiguous.esm',7)", [])
+            .execute("UPDATE pack_identity SET digest=zeroblob(32)", [])
             .unwrap();
         assert!(
             load_image_space(&path, ImageSpaceSelection::Direct(100))
                 .unwrap_err()
                 .to_string()
-                .contains("multiple plugins")
+                .contains("convert again")
         );
     }
 
     #[test]
-    fn ambiguous_legacy_weather_links_never_select_a_colliding_global_record() {
+    fn contextual_weather_self_links_do_not_select_colliding_runtime_records() {
         let (directory, connection) = database();
         let path = directory.path().join("world.db");
-        connection
-            .execute("UPDATE schema_info SET version=3", [])
-            .unwrap();
-        connection
-            .execute("INSERT INTO plugins VALUES(92,'Later.esm',8)", [])
-            .unwrap();
-        // Source index 1 could name a mod's own record while global index 1
-        // names an unrelated earlier plugin. Its existence proves nothing.
-        let colliding_global = 0x0100_0800u32;
-        insert(&connection, colliding_global, "IMGS", 7, fields());
+        let native_self = 0x0100_0800u32;
+        let selected = 0x0700_0800u32;
+        let colliding = 0x0100_0800u32;
+        let mut collision = fields();
+        collision
+            .iter_mut()
+            .find(|field| field.tag == *b"CNAM")
+            .unwrap()
+            .data = float_bytes(&[2., 9., 3.]);
+        insert(&connection, colliding, "IMGS", 1, collision);
+        insert(&connection, selected, "IMGS", 7, fields());
         insert(
             &connection,
-            0x0800_0900,
+            0x0700_0900,
             "WTHR",
-            8,
+            7,
             vec![ArchivedSubRecord {
                 tag: *b"IMSP",
-                data: [colliding_global; 4]
+                data: [native_self; 4]
                     .iter()
                     .flat_map(|id| id.to_le_bytes())
                     .collect(),
             }],
         );
-        let selection = ImageSpaceSelection::Weather {
-            form_id: 0x0800_0900,
-            slot: ImageSpaceSlot::Day,
-        };
-        let error = load_image_space(&path, selection).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unverified IMSP link normalization")
-        );
+        let loaded = load_image_space(
+            &path,
+            ImageSpaceSelection::Weather {
+                form_id: 0x0700_0900,
+                slot: ImageSpaceSlot::Day,
+            },
+        )
+        .unwrap();
         assert_eq!(
-            load_image_space(&path, ImageSpaceSelection::Direct(colliding_global))
-                .unwrap()
-                .form_id,
-            colliding_global
+            loaded.form_id,
+            NamedFormKey::new("Winning.esm", 0x800).unwrap()
         );
+        assert_eq!(loaded.cinematic.brightness, 1.17);
+        assert_eq!(
+            load_image_space(&path, ImageSpaceSelection::Direct(colliding))
+                .unwrap()
+                .cinematic
+                .brightness,
+            9.
+        );
+        let json = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(json["form_id"], "000800:Winning.esm");
+        assert_eq!(json["source_weather"]["form_id"], "000900:Winning.esm");
+    }
 
-        // A later override can reorder masters even when the stored link's
-        // high byte is zero and both same-numbered records originated in base.
+    #[test]
+    fn cleared_weather_site_refuses_only_its_selected_slot_and_preserves_neighbor() {
+        let (directory, connection) = database();
+        let path = directory.path().join("world.db");
+        insert(&connection, 200, "IMGS", 7, fields());
         insert(
             &connection,
             50,
             "WTHR",
-            8,
+            1,
             vec![ArchivedSubRecord {
                 tag: *b"IMSP",
-                data: [200u32; 4].iter().flat_map(|id| id.to_le_bytes()).collect(),
+                data: [201u32, 200, 0, 0]
+                    .iter()
+                    .flat_map(|id| id.to_le_bytes())
+                    .collect(),
             }],
         );
-        insert(&connection, 200, "IMGS", 7, fields());
-        connection
-            .execute(
-                "INSERT INTO formid_map VALUES(50,'Base.esm'),(200,'Base.esm')",
-                [],
-            )
-            .unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
+        let key = crate::world::test_support::key(&identity, 50);
+        connection.execute("UPDATE resolved_links SET target_key=NULL,outcome='cleared' WHERE record_key=?1 AND byte_offset=0",[key]).unwrap();
         let error = load_image_space(
+            &path,
+            ImageSpaceSelection::Weather {
+                form_id: 50,
+                slot: ImageSpaceSlot::Sunrise,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no image space"));
+        let good = load_image_space(
             &path,
             ImageSpaceSelection::Weather {
                 form_id: 50,
                 slot: ImageSpaceSlot::Day,
             },
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unverified IMSP link normalization")
-        );
+        .unwrap();
+        assert_eq!(good.form_id, NamedFormKey::new("Base.esm", 200).unwrap());
     }
 }

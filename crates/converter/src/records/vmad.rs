@@ -10,7 +10,20 @@ use super::Value;
 pub fn decode(
     bytes: &[u8],
     owner: &[u8; 4],
-    remap: impl FnMut(u32) -> Result<u32, String>,
+    mut remap: impl FnMut(u32) -> Result<u32, String>,
+) -> Result<(Value, Vec<u8>), String> {
+    decode_at(bytes, owner, |_, word| {
+        let mapped = remap(word)?;
+        Ok((mapped, Value::FormId(mapped)))
+    })
+}
+
+/// Decode object identities with exact source offsets, independently of their semantic width.
+/// The returned word preserves the native four-byte wire; the value may name a 64-bit FormKey.
+pub fn decode_at(
+    bytes: &[u8],
+    owner: &[u8; 4],
+    remap: impl FnMut(usize, u32) -> Result<(u32, Value), String>,
 ) -> Result<(Value, Vec<u8>), String> {
     let mut input = Cursor {
         source: bytes,
@@ -64,7 +77,7 @@ struct Cursor<'a, F> {
     remap: F,
 }
 
-impl<F: FnMut(u32) -> Result<u32, String>> Cursor<'_, F> {
+impl<F: FnMut(usize, u32) -> Result<(u32, Value), String>> Cursor<'_, F> {
     /// Consume exactly one checked span, never advancing on a failed boundary.
     fn take(&mut self, size: usize) -> Result<&[u8], String> {
         let end = self.offset.checked_add(size).ok_or("VMAD size overflow")?;
@@ -146,13 +159,13 @@ impl<F: FnMut(u32) -> Result<u32, String>> Cursor<'_, F> {
             _ => return Err(format!("unsupported VMAD object format {format}")),
         };
         let source_id = u32::from_le_bytes(raw[link_offset..link_offset + 4].try_into().unwrap());
-        let form_id = (self.remap)(source_id)?;
+        let (form_id, identity) = (self.remap)(start + link_offset, source_id)?;
         self.canonical[start + link_offset..start + link_offset + 4]
             .copy_from_slice(&form_id.to_le_bytes());
         let alias = i16::from_le_bytes(raw[alias_offset..alias_offset + 2].try_into().unwrap());
         let unused = u16::from_le_bytes(raw[unused_offset..unused_offset + 2].try_into().unwrap());
         Ok(Value::Struct(vec![
-            ("form_id".into(), Value::FormId(form_id)),
+            ("form_id".into(), identity),
             ("alias".into(), Value::Signed(i64::from(alias))),
             ("unused".into(), Value::Unsigned(u64::from(unused))),
         ]))

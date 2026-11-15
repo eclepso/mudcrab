@@ -689,12 +689,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
             (RACE_NULL_TEXT, "null_id".into(), 2)
         ]
     );
-    let read_cache = |name| {
-        rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(
-            &fs::read(output.join(name)).unwrap(),
-        )
-        .unwrap()
-    };
+    let read_cache = |name| crate::esm::cell_cache::runtime_fixture_cache(&output.join(name));
     let runtime = read_cache("cell_cache.rkyv");
     let preserved = read_cache("cell_cache_preserved.rkyv");
     assert_eq!(runtime.cells.len(), 2);
@@ -717,7 +712,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
             .iter()
             .map(|layer| layer.texture_form_id)
             .collect::<Vec<_>>(),
-        [0x899, SELF_TEXTURE, 0x89a, 0x881]
+        [0x899, SELF_TEXTURE, 0x89a, 0x881].map(u64::from)
     );
     assert_eq!(
         runtime_land
@@ -725,7 +720,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
             .iter()
             .map(|layer| layer.texture_form_id)
             .collect::<Vec<_>>(),
-        [0, SELF_TEXTURE, 0, 0]
+        [0, SELF_TEXTURE, 0, 0].map(u64::from)
     );
     assert_eq!(
         runtime_land
@@ -766,7 +761,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
         assert!(heightless.layers.iter().all(|layer| layer.quadrant == 2));
         for (&slot, layer) in expected_slots[1..].iter().zip(&heightless.layers[1..]) {
             assert!(!layer.is_base);
-            assert_eq!(layer.texture_form_id, SELF_TEXTURE);
+            assert_eq!(layer.texture_form_id, u64::from(SELF_TEXTURE));
             assert_eq!(
                 layer
                     .weights
@@ -887,10 +882,7 @@ fn rv_a_runtime_late_validation_text_normalization_preserves_predecessor() {
     assert_eq!(row["form_id"], WALK_SETTING);
     assert_eq!(row["load_order"], 0);
     for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
-        let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(
-            &fs::read(output.join(name)).unwrap(),
-        )
-        .unwrap();
+        let cache = crate::esm::cell_cache::runtime_fixture_cache(&output.join(name));
         let neighbor = cache
             .cells
             .iter()
@@ -1033,10 +1025,7 @@ fn rv_a_deferred_replay_failure_publishes_predecessor_and_neighbor_with_private_
     let row: Json = serde_json::from_str(typed.trim()).unwrap();
     assert_eq!(row["load_order"], 0);
     for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
-        let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(
-            &fs::read(output.join(name)).unwrap(),
-        )
-        .unwrap();
+        let cache = crate::esm::cell_cache::runtime_fixture_cache(&output.join(name));
         let neighbor = cache
             .cells
             .iter()

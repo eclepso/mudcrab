@@ -514,7 +514,7 @@ pub(crate) fn export_inhouse_record_archive_to_db(
 
 /// Recreate reader-owned outputs while preserving caller tables and asset-cache proofs.
 /// DDL participates in the export transaction, so an export error restores the old snapshot.
-fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         r#"DROP TABLE IF EXISTS record_diagnostics;
         DROP TABLE IF EXISTS inhouse_plugin_masters;
@@ -630,6 +630,52 @@ struct LegacyRecords<'a> {
     ordered: Vec<(&'a u32, &'a RawRecord)>,
 }
 
+/// Run scalar extractors in private memory using compact CPU indices, never legacy slots.
+/// The caller writes checked FormKeys and original canonical bytes to the actual pack separately.
+pub(crate) fn project_native_rows(
+    conn: &Connection,
+    master: &HashMap<u32, RawRecord>,
+    identities: &HashMap<u32, StableId>,
+) -> Result<()> {
+    project_native_rows_with_offsets(conn, master, identities, &HashMap::new())
+}
+
+/// Native LAND tie breaking uses the same physical positions as the paired cache producers.
+pub(crate) fn project_native_rows_with_offsets(
+    conn: &Connection,
+    master: &HashMap<u32, RawRecord>,
+    identities: &HashMap<u32, StableId>,
+    source_offsets: &HashMap<u32, u64>,
+) -> Result<()> {
+    let file: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !file.is_empty() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    create_tables(conn)?;
+    let mut ordered: Vec<_> = master.iter().collect();
+    ordered.sort_unstable_by_key(|(id, _)| **id);
+    project_scalar_records(
+        conn,
+        LegacyRecords {
+            by_id: master,
+            ordered,
+        },
+        None,
+        None,
+        None,
+        Some(source_offsets),
+        ExportOptions {
+            runtime_views: true,
+            scalar_scripts: true,
+        },
+        Some(identities),
+    )
+}
+
 /// Preserve existing u32 export APIs while complete exports enter through FormKey identities.
 fn export_record_adapter(
     conn: &Connection,
@@ -643,7 +689,7 @@ fn export_record_adapter(
     let Some(order) = order else {
         let mut ordered: Vec<_> = master.iter().collect();
         ordered.sort_unstable_by_key(|(id, _)| **id);
-        return export_legacy_records(
+        return project_scalar_records(
             conn,
             LegacyRecords {
                 by_id: master,
@@ -654,6 +700,7 @@ fn export_record_adapter(
             unresolved_fields,
             terrain_offsets,
             options,
+            None,
         );
     };
     let identities = order.form_key_context().map_err(sql_identity_error)?;
@@ -715,7 +762,7 @@ fn export_records(
         .into_iter()
         .map(|(_, record)| (&record.form_id, record))
         .collect();
-    export_legacy_records(
+    project_scalar_records(
         conn,
         LegacyRecords {
             by_id: export.lookup,
@@ -726,6 +773,7 @@ fn export_records(
         export.unresolved_fields,
         export.terrain_offsets,
         export.options,
+        None,
     )
 }
 
@@ -737,7 +785,7 @@ fn sql_identity_error(error: impl std::fmt::Display) -> rusqlite::Error {
 /// Writes every merged record; with a load order, also records each record's
 /// owning plugin and plugin-local ID in `formid_map`. SQL insertion follows unsigned
 /// legacy owner identity order, independently of the winning supplier's load order.
-fn export_legacy_records(
+fn project_scalar_records(
     conn: &Connection,
     records: LegacyRecords<'_>,
     order: Option<&LoadOrder>,
@@ -745,6 +793,7 @@ fn export_legacy_records(
     unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
     terrain_offsets: Option<&HashMap<u32, u64>>,
     options: ExportOptions,
+    native_ids: Option<&HashMap<u32, StableId>>,
 ) -> Result<()> {
     let LegacyRecords {
         by_id: master,
@@ -758,7 +807,7 @@ fn export_legacy_records(
     let tx = conn.unchecked_transaction()?;
     // Only a full load-order export writes these; a subset export keeps the stored ones.
     let mut omissions = ProjectionOmissions::default();
-    if order.is_some() {
+    if order.is_some() || native_ids.is_some() {
         replace_complete_snapshot(&tx)?;
         if let Some(paths) = plugin_paths {
             tx.execute("DELETE FROM plugins", [])?;
@@ -874,6 +923,11 @@ fn export_legacy_records(
             )?;
         }
 
+        if let Some(native_ids) = native_ids {
+            if let Some(identity) = native_ids.get(&form_id) {
+                tx.prepare_cached("INSERT OR REPLACE INTO formid_map(form_id,plugin_name,internal_id,record_type) VALUES(?1,?2,?3,?4)")?.execute(params![form_id,identity.plugin,identity.local_id,type_str])?;
+            }
+        }
         if !runtime_views {
             // Canonical records/formid_map are complete; only materialized runtime views defer.
             continue;
@@ -1119,7 +1173,7 @@ fn export_legacy_records(
     // export owns them, so the movement annotator's subset export leaves them alone, and
     // diagnostic archives defer them. The emittance pass holds every reference and the records
     // their XEMI names, and may run on a database older than `emittance_id`.
-    if runtime_views && order.is_some() {
+    if runtime_views && (order.is_some() || native_ids.is_some()) {
         insert_actor_models(&tx, master)?;
         let (authoring, unreadable) = race_authoring_rows(master);
         for (id, error) in unreadable {

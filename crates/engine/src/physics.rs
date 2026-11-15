@@ -110,6 +110,7 @@ impl MovementTuning {
     pub fn from_world_database(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .wrap_err_with(|| format!("opening movement records in {}", path.display()))?;
+        shared::world_assets::install_runtime_identity_functions(&conn)?;
         let has_table: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='movement_types')",
             [], |row| row.get(0),
@@ -118,11 +119,15 @@ impl MovementTuning {
             return Ok(Self::default());
         }
         let race_id: u32 = conn
-            .query_row("SELECT race_id FROM npcs WHERE id=7", [], |row| row.get(0))
+            .query_row(
+                "SELECT runtime_id(race_id) FROM npcs WHERE id=stored_key(7)",
+                [],
+                |row| row.get(0),
+            )
             .wrap_err("record-backed movement needs Player NPC_ 00000007 RNAM")?;
         let race_type: String = conn
             .query_row(
-                "SELECT record_type FROM records WHERE form_id=?1",
+                "SELECT record_type FROM records WHERE form_id=stored_key(?1)",
                 [race_id],
                 |row| row.get(0),
             )
@@ -133,7 +138,7 @@ impl MovementTuning {
         );
         let (walk_link, run_link): (Option<u32>, Option<u32>) = conn
             .query_row(
-                "SELECT walk_movt_id, run_movt_id FROM race_movement_links WHERE id=?1",
+                "SELECT runtime_id(walk_movt_id),runtime_id(run_movt_id) FROM race_movement_links WHERE id=stored_key(?1)",
                 [race_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -150,7 +155,7 @@ impl MovementTuning {
                     m.forward_walk, m.forward_run, m.back_walk, m.back_run, \
                     COALESCE(p.name, '<unknown plugin>') \
              FROM movement_types m LEFT JOIN plugins p ON p.id=m.load_order \
-             WHERE m.id=?1",
+             WHERE m.id=stored_key(?1)",
                 params![NPC_DEFAULT_MOVT_FORM_ID],
                 |row| {
                     Ok((

@@ -60,7 +60,7 @@ class ValidationTests(unittest.TestCase):
                 for index in range(count)
             ],
         }
-        self.metadata = {"worldspace_id": 60, "start_grid": [5, -12], "stream_radius": 2, "resolution": [2, 1], "run_id": "16mib-01", "scenario": "repeat-terrain-startup", "commit": "fixture"}
+        self.metadata = {"format_version": 3, "worldspace_id": "00003C:Skyrim.esm", "start_grid": [5, -12], "stream_radius": 2, "resolution": [2, 1], "run_id": "16mib-01", "scenario": "repeat-terrain-startup", "commit": "fixture"}
         self.manifest = {"exit_code": 0, "warmup_frames": 100, "duration_seconds": 1, "run_id": "16mib-01", "scenario": "repeat-terrain-startup", "commit": "fixture", "input_hashes_before": {"engine": "same"}, "input_hashes_after": {"engine": "same"}}
         self.logs = "INFO engine::app: Mudcrab runtime initialized camera=Vec3(2048.0, 5976.0, 5952.0) target=Vec3(2048.0, -24.0, -2048.0)\n"
         self.flush()
@@ -77,6 +77,12 @@ class ValidationTests(unittest.TestCase):
 
     def validate(self):
         return RUNNER.analyze_run(self.root, self.manifest)
+
+    def test_profile_numeric_identity_is_not_interpreted_as_a_pack_key(self):
+        for value in (60, 73014446780):
+            self.metadata["worldspace_id"] = value
+            self.flush()
+            self.assertIn("profile worldspace_id differs from the requested camera/scene", self.validate()["failures"])
 
     def test_success_does_not_claim_visual_coverage_or_require_a_retry(self):
         result = self.validate()

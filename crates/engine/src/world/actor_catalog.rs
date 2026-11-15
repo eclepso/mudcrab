@@ -138,6 +138,13 @@ impl ActorCatalog {
     }
 
     fn read(connection: &Connection, assets_root: Option<PathBuf>) -> Self {
+        let identity = match shared::world_assets::install_runtime_identity_functions(connection) {
+            Ok(identity) => identity,
+            Err(error) => {
+                warn!("actors: world identity unavailable ({error}); convert again");
+                return Self::default();
+            }
+        };
         let mut idle_catalog = assets_root
             .as_ref()
             .and_then(|root| {
@@ -150,11 +157,12 @@ impl ActorCatalog {
                         return None;
                     }
                 };
-                let parsed =
-                    serde_json::from_slice::<shared::actor_idle_catalog::ActorIdleCatalog>(&bytes);
+                let parsed = serde_json::from_slice::<
+                    shared::actor_idle_catalog::ActorIdleCatalogFile,
+                >(&bytes);
                 match parsed {
-                    Ok(catalog) => match catalog.validate() {
-                        Ok(()) => Some(catalog),
+                    Ok(catalog) => match catalog.to_runtime(&identity) {
+                        Ok(catalog) => Some(catalog),
                         Err(error) => {
                             warn!("actors: invalid idle catalog: {error}");
                             None
@@ -169,11 +177,22 @@ impl ActorCatalog {
             .unwrap_or_default();
         let outfits = assets_root
             .as_deref()
-            .map(Self::read_outfits)
+            .map(|root| Self::read_outfits(root, &identity))
             .unwrap_or_default();
+        for (table, columns) in [
+            ("actor_models", &["id", "race_id", "skin_armo_id"][..]),
+            ("actor_model_parts", &["npc_id"][..]),
+            ("race_animation_sources", &["race_id"][..]),
+        ] {
+            if let Err(error) =
+                crate::world::database::report_runtime_capacity(connection, table, columns)
+            {
+                warn!("actors: capacity inspection unavailable: {error}");
+            }
+        }
         let mut race_sources = HashMap::new();
         if let Ok(mut statement) = connection
-            .prepare("SELECT race_id,sex,skeleton_nif,project_hkx FROM race_animation_sources")
+            .prepare("SELECT runtime_id_or_null(race_id),sex,skeleton_nif,project_hkx FROM race_animation_sources")
             && let Ok(rows) = statement.query_map([], |row| {
                 Ok((
                     row.get::<_, u32>(0)?,
@@ -209,11 +228,11 @@ impl ActorCatalog {
             "NULL AS weight"
         };
         let toned = format!(
-            "SELECT id, race_id, sex, skin_armo_id, head_model, head_source, resolution, \
+            "SELECT runtime_id_or_null(id), runtime_id_or_null(race_id), sex, runtime_id_or_null(skin_armo_id), head_model, head_source, resolution, \
              skin_tone_r, skin_tone_g, skin_tone_b, {weight_column} FROM actor_models"
         );
         let untoned = format!(
-            "SELECT id, race_id, sex, skin_armo_id, head_model, head_source, resolution, \
+            "SELECT runtime_id_or_null(id), runtime_id_or_null(race_id), sex, runtime_id_or_null(skin_armo_id), head_model, head_source, resolution, \
              NULL, NULL, NULL, {weight_column} FROM actor_models"
         );
         match connection
@@ -277,7 +296,9 @@ impl ActorCatalog {
             }
         }
 
-        match connection.prepare("SELECT npc_id, slot, model_path FROM actor_model_parts") {
+        match connection
+            .prepare("SELECT runtime_id_or_null(npc_id), slot, model_path FROM actor_model_parts")
+        {
             Ok(mut statement) => match statement.query_map([], |row| {
                 Ok((
                     row.get::<_, u32>(0)?,
@@ -336,7 +357,10 @@ impl ActorCatalog {
 
     /// The optional worn-outfit sidecar. A pack without it, or with an unreadable or invalid one,
     /// spawns actors in their skin exactly as before.
-    fn read_outfits(root: &Path) -> shared::actor_outfits::ActorOutfitCatalog {
+    fn read_outfits(
+        root: &Path,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> shared::actor_outfits::ActorOutfitCatalog {
         let path = root.join(shared::actor_outfits::PATH);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -348,9 +372,23 @@ impl ActorCatalog {
                 return Default::default();
             }
         };
-        match serde_json::from_slice::<shared::actor_outfits::ActorOutfitCatalog>(&bytes) {
-            Ok(catalog) => match catalog.validate() {
-                Ok(()) => catalog,
+        match serde_json::from_slice::<shared::actor_outfits::ActorOutfitCatalogFile>(&bytes) {
+            Ok(catalog) => match catalog.to_runtime(identity) {
+                Ok(catalog) => {
+                    let unavailable: usize = catalog
+                        .skipped
+                        .iter()
+                        .filter(|(reason, _)| reason.starts_with("runtime_"))
+                        .map(|(_, count)| *count)
+                        .sum();
+                    if unavailable != 0 {
+                        warn!(
+                            unavailable,
+                            "actors: outfit entries require unavailable runtime identity slots; entries omitted"
+                        );
+                    }
+                    catalog
+                }
                 Err(error) => {
                     warn!("actors: invalid outfit catalog: {error}");
                     Default::default()

@@ -129,11 +129,13 @@ pub struct ChunkStore {
     root: PathBuf,
     chunks: HashMap<String, ChunkEntry>,
     order: VecDeque<String>,
+    identity: Result<shared::pack_identity::PackIdentity, String>,
 }
 
 impl ChunkStore {
     pub fn new(root: PathBuf) -> Self {
         Self {
+            identity: world_identity(&root),
             root,
             chunks: HashMap::new(),
             order: VecDeque::new(),
@@ -149,14 +151,17 @@ impl ChunkStore {
     /// [`ChunkEntry::Missing`] on purpose: the converted assets are fixed for the whole run (the
     /// engine holds a shared lock on them), so a missing file stays missing, and rechecking the
     /// disk for every cell of a worldspace with no merged data would cost a failed `stat` per cell.
-    fn entry(&mut self, relative: &str, worldspace_id: u32) -> &ChunkEntry {
+    fn entry(&mut self, relative: &str, worldspace_id: u64) -> &ChunkEntry {
         if !self.chunks.contains_key(relative) {
             while self.order.len() >= CHUNK_CACHE_LIMIT {
                 if let Some(oldest) = self.order.pop_front() {
                     self.chunks.remove(&oldest);
                 }
             }
-            let entry = open_chunk(&self.root.join(relative), worldspace_id);
+            let entry = match &self.identity {
+                Ok(identity) => open_chunk(&self.root.join(relative), worldspace_id, identity),
+                Err(reason) => ChunkEntry::Invalid(reason.clone()),
+            };
             self.order.push_back(relative.to_owned());
             self.chunks.insert(relative.to_owned(), entry);
         }
@@ -171,18 +176,38 @@ impl ChunkStore {
         grid_y: i32,
         cell_id: u32,
     ) -> CellLookup {
-        let relative = terrain_chunk_path(worldspace_id, grid_x, grid_y);
-        match self.entry(&relative, worldspace_id) {
+        let resolve = (|| -> Result<(u64, u64), String> {
+            let identity = self.identity.as_ref().map_err(Clone::clone)?;
+            let world = identity
+                .runtime_key(worldspace_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "runtime worldspace has no identity".to_owned())?;
+            let cell = identity
+                .runtime_key(cell_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "runtime CELL has no identity".to_owned())?;
+            Ok((world.to_packed(), cell.to_packed()))
+        })();
+        let (worldspace_key, cell_key) = match resolve {
+            Ok(keys) => keys,
+            Err(reason) => return CellLookup::Invalid(reason),
+        };
+        let relative = terrain_chunk_path(worldspace_key, grid_x, grid_y);
+        match self.entry(&relative, worldspace_key) {
             ChunkEntry::Missing => CellLookup::NoData,
             ChunkEntry::Invalid(reason) => CellLookup::Invalid(reason.clone()),
             ChunkEntry::Open(bytes) => {
                 // SAFETY: `open_chunk` validated exactly these bytes with `rkyv::access`, and the
                 // mapping is never changed while it is held here.
-                let archived = unsafe { rkyv::access_unchecked::<ArchivedTerrainChunkFile>(bytes) };
+                let archived = unsafe {
+                    rkyv::access_unchecked::<ArchivedTerrainChunkFile>(
+                        &bytes[shared::pack_identity::IDENTITY_ENVELOPE_SIZE..],
+                    )
+                };
                 let Some(cell) = archived
                     .cells
                     .iter()
-                    .find(|cell| u32::from(cell.cell_id) == cell_id)
+                    .find(|cell| u64::from(cell.cell_id) == cell_key)
                 else {
                     return CellLookup::NoData;
                 };
@@ -195,7 +220,11 @@ impl ChunkStore {
     }
 }
 
-fn open_chunk(path: &Path, worldspace_id: u32) -> ChunkEntry {
+fn open_chunk(
+    path: &Path,
+    worldspace_id: u64,
+    identity: &shared::pack_identity::PackIdentity,
+) -> ChunkEntry {
     if !path.is_file() {
         return ChunkEntry::Missing;
     }
@@ -209,7 +238,11 @@ fn open_chunk(path: &Path, worldspace_id: u32) -> ChunkEntry {
         Ok(bytes) => bytes,
         Err(error) => return ChunkEntry::Invalid(describe(error.to_string())),
     };
-    match rkyv::access::<ArchivedTerrainChunkFile, RkyvError>(&bytes) {
+    let payload = match shared::cache_identity::terrain_chunk_payload(identity, &bytes) {
+        Ok(payload) => payload,
+        Err(error) => return ChunkEntry::Invalid(describe(error.to_string())),
+    };
+    match rkyv::access::<ArchivedTerrainChunkFile, RkyvError>(payload) {
         Err(error) => ChunkEntry::Invalid(describe(error.to_string())),
         Ok(chunk) if u32::from(chunk.format_version) != TERRAIN_MESH_FORMAT_VERSION => {
             ChunkEntry::Invalid(describe(format!(
@@ -217,10 +250,10 @@ fn open_chunk(path: &Path, worldspace_id: u32) -> ChunkEntry {
                 u32::from(chunk.format_version)
             )))
         }
-        Ok(chunk) if u32::from(chunk.worldspace_id) != worldspace_id => {
+        Ok(chunk) if u64::from(chunk.worldspace_id) != worldspace_id => {
             ChunkEntry::Invalid(describe(format!(
                 "chunk is for worldspace {:08X}, expected {worldspace_id:08X}",
-                u32::from(chunk.worldspace_id)
+                u64::from(chunk.worldspace_id)
             )))
         }
         Ok(_) => ChunkEntry::Open(bytes),
@@ -368,10 +401,28 @@ impl TerrainMerge {
     }
 }
 
+/// Authenticate the world's immutable allocation for identity-bearing terrain members.
+fn world_identity(root: &Path) -> Result<shared::pack_identity::PackIdentity, String> {
+    let database = rusqlite::Connection::open_with_flags(
+        root.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| {
+        format!("terrain has no authenticated world allocation; convert again: {error}")
+    })?;
+    shared::pack_identity::PackIdentity::read_sql(&database).map_err(|error| error.to_string())
+}
+
+/// Read the named portable table only after authenticating its containing world's allocation.
 fn read_table(path: &Path) -> Result<LandTextureTable, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+    let root = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "invalid land texture table path".to_owned())?;
+    let identity = world_identity(root)?;
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    LandTextureTable::from_portable_json(&bytes, &identity)
+        .map_err(|error| format!("land texture table {}: {error}", path.display()))
 }
 
 /// The device's verdict on the table, written once by the render world and read by the main one.
@@ -806,24 +857,76 @@ mod tests {
     use bevy::render::render_resource::{Extent3d, TextureViewDescriptor};
     use shared::terrain_mesh::TerrainChunkFile;
 
+    fn fixture_identity(root: Option<&Path>) -> shared::pack_identity::PackIdentity {
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x72; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let owner = table.id("Fixture.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+        if let Some(root) = root {
+            let mut connection = rusqlite::Connection::open(root.join("skyrim_world.db")).unwrap();
+            let tx = connection.transaction().unwrap();
+            identity.write_sql(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        identity
+    }
+
+    fn fixture_key(local: u64) -> u64 {
+        0x0100_0000 | local
+    }
+
+    fn fixture_mesh(mut cell: TerrainCellMesh) -> TerrainCellMesh {
+        cell.cell_id = fixture_key(cell.cell_id);
+        for slot in &mut cell.quadrant_slots {
+            if *slot != 0 {
+                *slot = fixture_key(*slot);
+            }
+        }
+        cell
+    }
+
+    fn fixture_table(textures: u16) -> LandTextureTable {
+        let mut table = vanilla_table(textures);
+        for entry in &mut table.entries {
+            if entry.ltex_form_id != 0 {
+                entry.ltex_form_id = fixture_key(entry.ltex_form_id);
+            }
+        }
+        table
+    }
+
     fn chunk_bytes(worldspace_id: u32, cells: Vec<TerrainCellMesh>) -> Vec<u8> {
-        rkyv::to_bytes::<RkyvError>(&TerrainChunkFile {
-            format_version: TERRAIN_MESH_FORMAT_VERSION,
-            worldspace_id,
-            cells,
-        })
+        shared::cache_identity::encode_terrain_chunk(
+            &fixture_identity(None),
+            &TerrainChunkFile {
+                format_version: TERRAIN_MESH_FORMAT_VERSION,
+                worldspace_id: fixture_key(u64::from(worldspace_id)),
+                cells: cells.into_iter().map(fixture_mesh).collect(),
+            },
+        )
         .unwrap()
-        .to_vec()
     }
 
     fn write_chunk(root: &Path, worldspace_id: u32, gx: i32, gy: i32, bytes: &[u8]) {
-        let path = root.join(terrain_chunk_path(worldspace_id, gx, gy));
+        fixture_identity(Some(root));
+        let path = root.join(terrain_chunk_path(
+            fixture_key(u64::from(worldspace_id)),
+            gx,
+            gy,
+        ));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
 
     fn ready(root: &Path) -> TerrainMerge {
-        let classes = Arc::new(TerrainClasses::from_table(vanilla_table(6)).unwrap());
+        fixture_identity(Some(root));
+        let classes = Arc::new(TerrainClasses::from_table(fixture_table(6)).unwrap());
         TerrainMerge::with_state(
             MergeState::Ready {
                 classes,
@@ -859,7 +962,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LAND_TEXTURE_TABLE_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_string(&vanilla_table(6)).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            fixture_table(6)
+                .to_portable_json(&fixture_identity(Some(dir.path())))
+                .unwrap(),
+        )
+        .unwrap();
         let merge = TerrainMerge::open(dir.path());
         assert!(matches!(merge.state, MergeState::AwaitingDevice(_)));
         assert!(merge.holds_cells());
@@ -871,9 +980,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LAND_TEXTURE_TABLE_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut table = vanilla_table(3);
+        let mut table = fixture_table(3);
         table.entries[2].id = 7;
-        std::fs::write(&path, serde_json::to_string(&table).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            table
+                .to_portable_json(&fixture_identity(Some(dir.path())))
+                .unwrap(),
+        )
+        .unwrap();
         let merge = TerrainMerge::open(dir.path());
         let MergeState::Refused(reason) = &merge.state else {
             panic!("expected a refusal, got {:?}", merge.state);
@@ -908,12 +1023,12 @@ mod tests {
         let mut merge = ready(dir.path());
 
         match merge.lookup(exterior(1, 1), 0xA1) {
-            CellLookup::Found(cell) => assert_eq!(*cell, known),
+            CellLookup::Found(cell) => assert_eq!(*cell, fixture_mesh(known)),
             other => panic!("expected the cell, got {other:?}"),
         }
         // Same chunk file, second cell: the FormID is not in the table, so validation refuses it.
         match merge.lookup(exterior(2, 3), 0xA2) {
-            CellLookup::Invalid(reason) => assert!(reason.contains("00000BAD"), "{reason}"),
+            CellLookup::Invalid(reason) => assert!(reason.contains("01000BAD"), "{reason}"),
             other => panic!("expected an invalid cell, got {other:?}"),
         }
         // The chunk exists but has no entry for this cell.
@@ -952,6 +1067,7 @@ mod tests {
     #[test]
     fn the_chunk_cache_is_bounded_and_rereads_evicted_chunks() {
         let dir = tempfile::tempdir().unwrap();
+        fixture_identity(Some(dir.path()));
         let mut store = ChunkStore::new(dir.path().to_path_buf());
         for chunk in 0..(CHUNK_CACHE_LIMIT as i32 + 10) {
             let _ = store.cell(0x3C, chunk * 4, 0, 1);

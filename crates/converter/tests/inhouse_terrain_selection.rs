@@ -123,12 +123,9 @@ fn land(id: u32, offset: f32, marker: u8) -> Vec<u8> {
     record(b"LAND", id, 0, &fields)
 }
 
-/// Inspect actual archived terrain, not a comparator's transformed presentation.
+/// Inspect authenticated terrain geometry with checked gameplay IDs for these fixtures.
 fn assert_terrain(output: &Path, height: f32, marker: u8) {
-    let cache = rkyv::from_bytes::<converter::shared::CellCache, rkyv::rancor::Error>(
-        &fs::read(output.join("cell_cache.rkyv")).unwrap(),
-    )
-    .unwrap();
+    let cache = common::runtime_cache(output, "cell_cache.rkyv");
     let cell = cache
         .cells
         .iter()
@@ -345,12 +342,7 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
             .artifacts
             .contains(&PathBuf::from("cell_cache_preserved.rkyv"))
     );
-    let read_cache = |name| {
-        rkyv::from_bytes::<converter::shared::CellCache, rkyv::rancor::Error>(
-            &fs::read(output.join(name)).unwrap(),
-        )
-        .unwrap()
-    };
+    let read_cache = |name| common::runtime_cache(&output, name);
     let runtime = read_cache("cell_cache.rkyv");
     let preserved = read_cache("cell_cache_preserved.rkyv");
     let runtime = runtime

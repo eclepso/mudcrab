@@ -231,7 +231,8 @@ fn rv_a_checked_schema_defers_then_really_rejects_missing_rank_alternative() {
     };
     let prepared = decoder::prepare_schema(&schema);
     let context = decoder::Context {
-        order: &order,
+        native: None,
+        order: Some(&order),
         plugin_index: 1,
         localized: false,
         source_ids: None,
@@ -656,7 +657,8 @@ fn rv_a_injected_baseline_failure_omits_unresolved_first_definition_fields() {
     let prepared = decoder::prepare_schema(&schema);
     let mut first_pass = None;
     let context = decoder::Context {
-        order: &order,
+        native: None,
+        order: Some(&order),
         plugin_index: 4,
         localized: false,
         source_ids: None,

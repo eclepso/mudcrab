@@ -33,6 +33,70 @@ pub const CONVERTER_SCHEMA_VERSION: u32 = shared::LOD_CONVERTER_SCHEMA_VERSION;
 /// been published.
 pub const STAGING_JOURNAL_FILE: &str = ".conversion-staging-journal.jsonl";
 
+/// Generation proof written before a new run creates identity-bearing staging payloads.
+pub const STAGING_GENERATION_FILE: &str = ".conversion-generation.json";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingGeneration {
+    converter_schema: u32,
+    world_database_schema: u32,
+}
+
+/// Only a new staging directory can acquire this stamp; existing payloads are never restamped.
+pub(crate) fn write_staging_generation(staging: &Path) -> Result<()> {
+    let path = staging.join(STAGING_GENERATION_FILE);
+    if path.exists() {
+        return validate_staging_generation(staging);
+    }
+    color_eyre::eyre::ensure!(
+        ![
+            "skyrim_world.db",
+            "conversion-manifest.json",
+            STAGING_JOURNAL_FILE
+        ]
+        .iter()
+        .any(|name| staging.join(name).exists()),
+        "staging payloads have no generation proof; convert again into a fresh staging directory"
+    );
+    let generation = StagingGeneration {
+        converter_schema: CONVERTER_SCHEMA_VERSION,
+        world_database_schema: shared::WORLD_DATABASE_SCHEMA_VERSION,
+    };
+    fs::write(path, serde_json::to_vec_pretty(&generation)?)?;
+    Ok(())
+}
+
+/// Refuse old or unproven resume generations before reading their payloads.
+pub(crate) fn validate_staging_generation(staging: &Path) -> Result<()> {
+    let generation: StagingGeneration = serde_json::from_slice(
+        &fs::read(staging.join(STAGING_GENERATION_FILE))
+            .wrap_err("resume staging has no generation proof; convert again")?,
+    )
+    .wrap_err("resume staging generation is invalid; convert again")?;
+    color_eyre::eyre::ensure!(
+        generation.converter_schema == CONVERTER_SCHEMA_VERSION
+            && generation.world_database_schema == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "resume staging uses an old or unsupported generation; convert again"
+    );
+    let database = staging.join("skyrim_world.db");
+    if database.exists() {
+        shared::world_assets::validate_world_database(&database)?;
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        shared::records::RecordContextReader::new(&connection)
+            .wrap_err("resume world context is invalid; convert again")?;
+    }
+    let manifest_path = staging.join("conversion-manifest.json");
+    if manifest_path.exists() {
+        let manifest: ConversionManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+        manifest.validate_world_generation(staging)?;
+    }
+    Ok(())
+}
+
 /// What a staged output was produced from, as recorded when it was written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedOutput {
@@ -366,6 +430,9 @@ impl IngestionJournal {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversionManifest {
     pub schema_version: u32,
+    /// Exact owner allocation/source proof of every identity-bearing member in this generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_table_digest: Option<String>,
     /// Metadata-only rebuilds do not upgrade the retained mesh cache contract.
     /// Absent means the meshes follow `schema_version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,6 +543,34 @@ pub(crate) fn mesh_output_contracts_apply(schema: u32) -> bool {
 }
 
 impl ConversionManifest {
+    /// Shared refusal boundary for warm identity data, repair and metadata-only rebuilds.
+    /// Old manifests may be inspected as source evidence, but never certify current payloads.
+    pub fn validate_world_generation(
+        &self,
+        root: &Path,
+    ) -> Result<shared::pack_identity::PackIdentity> {
+        color_eyre::eyre::ensure!(
+            self.schema_version == CONVERTER_SCHEMA_VERSION,
+            "converted assets use converter schema {}; convert again with converter schema {CONVERTER_SCHEMA_VERSION}",
+            self.schema_version
+        );
+        let path = root.join("skyrim_world.db");
+        shared::world_assets::validate_world_database(&path)?;
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let identity = shared::pack_identity::PackIdentity::read_sql(&connection)
+            .wrap_err("world allocation is invalid; convert again")?;
+        color_eyre::eyre::ensure!(
+            self.plugin_table_digest.as_deref() == Some(identity.digest_hex().as_str()),
+            "conversion manifest does not authenticate this world's owner allocation; convert again"
+        );
+        shared::records::RecordContextReader::new(&connection)
+            .wrap_err("world native context is invalid; convert again")?;
+        Ok(identity)
+    }
+
     /// Load archive candidates independently of converted-output producer eligibility.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.is_file() {
@@ -488,6 +583,18 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
+        if manifest.schema_version == CONVERTER_SCHEMA_VERSION
+            && path
+                .parent()
+                .is_some_and(|root| root.join("skyrim_world.db").exists())
+            && manifest
+                .validate_world_generation(path.parent().expect("manifest parent"))
+                .is_err()
+        {
+            manifest.complete = false;
+            manifest.derived_outputs.clear();
+            manifest.extensions.clear();
+        }
         let metadata_rebuild = path
             .parent()
             .is_some_and(|root| root.join("metadata-rebuild.json").exists());

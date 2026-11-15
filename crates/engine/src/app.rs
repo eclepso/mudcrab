@@ -56,6 +56,7 @@ use serde::Deserialize;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -67,6 +68,16 @@ struct InitialWorldCameraPose {
     shot: crate::shots::Shot,
     aspect: f32,
     resolution: bevy::window::WindowResolution,
+}
+
+/// Resolve external requests only after authenticating the adjacent converted world.
+fn request_identity(config: &EngineConfig) -> Result<Arc<shared::pack_identity::PackIdentity>> {
+    let path = config.assets_dir.join("skyrim_world.db");
+    shared::world_assets::validate_world_database(&path)?;
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(Arc::new(shared::pack_identity::PackIdentity::read_sql(
+        &connection,
+    )?))
 }
 
 fn prepare_start_camera(
@@ -98,7 +109,8 @@ fn prepare_start_camera(
             && !config.physics_fixture,
         "--start-shot requires a live world run without another automated camera mode"
     );
-    let file = ShotsFile::load(path)?;
+    let identity = request_identity(config)?;
+    let file = ShotsFile::load_with_identity(path, &identity)?;
     color_eyre::eyre::ensure!(
         file.shots.len() == 1 && file.shots[0].is_exterior(),
         "--start-shot requires exactly one exterior camera pose"
@@ -107,6 +119,7 @@ fn prepare_start_camera(
     config.start_grid = grid;
     if let Some(worldspace) = worldspace {
         config.worldspace_id = worldspace;
+        config.worldspace_name = Some(crate::config::named_runtime_request(&identity, worldspace)?);
     }
     if let Some((settings, settings_file)) = preferences {
         settings_file.apply_start_shot(
@@ -134,6 +147,24 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .then(|| crate::settings::prepare_settings(&mut config));
     // A saved profile can disagree with an explicit launch option the parser already accepted.
     config.check_visual_profile()?;
+    let real_world = !(config.streaming_fixture
+        || config.benchmark_only
+        || config.material_fixture
+        || config.terrain_water_fixture
+        || config.transform_bounds_fixture
+        || config.renderer_fixture
+        || config.physics_fixture);
+    let early_asset_lock = if real_world {
+        Some(shared::asset_lock::AssetLock::acquire_shared(
+            &config.assets_dir,
+        )?)
+    } else {
+        None
+    };
+    if real_world {
+        let identity = request_identity(&config)?;
+        config.resolve_pack_identity(&identity)?;
+    }
     config.image_space_selection()?;
     let start_camera = prepare_start_camera(&mut config, preferences.as_mut())?;
     let shots = prepare_shots(&mut config)?;
@@ -144,6 +175,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
+        let identity = request_identity(&config)?;
+        config.resolve_pack_identity(&identity)?;
         Some(fixture)
     } else {
         None
@@ -156,7 +189,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             || config.transform_bounds_fixture
             || config.renderer_fixture
             || config.physics_fixture);
-    let asset_lock = if reads_asset_tree {
+    let asset_lock = if early_asset_lock.is_some() {
+        early_asset_lock
+    } else if reads_asset_tree {
         Some(
             shared::asset_lock::AssetLock::acquire_shared(&config.assets_dir).wrap_err_with(
                 || {
@@ -718,15 +753,21 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         // The logger is not installed yet, so a `warn!` here would never be seen.
         eprintln!("warning: {mode} photographs the window, so --headless is ignored");
     }
+    let identity = request_identity(config)?;
     let (file, checkpoints) = if config.matched_route.is_some() {
-        let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
+        let (file, checkpoints) =
+            crate::matched_route::MatchedRoute::load_with_identity(&path, &identity)?.expand()?;
         (file, Some(checkpoints))
     } else {
-        (ShotsFile::load(&path)?, None)
+        (ShotsFile::load_with_identity(&path, &identity)?, None)
     };
     if let Some((worldspace_id, grid)) = file.start() {
         if let Some(worldspace_id) = worldspace_id {
             config.worldspace_id = worldspace_id;
+            config.worldspace_name = Some(crate::config::named_runtime_request(
+                &identity,
+                worldspace_id,
+            )?);
         }
         config.start_grid = grid;
     }
@@ -735,6 +776,7 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         .clone()
         .unwrap_or_else(|| default_output_dir(&path));
     let mut run = ShotsRun::new(file, output_dir, config.worldspace_id);
+    run.bind_identity(identity)?;
     run.route_checkpoints = checkpoints;
     run.settle_timeout_seconds = config.shots_settle_timeout;
     Ok(Some(run))
@@ -767,8 +809,10 @@ fn prepare_route(config: &mut EngineConfig) -> Result<Option<RoutePlan>> {
             "warning: --route without --benchmark-frames or --benchmark-duration moves the camera but writes no report"
         );
     }
-    let plan = RoutePlan::load(&path)?;
+    let identity = request_identity(config)?;
+    let plan = RoutePlan::load_with_identity(&path, &identity)?;
     config.worldspace_id = plan.worldspace;
+    config.worldspace_name = plan.worldspace_name.clone();
     config.start_grid = plan.start_grid();
     Ok(Some(plan))
 }
@@ -923,7 +967,25 @@ impl StreamingFixtureDirectory {
 
     fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
         let database_path = self.path.join("skyrim_world.db");
-        let connection = Connection::open(&database_path)?;
+        let mut connection = Connection::open(&database_path)?;
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x5D; 32]),
+                ..Default::default()
+            },
+        )])?;
+        let owner = table.id("Fixture.esm").expect("fixture owner");
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![owner])?;
+        let transaction = connection.transaction()?;
+        identity.write_sql(&transaction)?;
+        transaction.commit()?;
+        let stored = |runtime| -> Result<i64> {
+            Ok(identity
+                .runtime_key(runtime)?
+                .ok_or_else(|| color_eyre::eyre::eyre!("fixture requires a non-null identity"))?
+                .to_sql_i64())
+        };
         connection.execute("CREATE TABLE schema_info(version INTEGER NOT NULL)", [])?;
         connection.execute(
             "INSERT INTO schema_info VALUES(?1)",
@@ -946,29 +1008,34 @@ impl StreamingFixtureDirectory {
         )?;
         connection.execute(
             "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES(?1,'Fixture',NULL,0,?2,?3)",
-            params![worldspace_id, start_grid.0, start_grid.1],
+            params![stored(worldspace_id)?, start_grid.0, start_grid.1],
         )?;
         let mut insert = connection
             .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
         let mut cell_id = 1u32;
         for grid_y in start_grid.1.saturating_sub(48)..=start_grid.1.saturating_add(48) {
             for grid_x in start_grid.0.saturating_sub(48)..=start_grid.0.saturating_add(48) {
-                insert.execute(params![cell_id, worldspace_id, grid_x, grid_y])?;
+                insert.execute(params![
+                    stored(cell_id)?,
+                    stored(worldspace_id)?,
+                    grid_x,
+                    grid_y
+                ])?;
                 cell_id += 1;
             }
         }
         drop(insert);
         connection.execute(
             "INSERT INTO cells(id,worldspace_id,grid_x,grid_y,interior_name) VALUES(?1,NULL,NULL,NULL,'Fixture Hall')",
-            params![STREAMING_FIXTURE_INTERIOR_CELL_ID],
+            params![stored(STREAMING_FIXTURE_INTERIOR_CELL_ID)?],
         )?;
         connection.execute(
             "INSERT INTO \"references\"(id,cell_id,base_form_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale)
              VALUES(?1,?2,?3,256.0,0.0,192.0,0.0,0.0,0.0,1.0)",
             params![
-                STREAMING_FIXTURE_INTERIOR_REFERENCE_ID,
-                STREAMING_FIXTURE_INTERIOR_CELL_ID,
-                STREAMING_FIXTURE_INTERIOR_REFERENCE_ID
+                stored(STREAMING_FIXTURE_INTERIOR_REFERENCE_ID)?,
+                stored(STREAMING_FIXTURE_INTERIOR_CELL_ID)?,
+                stored(STREAMING_FIXTURE_INTERIOR_REFERENCE_ID)?
             ],
         )?;
         drop(connection);
@@ -976,7 +1043,7 @@ impl StreamingFixtureDirectory {
             version: shared::CELL_CACHE_VERSION,
             cells: Vec::new(),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
+        let bytes = shared::cache_identity::encode_cell_cache(&identity, &cache, false)
             .wrap_err("failed to archive streaming fixture cache")?;
         fs::write(self.path.join("cell_cache.rkyv"), bytes)?;
         Ok(())
@@ -2054,6 +2121,8 @@ fn validate_renderer_fixture(
 #[derive(Deserialize)]
 struct RuntimeManifest {
     schema_version: u32,
+    #[serde(default)]
+    plugin_table_digest: Option<String>,
     complete: bool,
 }
 
@@ -2064,6 +2133,15 @@ struct RuntimeIntegrationReport {
 }
 
 fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
+    // --allow-incomplete-assets relaxes completeness only; every world must be this generation.
+    shared::world_assets::validate_world_database(&config.assets_dir.join("skyrim_world.db"))?;
+    let context_connection = Connection::open_with_flags(
+        config.assets_dir.join("skyrim_world.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    shared::records::RecordContextReader::new(&context_connection)
+        .wrap_err("world native context is invalid; convert again")?;
+    shared::world_assets::validate_runtime_cell_cache(&config.assets_dir)?;
     for required in ["skyrim_world.db", "cell_cache.rkyv"] {
         color_eyre::eyre::ensure!(
             config.assets_dir.join(required).is_file(),
@@ -2084,6 +2162,11 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", manifest_path.display()))?,
     )
     .wrap_err("invalid conversion manifest")?;
+    let identity = request_identity(config)?;
+    color_eyre::eyre::ensure!(
+        manifest.plugin_table_digest.as_deref() == Some(identity.digest_hex().as_str()),
+        "conversion manifest does not authenticate this world's owner allocation; convert again"
+    );
     if !(shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter_schema_version())
         .contains(&manifest.schema_version)
     {
@@ -2186,7 +2269,7 @@ fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) 
     match rejection {
         AssetSetRejection::ConverterSchemaOlder { found } => format!(
             "converted assets are stale: {} was written by converter schema {found}, but this \
-             engine accepts converter schemas {converter_min} through {converter_max}; reconvert \
+             engine accepts converter schemas {converter_min} through {converter_max}; convert again \
              with `{reconvert}` (the converter reuses what it can from the previous conversion)",
             manifest.display()
         ),
@@ -2207,7 +2290,7 @@ fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) 
         AssetSetRejection::WorldDatabaseSchema { found } => format!(
             "the converted assets use an unsupported world database schema: {} reports world \
              database schema {found} is unsupported; this engine accepts world database schemas \
-             {database_min} through {database_max}; reconvert with a converter built from the \
+             {database_min} through {database_max}; convert again with a converter built from the \
              same revision as this engine: `{reconvert}`",
             report.display()
         ),
@@ -2531,6 +2614,7 @@ fn initial_walk_ground_height(
     }
     let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
+    shared::world_assets::install_runtime_identity_functions(&connection)?;
     let cell_id = connection
         .query_row(
             crate::world::database::EXTERIOR_CELL_ID_SQL,
@@ -2566,6 +2650,7 @@ fn cell_centre_ground_height(
 ) -> Result<Option<f32>> {
     let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
+    shared::world_assets::install_runtime_identity_functions(&connection)?;
     let cell_id = connection
         .query_row(
             crate::world::database::EXTERIOR_CELL_ID_SQL,

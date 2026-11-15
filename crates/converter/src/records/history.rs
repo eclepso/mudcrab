@@ -2,7 +2,7 @@
 use super::{DecodedRecord, PluginDiagnostics, Value, addons::RuntimeSchemas, decoder, scanner};
 use crate::esm::{binary::PluginMetadata, load_order::LoadOrder};
 use color_eyre::{Result, eyre::ensure};
-use rusqlite::{Connection, OpenFlags, Statement, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Statement, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -101,17 +101,8 @@ pub(crate) fn write_tables(
     write_tables_with_schemas(conn, entries, order, paths, &schemas)
 }
 
-/// Atomically retain the exact ordered add-ons beside their producing history snapshot.
-/// Configuration is already validated before conversion; this persists reproducible bytes.
-pub(crate) fn write_tables_with_schemas(
-    conn: &Connection,
-    entries: &[HistoryEntry],
-    order: &LoadOrder,
-    paths: &[PathBuf],
-    schemas: &RuntimeSchemas,
-) -> Result<()> {
-    // Complete conversion replaces this owned tooling snapshot atomically with provenance.
-    // Recreate the owned tables so retained history and add-on bytes cannot become stale.
+/// Recreate one complete history snapshot inside its caller transaction.
+fn create_history_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS inhouse_schema_addons;
         CREATE TABLE inhouse_schema_addons(
         ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, sha256 TEXT NOT NULL,
@@ -132,6 +123,21 @@ pub(crate) fn write_tables_with_schemas(
         PRIMARY KEY(plugin_id,source_record_offset)) WITHOUT ROWID;
         CREATE INDEX record_overrides_chain ON record_overrides(form_id,chain_position);
         CREATE INDEX record_overrides_source ON record_overrides(original_owner,full_local,plugin_id,source_record_offset);")?;
+    Ok(())
+}
+
+/// Atomically retain the exact ordered add-ons beside their producing history snapshot.
+/// Configuration is already validated before conversion; this persists reproducible bytes.
+pub(crate) fn write_tables_with_schemas(
+    conn: &Connection,
+    entries: &[HistoryEntry],
+    order: &LoadOrder,
+    paths: &[PathBuf],
+    schemas: &RuntimeSchemas,
+) -> Result<()> {
+    // Complete conversion replaces this owned tooling snapshot atomically with provenance.
+    // Recreate the owned tables so retained history and add-on bytes cannot become stale.
+    create_history_tables(conn)?;
     write_master_table(conn, order)?;
     let mut addon_insert = conn.prepare(
         "INSERT INTO inhouse_schema_addons(ordinal,name,sha256,schema_json) VALUES(?1,?2,?3,?4)",
@@ -247,6 +253,216 @@ fn write_master_table(conn: &Connection, order: &LoadOrder) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Publish native physical history and schema provenance in the complete world transaction.
+/// Semantic row identities use authenticated eight-byte keys; original source facts stay native.
+pub fn write_native_tables(
+    tx: &rusqlite::Transaction<'_>,
+    result: &super::native::NativeReadResult,
+    identity: &shared::pack_identity::PackIdentity,
+    paths: &[PathBuf],
+    schemas: &RuntimeSchemas,
+) -> Result<()> {
+    ensure!(
+        paths.len() == identity.order().len(),
+        "native history source/order mismatch"
+    );
+    ensure!(
+        shared::pack_identity::PackIdentity::read_sql(tx)?.digest() == identity.digest(),
+        "native history belongs to a different pack allocation"
+    );
+    create_history_tables(tx)?;
+    tx.execute_batch("DROP TABLE IF EXISTS inhouse_plugin_masters;
+        CREATE TABLE inhouse_plugin_masters(plugin_id INTEGER NOT NULL, master_index INTEGER NOT NULL CHECK(master_index>=0), master_name TEXT NOT NULL, PRIMARY KEY(plugin_id,master_index)) WITHOUT ROWID;")?;
+    let mut masters = tx.prepare("INSERT INTO inhouse_plugin_masters VALUES(?1,?2,?3)")?;
+    for (priority, &plugin) in identity.order().iter().enumerate() {
+        let entry = identity
+            .table()
+            .entry(plugin)
+            .expect("authenticated source order");
+        for (index, name) in entry.facts.masters.iter().enumerate() {
+            masters.execute(params![priority as u64, index as u64, name])?;
+        }
+    }
+    let mut addons = tx.prepare("INSERT INTO inhouse_schema_addons VALUES(?1,?2,?3,?4)")?;
+    for (ordinal, (addon, bytes)) in schemas
+        .identities()
+        .iter()
+        .zip(schemas.addon_bytes())
+        .enumerate()
+    {
+        addons.execute(params![ordinal as u64, addon.name, addon.sha256, bytes])?;
+    }
+    let paths = paths
+        .iter()
+        .map(|path| path.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut sorted: Vec<_> = result.history.iter().collect();
+    sorted.sort_unstable_by_key(|entry| (entry.key, entry.supplier, entry.source_offset));
+    let mut positions = HashMap::new();
+    let mut counts = HashMap::<Option<shared::form_key::FormKey>, u32>::new();
+    for entry in &sorted {
+        let next = counts.entry(entry.key).or_default();
+        positions.insert((entry.supplier, entry.source_offset), *next);
+        *next += 1;
+    }
+    sorted.sort_unstable_by_key(|entry| (entry.supplier, entry.source_offset));
+    let mut insert = tx.prepare("INSERT INTO record_overrides VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)")?;
+    for entry in sorted {
+        let path = paths
+            .get(entry.supplier)
+            .ok_or_else(|| color_eyre::eyre::eyre!("unknown native history supplier"))?;
+        let key = entry
+            .key
+            .map(|key| identity.required_key(key.to_sql_i64()))
+            .transpose()?;
+        let source = super::source_identity::resolve_native(
+            &entry.signature,
+            entry.source_word,
+            entry.supplier,
+            identity,
+        );
+        let header = entry.signature == *b"TES4";
+        insert.execute(params![
+            key.map(shared::form_key::FormKey::to_sql_i64),
+            positions[&(entry.supplier, entry.source_offset)],
+            entry.supplier as u64,
+            entry.source_word,
+            entry.deleted,
+            String::from_utf8_lossy(&entry.signature),
+            entry.flags,
+            entry.source_offset,
+            entry.source_record_size,
+            if header {
+                "header"
+            } else if entry.accepted {
+                "accepted"
+            } else {
+                "skipped"
+            },
+            entry.reason,
+            entry.source_cell_form_id,
+            entry.source_worldspace_form_id,
+            entry.source_topic_form_id,
+            entry.topic_group_offset,
+            header.then(|| path.to_string_lossy()),
+            header.then(|| schemas.schema_sha256()),
+            source.original_owner,
+            source.full_local,
+            source.state.as_str(),
+            entry.source_group_end,
+            entry.frame_complete,
+            entry.signature.as_slice()
+        ])?;
+    }
+    Ok(())
+}
+
+/// One stored native version; IDs here are explicit source facts, never runtime indices.
+#[derive(Debug, Serialize)]
+pub struct NativeHistoryVersion {
+    pub chain_position: u32,
+    pub plugin: String,
+    pub plugin_id: u32,
+    pub source_form_id: u32,
+    pub deleted: bool,
+    pub record_type: String,
+    pub flags: u32,
+    pub source_record_offset: u64,
+    pub source_record_size: u32,
+    pub status: String,
+    pub reason: Option<String>,
+    pub source_cell_form_id: Option<u32>,
+    pub source_worldspace_form_id: Option<u32>,
+    pub source_topic_form_id: Option<u32>,
+    pub topic_group_offset: Option<u64>,
+    pub source_group_end: u64,
+    pub frame_complete: bool,
+    pub original_owner: Option<String>,
+    pub full_local: Option<u32>,
+    pub source_identity_state: String,
+    pub winner: bool,
+}
+
+/// Portable native history keeps semantic identity named and bounds malformed duplicate chains.
+#[derive(Debug, Serialize)]
+pub struct NativeHistoryReport {
+    pub form_id: shared::form_key::NamedFormKey,
+    pub versions: Vec<NativeHistoryVersion>,
+    pub total_versions: u64,
+    pub truncated: bool,
+}
+
+/// Authenticate a native generation before reading its eight-byte override-chain keys.
+/// Losing payloads stay in their original plugins and are not loaded by this metadata query.
+pub fn read_native_chain(
+    path: &Path,
+    form: &shared::form_key::NamedFormKey,
+) -> Result<NativeHistoryReport> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    let key = identity
+        .table()
+        .intern(form)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("null has no native override chain"))?;
+    let total_versions: u64 = connection.query_row(
+        "SELECT count(*) FROM record_overrides WHERE form_id=?1",
+        [key.to_sql_i64()],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare("SELECT chain_position,plugin_id,source_form_id,deleted,record_type,flags,source_record_offset,source_record_size,status,reason,source_cell_form_id,source_worldspace_form_id,source_topic_form_id,topic_group_offset,source_group_end,frame_complete,original_owner,full_local,source_identity_state FROM record_overrides WHERE form_id=?1 ORDER BY chain_position LIMIT 4096")?;
+    let mut rows = statement.query([key.to_sql_i64()])?;
+    let mut versions = Vec::new();
+    while let Some(row) = rows.next()? {
+        let priority: u32 = row.get(1)?;
+        let supplier = identity
+            .order()
+            .get(priority as usize)
+            .and_then(|id| identity.table().entry(*id))
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("native history has an unknown supplier; convert again")
+            })?;
+        versions.push(NativeHistoryVersion {
+            chain_position: row.get(0)?,
+            plugin: supplier.display_name.clone(),
+            plugin_id: priority,
+            source_form_id: row.get(2)?,
+            deleted: row.get(3)?,
+            record_type: row.get(4)?,
+            flags: row.get(5)?,
+            source_record_offset: row.get(6)?,
+            source_record_size: row.get(7)?,
+            status: row.get(8)?,
+            reason: row.get(9)?,
+            source_cell_form_id: row.get(10)?,
+            source_worldspace_form_id: row.get(11)?,
+            source_topic_form_id: row.get(12)?,
+            topic_group_offset: row.get(13)?,
+            source_group_end: row.get(14)?,
+            frame_complete: row.get(15)?,
+            original_owner: row.get(16)?,
+            full_local: row.get(17)?,
+            source_identity_state: row.get(18)?,
+            winner: false,
+        });
+    }
+    // A later deletion is authoritative even when metadata output is bounded.
+    let winner: Option<(u32,u64,bool)> = connection.query_row("SELECT plugin_id,source_record_offset,deleted FROM record_overrides WHERE form_id=?1 AND status='accepted' ORDER BY chain_position DESC LIMIT 1", [key.to_sql_i64()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+    if let Some((supplier, offset, false)) = winner
+        && let Some(version) = versions
+            .iter_mut()
+            .find(|version| version.plugin_id == supplier && version.source_record_offset == offset)
+    {
+        version.winner = true;
+    }
+    let truncated = total_versions > versions.len() as u64;
+    Ok(NativeHistoryReport {
+        form_id: identity.table().named(key)?,
+        versions,
+        total_versions,
+        truncated,
+    })
 }
 
 /// Header/source facts and the independently decoded result for one version.
@@ -463,7 +679,8 @@ fn decode_version<'a>(
         payload,
     };
     let context = decoder::Context {
-        order,
+        native: None,
+        order: Some(order),
         plugin_index: entry.plugin_index as usize,
         localized: order.metadata[entry.plugin_index as usize].flags & 0x80 != 0,
         source_ids: Some(source_ids()?),

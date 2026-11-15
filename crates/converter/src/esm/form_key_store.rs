@@ -15,7 +15,7 @@ use shared::{
 use std::path::PathBuf;
 
 /// Source archive version, independent of runtime world and native plugin versions.
-pub const SOURCE_ARCHIVE_VERSION: u32 = 1;
+pub const SOURCE_ARCHIVE_VERSION: u32 = 2;
 
 /// One restored source winner. Raw words always belong to `supplier`, not to its owner.
 #[derive(Debug)]
@@ -74,7 +74,7 @@ impl FormKeyConversion {
             "CREATE TABLE source_archive (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL, scope TEXT NOT NULL CHECK(scope='diagnostic_source_only'));
              CREATE TABLE source_records (key INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, supplier INTEGER NOT NULL REFERENCES pack_plugins(id), source_word INTEGER NOT NULL, signature BLOB NOT NULL CHECK(length(signature)=4), flags INTEGER NOT NULL, source_cell INTEGER, source_world INTEGER, cell_key INTEGER, world_key INTEGER);
              CREATE TABLE source_fields (record_key INTEGER NOT NULL REFERENCES source_records(key), ordinal INTEGER NOT NULL, signature BLOB NOT NULL CHECK(length(signature)=4), data BLOB NOT NULL, PRIMARY KEY(record_key,ordinal));
-             CREATE TABLE source_links (record_key INTEGER NOT NULL, field_ordinal INTEGER NOT NULL, byte_offset INTEGER NOT NULL, source_word INTEGER NOT NULL, target_key INTEGER, PRIMARY KEY(record_key,field_ordinal,byte_offset), FOREIGN KEY(record_key,field_ordinal) REFERENCES source_fields(record_key,ordinal));
+             CREATE TABLE source_links (record_key INTEGER NOT NULL, field_ordinal INTEGER NOT NULL, byte_offset INTEGER NOT NULL, source_word INTEGER NOT NULL, target_key INTEGER, outcome TEXT NOT NULL CHECK(outcome IN ('resolved','null','cleared')), PRIMARY KEY(record_key,field_ordinal,byte_offset), FOREIGN KEY(record_key,field_ordinal) REFERENCES source_fields(record_key,ordinal));
              CREATE TABLE source_messages (severity TEXT NOT NULL CHECK(severity IN ('warning','notice')), ordinal INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY(severity,ordinal));",
         )?;
         transaction.execute(
@@ -87,7 +87,7 @@ impl FormKeyConversion {
             let mut fields =
                 transaction.prepare("INSERT INTO source_fields VALUES(?1,?2,?3,?4)")?;
             let mut links =
-                transaction.prepare("INSERT INTO source_links VALUES(?1,?2,?3,?4,?5)")?;
+                transaction.prepare("INSERT INTO source_links VALUES(?1,?2,?3,?4,?5,?6)")?;
             for (sequence, (_, key, record)) in ordered.into_iter().enumerate() {
                 let supplier = *identity
                     .order()
@@ -128,7 +128,8 @@ impl FormKeyConversion {
                         link.subrecord as i64,
                         link.byte_offset as i64,
                         link.source_word,
-                        link.key.map(FormKey::to_sql_i64)
+                        link.key.map(FormKey::to_sql_i64),
+                        link.outcome.as_str()
                     ])?;
                 }
             }
@@ -167,7 +168,27 @@ fn validate_link_context(
     supplier: PluginId,
     link: &super::form_key_merge::ResolvedLink,
 ) -> Result<()> {
-    validate_source_context(identity, supplier, Some(link.source_word), link.key)
+    use super::form_key_merge::LinkOutcome;
+    match link.outcome {
+        LinkOutcome::Cleared => {
+            ensure!(
+                link.source_word != 0 && link.key.is_none(),
+                "invalid cleared source link"
+            );
+            Ok(())
+        }
+        LinkOutcome::Null => {
+            ensure!(
+                link.source_word == 0 && link.key.is_none(),
+                "invalid null source link"
+            );
+            Ok(())
+        }
+        LinkOutcome::Resolved => {
+            ensure!(link.key.is_some(), "resolved source link lacks target");
+            validate_source_context(identity, supplier, Some(link.source_word), link.key)
+        }
+    }
 }
 
 /// Authenticate optional field/group keys using the same native rules as record admission.
@@ -267,7 +288,7 @@ impl SourceArchive {
                 source.subrecords.push((signature, field.get(2)?));
             }
             let mut links = Vec::new();
-            let mut sites = connection.prepare("SELECT field_ordinal,byte_offset,source_word,target_key FROM source_links WHERE record_key=?1 ORDER BY field_ordinal,byte_offset")?;
+            let mut sites = connection.prepare("SELECT field_ordinal,byte_offset,source_word,target_key,outcome FROM source_links WHERE record_key=?1 ORDER BY field_ordinal,byte_offset")?;
             let mut sites = sites.query([key.to_sql_i64()])?;
             while let Some(site) = sites.next()? {
                 let subrecord: usize = site.get(0)?;
@@ -284,6 +305,12 @@ impl SourceArchive {
                     byte_offset: site.get(1)?,
                     source_word: site.get(2)?,
                     key: identity.optional_key(site.get(3)?)?,
+                    outcome: match site.get::<_, String>(4)?.as_str() {
+                        "resolved" => super::form_key_merge::LinkOutcome::Resolved,
+                        "null" => super::form_key_merge::LinkOutcome::Null,
+                        "cleared" => super::form_key_merge::LinkOutcome::Cleared,
+                        _ => color_eyre::eyre::bail!("invalid source link outcome"),
+                    },
                 };
                 validate_site(&source, &link)?;
                 validate_link_context(&identity, supplier, &link)?;
@@ -329,7 +356,7 @@ impl SourceArchive {
             for link in &record.links {
                 links.push(serde_json::json!({
                     "subrecord": link.subrecord, "signature": String::from_utf8_lossy(&link.signature),
-                    "byte_offset": link.byte_offset, "source_word": link.source_word, "target": named(link.key)?,
+                    "byte_offset": link.byte_offset, "source_word": link.source_word, "target": named(link.key)?, "outcome":link.outcome.as_str(),
                 }));
             }
             records.push(serde_json::json!({

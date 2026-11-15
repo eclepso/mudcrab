@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Capture repeated Riverwood startups; counters never establish pixel coverage."""
 
+
 import argparse
 from contextlib import contextmanager
 import csv
@@ -18,6 +19,9 @@ import sys
 import time
 from datetime import datetime, timezone
 import zlib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from form_key_identity import PackIdentity, TAMRIEL, named, require_schema
 
 
 INPUT_FILES = (
@@ -314,8 +318,16 @@ def analyze_run(directory, manifest):
             failures.append(f"final gauge {key} is not zero: {value!r}")
     if object_field(report, "renderer", failures, "report renderer").get("renderer_validation_failures") != 0:
         failures.append("renderer validation failures are nonzero or missing")
-    for key, expected in (("worldspace_id", 60), ("start_grid", [5, -12]), ("stream_radius", 2)):
-        if metadata.get(key) != expected:
+    if metadata.get("format_version") != 3:
+        failures.append("profile identity format is unsupported; regenerate the capture")
+    for key, expected in (("worldspace_id", TAMRIEL), ("start_grid", [5, -12]), ("stream_radius", 2)):
+        observed = metadata.get(key)
+        if key == "worldspace_id":
+            try:
+                observed, expected = named(observed), named(expected)
+            except ValueError:
+                observed = None
+        if observed != expected:
             failures.append(f"profile {key} differs from the requested camera/scene")
     timeline = profile.get("timeline", [])
     if not isinstance(timeline, list):
@@ -439,7 +451,7 @@ def stop_owned_group(process):
 
 def engine_command(args, directory, budget, run_id):
     return shlex.split(args.launch_prefix) + [
-        str(args.engine), "--assets", str(args.assets), "--worldspace", "0x3c",
+        str(args.engine), "--assets", str(args.assets), "--worldspace", TAMRIEL,
         "--grid-x", "5", "--grid-y", "-12", "--stream-radius", "2",
         "--max-upload-mib-per-frame", str(budget), "--auto-fly-speed", "0",
         "--benchmark-duration", str(args.duration), "--benchmark-warmup-frames", str(args.warmup),
@@ -470,7 +482,7 @@ def run_one(args, directory, budget, run_id, environment):
         "engine": str(args.engine), "assets": str(args.assets), "command": command,
         "cwd": str(directory), "upload_budget_mib": budget, "warmup_frames": args.warmup,
         "duration_seconds": args.duration, "timeout_seconds": args.timeout,
-        "worldspace": 60, "start_grid": [5, -12], "stream_radius": 2,
+        "identity_schema_version": 2, "worldspace": TAMRIEL, "start_grid": [5, -12], "stream_radius": 2,
         "camera_offset": CAMERA_OFFSET, "environment": {key: environment[key] for key in SAFE_ENVIRONMENT if key in environment},
         "commit": args.commit, "scenario": "repeat-terrain-startup",
         "input_hashes_before": None, "input_hashes_after": None,

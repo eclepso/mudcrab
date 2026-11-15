@@ -65,6 +65,15 @@ pub fn finalize_world_database_with_sources(
         return Ok(None);
     }
     let mut connection = Connection::open(&database_path)?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    let version: u32 =
+        connection.query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
+            row.get(0)
+        })?;
+    ensure!(
+        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "world database is out of date; convert again"
+    );
     let mut report = IntegrationReport {
         schema_version: connection.query_row(
             "SELECT version FROM schema_info LIMIT 1",
@@ -110,7 +119,7 @@ pub fn finalize_world_database_with_sources(
         statement
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, u32>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
@@ -122,14 +131,16 @@ pub fn finalize_world_database_with_sources(
     // this pass, so both successful bounds and errors can be shared by key.
     let mut model_bounds = HashMap::new();
     let transaction = connection.transaction()?;
-    for (form_id, model_path, record_type, plugin) in static_models {
+    for (stored_id, model_path, record_type, plugin) in static_models {
+        let form_id = identity.required_key(stored_id)?;
+        let name = identity.table().named(form_id)?;
         let key = match converted_key(&model_path, "meshes", "glb") {
             Ok(key) => key,
             Err(error) => {
                 recover_invalid_static_model(
                     &transaction,
                     &mut report,
-                    form_id,
+                    (form_id, name.clone()),
                     &model_path,
                     record_type.as_deref(),
                     plugin.as_deref(),
@@ -145,7 +156,7 @@ pub fn finalize_world_database_with_sources(
                     recover_invalid_static_model(
                         &transaction,
                         &mut report,
-                        form_id,
+                        (form_id, name.clone()),
                         &model_path,
                         record_type.as_deref(),
                         plugin.as_deref(),
@@ -158,7 +169,7 @@ pub fn finalize_world_database_with_sources(
                 report.missing_model_count += 1;
                 issue(
                     &mut report,
-                    format!("missing converted model {model_path} for {form_id:08X}"),
+                    format!("missing converted model {model_path} for {name}"),
                 );
             } else {
                 report.unavailable_model_source_count += 1;
@@ -172,7 +183,7 @@ pub fn finalize_world_database_with_sources(
             Ok(bounds) => {
                 transaction.execute(
                     "UPDATE statics SET bounds_min_x=?1,bounds_min_y=?2,bounds_min_z=?3,bounds_max_x=?4,bounds_max_y=?5,bounds_max_z=?6,bounds_valid=1 WHERE id=?7",
-                    params![bounds.min[0], bounds.min[1], bounds.min[2], bounds.max[0], bounds.max[1], bounds.max[2], form_id],
+                    params![bounds.min[0], bounds.min[1], bounds.min[2], bounds.max[0], bounds.max[1], bounds.max[2], form_id.to_sql_i64()],
                 )?;
                 report.bounds_updated += 1;
             }
@@ -201,11 +212,13 @@ pub fn finalize_world_database_with_sources(
         )?;
         statement
             .query_map([], |row| {
-                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (form_id, texture_path) in diffuse_paths {
+    for (stored_id, texture_path) in diffuse_paths {
+        let form_id = identity.required_key(stored_id)?;
+        let name = identity.table().named(form_id)?;
         let key = converted_key(&texture_path, "textures", "ktx2")?;
         if !files.contains_key(&key) {
             let source_key = converted_key(&texture_path, "textures", "dds")?;
@@ -213,9 +226,7 @@ pub fn finalize_world_database_with_sources(
                 report.missing_texture_count += 1;
                 issue(
                     &mut report,
-                    format!(
-                        "missing converted diffuse texture {texture_path} for TXST {form_id:08X}"
-                    ),
+                    format!("missing converted diffuse texture {texture_path} for TXST {name}"),
                 );
             } else {
                 report.unavailable_texture_source_count += 1;
@@ -228,11 +239,13 @@ pub fn finalize_world_database_with_sources(
         )?;
         statement
             .query_map([], |row| {
-                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (form_id, texture_path) in flow_paths {
+    for (stored_id, texture_path) in flow_paths {
+        let form_id = identity.required_key(stored_id)?;
+        let name = identity.table().named(form_id)?;
         let key = converted_key(&texture_path, "textures", "ktx2")?;
         if !files.contains_key(&key) {
             let source_key = converted_key(&texture_path, "textures", "dds")?;
@@ -240,9 +253,7 @@ pub fn finalize_world_database_with_sources(
                 report.missing_texture_count += 1;
                 issue(
                     &mut report,
-                    format!(
-                        "missing converted flow-normal texture {texture_path} for WATR {form_id:08X}"
-                    ),
+                    format!("missing converted flow-normal texture {texture_path} for WATR {name}"),
                 );
             } else {
                 report.unavailable_texture_source_count += 1;
@@ -252,7 +263,8 @@ pub fn finalize_world_database_with_sources(
     let cache_path = staging.join("cell_cache.rkyv");
     if cache_path.is_file() {
         let mmap = crate::esm::cell_cache::validate_cell_cache(&cache_path)?;
-        let cache = rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(&mmap)
+        let payload = shared::cache_identity::cell_cache_payload(&identity, &mmap, false)?;
+        let cache = rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(payload)
             .wrap_err("invalid integration cell cache")?;
         report.cache_cells = cache.cells.len() as u64;
         if report.cache_cells != report.terrain_cells {
@@ -388,20 +400,24 @@ fn issue(report: &mut IntegrationReport, message: String) {
 fn recover_invalid_static_model(
     transaction: &rusqlite::Transaction<'_>,
     report: &mut IntegrationReport,
-    form_id: u32,
+    form: (shared::form_key::FormKey, shared::form_key::NamedFormKey),
     model_path: &str,
     record_type: Option<&str>,
     plugin: Option<&str>,
     error: impl std::fmt::Display,
 ) -> Result<()> {
-    transaction.execute("UPDATE statics SET model_path=NULL WHERE id=?1", [form_id])?;
+    let (form_id, name) = form;
+    transaction.execute(
+        "UPDATE statics SET model_path=NULL WHERE id=?1",
+        [form_id.to_sql_i64()],
+    )?;
     let owner = match (plugin.filter(|name| !name.is_empty()), record_type) {
         (Some(plugin), Some(record_type)) => {
-            format!("plugin {plugin} {record_type} {form_id:08X}")
+            format!("plugin {plugin} {record_type} {name}")
         }
-        (Some(plugin), None) => format!("plugin {plugin} record {form_id:08X}"),
-        (None, Some(record_type)) => format!("{record_type} {form_id:08X}"),
-        (None, None) => format!("record {form_id:08X}"),
+        (Some(plugin), None) => format!("plugin {plugin} record {name}"),
+        (None, Some(record_type)) => format!("{record_type} {name}"),
+        (None, None) => format!("record {name}"),
     };
     issue(
         report,
@@ -457,14 +473,54 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn fixture_tables(connection: &Connection) {
+        crate::esm::exporter::create_tables(connection).unwrap();
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x53; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let owner = table.id("Fixture.esm").unwrap();
+        let identity = shared::pack_identity::PackIdentity::new(table, vec![owner]).unwrap();
+        let tx = connection.unchecked_transaction().unwrap();
+        identity.write_sql(&tx).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn fixture_local(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {
+        Ok(shared::form_key::FormKey::from_sql_i64(row.get(column)?)
+            .expect("generated fixture key")
+            .local())
+    }
+
     fn empty_cache(directory: &Path) {
+        let connection = Connection::open(directory.join("skyrim_world.db")).unwrap();
+        for (table, columns) in [
+            ("statics", &["id"][..]),
+            ("records", &["form_id"][..]),
+            ("texture_sets", &["id"][..]),
+            ("waters", &["id"][..]),
+            ("references", &["id", "cell_id", "base_form_id"][..]),
+            ("room_bounds", &["ref_id", "cell_id"][..]),
+            ("reference_rooms", &["reference_id", "room_ref"][..]),
+            ("cells", &["id", "worldspace_id"][..]),
+            ("land", &["cell_id"][..]),
+        ] {
+            for column in columns {
+                connection.execute(&format!("UPDATE \"{table}\" SET \"{column}\"=\"{column}\"|16777216 WHERE \"{column}\">0 AND \"{column}\"<16777216"),[]).unwrap();
+            }
+        }
+        let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
         let cache = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
             cells: vec![],
         };
         fs::write(
             directory.join("cell_cache.rkyv"),
-            rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
+            shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
         )
         .unwrap();
     }
@@ -559,7 +615,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         for (id, model) in [
             (1, "architecture/wall.nif"),
             (2, r"Meshes\Architecture\WALL.NIF"),
@@ -594,7 +650,7 @@ mod tests {
         let rows = statement
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, u32>(0)?,
+                    fixture_local(row, 0)?,
                     row.get::<_, f32>(1)?,
                     row.get::<_, f32>(2)?,
                     row.get::<_, i32>(3)?,
@@ -614,7 +670,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO plugins(id,name,priority,checksum) VALUES(1,'Synthetic.esp',0,?1)",
@@ -667,7 +723,7 @@ mod tests {
             let diagnostic = report
                 .issues
                 .iter()
-                .find(|issue| issue.contains(&format!("{record_type} {form_id:08X}")))
+                .find(|issue| issue.contains(&format!("{record_type} {form_id:06X}:Fixture.esm")))
                 .unwrap();
             assert!(diagnostic.contains("plugin Synthetic.esp"));
             assert!(diagnostic.contains(&format!("{source_path:?}")));
@@ -677,7 +733,7 @@ mod tests {
         let projections: Vec<(u32, Option<String>)> = connection
             .prepare("SELECT id,model_path FROM statics ORDER BY id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((fixture_local(row, 0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -695,7 +751,7 @@ mod tests {
         let archived: Vec<(u32, Vec<u8>)> = connection
             .prepare("SELECT form_id,data FROM records ORDER BY form_id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((fixture_local(row, 0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -718,7 +774,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute_batch(
                 "INSERT INTO plugins(id,name,priority,checksum)
@@ -755,7 +811,7 @@ mod tests {
         let ambiguous_priority_diagnostic = report
             .issues
             .iter()
-            .find(|issue| issue.contains("TACT 00000002"))
+            .find(|issue| issue.contains("TACT 000002:Fixture.esm"))
             .unwrap();
         assert!(ambiguous_priority_diagnostic.contains("../unsafe.nif"));
         assert!(!ambiguous_priority_diagnostic.contains("First.esm"));
@@ -764,14 +820,14 @@ mod tests {
             report
                 .issues
                 .iter()
-                .filter(|issue| issue.contains("TACT 00000002"))
+                .filter(|issue| issue.contains("TACT 000002:Fixture.esm"))
                 .count(),
             1
         );
         let absent_metadata_diagnostic = report
             .issues
             .iter()
-            .find(|issue| issue.contains("APPA 00000004"))
+            .find(|issue| issue.contains("APPA 000004:Fixture.esm"))
             .unwrap();
         assert!(absent_metadata_diagnostic.contains("../without-plugin.nif"));
         assert!(!absent_metadata_diagnostic.contains("plugin "));
@@ -780,7 +836,7 @@ mod tests {
         let projections: Vec<(u32, Option<String>)> = connection
             .prepare("SELECT id,model_path FROM statics ORDER BY id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((fixture_local(row, 0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -796,7 +852,7 @@ mod tests {
         let archived: Vec<(u32, Vec<u8>)> = connection
             .prepare("SELECT form_id,data FROM records ORDER BY form_id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((fixture_local(row, 0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -818,7 +874,7 @@ mod tests {
     fn keeps_source_availability_classification_for_models_and_textures() {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection.execute_batch(
             "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/lost.nif',0),(2,'test/absent.nif',0);
              INSERT INTO texture_sets(id,diffuse_path) VALUES(3,'land/lost.dds'),(4,'land/absent.dds');",
@@ -848,7 +904,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO statics(id,model_path,flags) VALUES(1,'architecture/wall.nif',0)",
@@ -884,7 +940,7 @@ mod tests {
         let connection = Connection::open(database).unwrap();
         let bounds: (f32, f32, i32) = connection
             .query_row(
-                "SELECT bounds_min_x,bounds_max_z,bounds_valid FROM statics WHERE id=1",
+                "SELECT bounds_min_x,bounds_max_z,bounds_valid FROM statics WHERE id=16777217",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -896,7 +952,7 @@ mod tests {
     fn treats_undistributed_model_reference_as_coverage_metric() {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/missing.nif',0)",
@@ -916,7 +972,7 @@ mod tests {
     fn audits_winning_loose_model_and_texture_sources_outside_vfs() {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/lost.nif',0)",
@@ -955,7 +1011,7 @@ mod tests {
     fn fails_when_existing_model_source_has_no_converted_artifact() {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/lost.nif',0)",
@@ -1005,7 +1061,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO statics(id,model_path,flags) VALUES(0x500,'architecture/wall.nif',0)",
@@ -1066,7 +1122,7 @@ mod tests {
         let rows: Vec<(u32, i64)> = connection
             .prepare("SELECT reference_id,contained FROM reference_rooms ORDER BY reference_id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((fixture_local(row, 0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -1091,7 +1147,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute(
                 "INSERT INTO statics(id,model_path,flags) VALUES(0x500,'architecture/wall.nif',0)",
@@ -1129,7 +1185,7 @@ mod tests {
         let rows: Vec<(u32, i64)> = connection
             .prepare("SELECT reference_id,contained FROM reference_rooms ORDER BY reference_id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((fixture_local(row, 0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -1139,11 +1195,11 @@ mod tests {
     /// A reused older database whose `statics` has no bounds columns finalises, and the overlap
     /// pass leaves it alone even when it holds rooms.
     #[test]
-    fn finalises_a_legacy_database_without_bounds_columns() {
+    fn refuses_an_old_world_before_mutating_bounds() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database).unwrap();
-        crate::esm::exporter::create_tables(&connection).unwrap();
+        fixture_tables(&connection);
         connection
             .execute_batch(
                 "DROP TABLE statics;
@@ -1152,7 +1208,16 @@ mod tests {
             .unwrap();
         drop(connection);
         empty_cache(directory.path());
-        assert!(finalize_world_database(directory.path()).unwrap().is_some());
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION - 1],
+            )
+            .unwrap();
+        drop(connection);
+        let error = finalize_world_database(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("convert again"), "{error}");
 
         let mut connection = Connection::open(&database).unwrap();
         connection
@@ -1162,9 +1227,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(
-            crate::esm::rooms::add_overlap_rows(&mut connection).unwrap(),
-            0
-        );
+        let error = crate::esm::rooms::add_overlap_rows(&mut connection).unwrap_err();
+        assert!(error.to_string().contains("convert again"), "{error}");
     }
 }

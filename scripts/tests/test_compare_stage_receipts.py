@@ -17,9 +17,9 @@ SPEC.loader.exec_module(COMPARE)
 
 def receipt(hdr=(0.25, 0.2, 0.1, 1.0), output=(220.0, 198.0, 154.0)):
     return {
-        "schema": 1,
+        "schema": 2,
         "side": "mudcrab",
-        "pose": {"worldspace_id": 60, "interior_cell_id": None, "position": [21750, -44530, 140],
+        "pose": {"worldspace_id": "00003C:Skyrim.esm", "interior_cell_id": None, "position": [21750, -44530, 140],
                  "yaw": 90, "pitch": -3, "hfov": 80},
         "probes": [{
             "name": "sunlit-thatch",
@@ -40,6 +40,17 @@ def run(reference, candidate):
 
 
 class CompareStageReceiptsTests(unittest.TestCase):
+    def test_named_identity_compares_across_owner_spelling_and_refuses_numeric_receipts(self):
+        candidate = receipt()
+        candidate["pose"]["worldspace_id"] = "3c:skyrim.ESM"
+        self.assertEqual(run(receipt(), candidate)[0], [])
+        for value in (60, 73014446780):
+            candidate["pose"]["worldspace_id"] = value
+            self.assertTrue(any("numeric" in failure for failure in run(candidate, candidate)[0]))
+        candidate = receipt()
+        candidate["schema"] = 1
+        self.assertTrue(any("regenerated" in failure for failure in run(candidate, candidate)[0]))
+
     def test_identical_receipts_pass_both_stages(self):
         failures, skipped, passed = run(receipt(), receipt())
         self.assertEqual(failures, [])

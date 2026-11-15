@@ -243,10 +243,14 @@ impl EnvironmentCatalog {
     }
 
     pub fn from_connection(connection: &Connection) -> Self {
+        if let Err(error) = shared::world_assets::install_runtime_identity_functions(connection) {
+            warn!("environment: world identity unavailable ({error}); convert again");
+            return Self::default();
+        }
         let cells = read(
             connection,
             &format!(
-                "SELECT cell_id, lighting_template_id, {}, inherit_flags FROM cell_lighting",
+                "SELECT runtime_id_or_null(cell_id), runtime_id_or_null(lighting_template_id), {}, inherit_flags FROM cell_lighting",
                 lighting_columns()
             ),
             "cell_lighting",
@@ -263,8 +267,8 @@ impl EnvironmentCatalog {
         );
         let worldspaces = read(
             connection,
-            "SELECT worldspace_id, data_flags, parent_flags, climate_id, water_id, \
-             lighting_template_id, music_id FROM worldspace_environment",
+            "SELECT runtime_id_or_null(worldspace_id), data_flags, parent_flags, runtime_id_or_null(climate_id), runtime_id_or_null(water_id), \
+             runtime_id_or_null(lighting_template_id), runtime_id_or_null(music_id) FROM worldspace_environment",
             "worldspace_environment",
             |row| {
                 Ok((
@@ -283,7 +287,7 @@ impl EnvironmentCatalog {
         let templates = read(
             connection,
             &format!(
-                "SELECT id, {}, {} FROM lighting_templates",
+                "SELECT runtime_id_or_null(id), {}, {} FROM lighting_templates",
                 lighting_columns(),
                 dalc_columns("subrecord_dalc_")
             ),
@@ -300,7 +304,7 @@ impl EnvironmentCatalog {
         );
         let image_spaces = read(
             connection,
-            "SELECT id, eye_adaptation_speed, bloom_blur_radius, bloom_threshold, bloom_scale, \
+            "SELECT runtime_id_or_null(id), eye_adaptation_speed, bloom_blur_radius, bloom_threshold, bloom_scale, \
              receive_bloom_threshold, white, sunlight_scale, sky_scale, eye_adaptation_strength, \
              saturation, brightness, contrast, tint_amount, tint_r, tint_g, tint_b FROM image_spaces",
             "image_spaces",
@@ -334,7 +338,7 @@ impl EnvironmentCatalog {
         let mut climate_weathers: HashMap<u32, Vec<ClimateWeather>> = HashMap::new();
         for (climate, entry) in read_rows(
             connection,
-            "SELECT climate_id, weather_id, chance, chance_global_id FROM climate_weathers \
+            "SELECT runtime_id_or_null(climate_id), runtime_id_or_null(weather_id), chance, runtime_id_or_null(chance_global_id) FROM climate_weathers \
              ORDER BY climate_id, position",
             "climate_weathers",
             |row| {
@@ -402,7 +406,7 @@ impl EnvironmentCatalog {
 fn read_weathers(connection: &Connection) -> HashMap<u32, Weather> {
     let mut weathers = read(
         connection,
-        "SELECT id, editor_id, fog_day_near, fog_day_far, fog_night_near, fog_night_far, \
+        "SELECT runtime_id_or_null(id), editor_id, fog_day_near, fog_day_far, fog_night_near, fog_night_far, \
          fog_day_power, fog_night_power, fog_day_max, fog_night_max, image_space_sunrise_id, \
          image_space_day_id, image_space_sunset_id, image_space_night_id FROM weathers",
         "weathers",
@@ -429,7 +433,7 @@ fn read_weathers(connection: &Connection) -> HashMap<u32, Weather> {
     );
     for (weather, color_type, time, color) in read_rows(
         connection,
-        "SELECT weather_id, color_type, time_of_day, r, g, b FROM weather_colors",
+        "SELECT runtime_id_or_null(weather_id), color_type, time_of_day, r, g, b FROM weather_colors",
         "weather_colors",
         |row| {
             Ok((
@@ -447,7 +451,7 @@ fn read_weathers(connection: &Connection) -> HashMap<u32, Weather> {
     for (weather, time, block) in read_rows(
         connection,
         &format!(
-            "SELECT weather_id, time_of_day, {} FROM weather_directional_ambient",
+            "SELECT runtime_id_or_null(weather_id), time_of_day, {} FROM weather_directional_ambient",
             dalc_columns("")
         ),
         "weather_directional_ambient",
@@ -483,11 +487,49 @@ fn read_rows<T>(
     table: &str,
     map: impl FnMut(&Row<'_>) -> rusqlite::Result<T>,
 ) -> Vec<T> {
+    let identity_columns: &[&str] = match table {
+        "cell_lighting" => &["cell_id", "lighting_template_id"],
+        "worldspace_environment" => &[
+            "worldspace_id",
+            "climate_id",
+            "water_id",
+            "lighting_template_id",
+            "music_id",
+        ],
+        "lighting_templates" | "image_spaces" | "weathers" => &["id"],
+        "climate_weathers" => &["climate_id", "weather_id", "chance_global_id"],
+        "weather_colors" | "weather_directional_ambient" => &["weather_id"],
+        _ => &[],
+    };
     let rows = connection.prepare(sql).and_then(|mut statement| {
-        statement
-            .query_map([], map)?
-            .collect::<rusqlite::Result<Vec<_>>>()
+        let mut result = Vec::new();
+        let mut omitted = 0usize;
+        let mut first_error = None;
+        for row in statement.query_map([], map)? {
+            match row {
+                Ok(row) => result.push(row),
+                Err(error) => {
+                    omitted += 1;
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if omitted != 0 {
+            warn!(
+                "environment: omitted {omitted} unusable rows in {table}; first {}",
+                first_error.as_deref().unwrap_or("unknown")
+            );
+        }
+        Ok(result)
     });
+    if rows.is_ok() {
+        if let Err(error) =
+            crate::world::database::report_runtime_capacity(connection, table, identity_columns)
+        {
+            warn!("environment: {table} identity inspection failed ({error}); table refused");
+            return Vec::new();
+        }
+    }
     rows.unwrap_or_else(|error| {
         info!("environment: no usable `{table}` table ({error}); built-in lighting stays");
         Vec::new()

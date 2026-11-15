@@ -507,10 +507,7 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
             .windows(4)
             .any(|bytes| bytes == b"VHGT")
     );
-    let cache = rkyv::from_bytes::<converter::shared::CellCache, rkyv::rancor::Error>(
-        &fs::read(output.join("cell_cache.rkyv")).unwrap(),
-    )
-    .unwrap();
+    let cache = common::runtime_cache(&output, "cell_cache.rkyv");
     let texture_cell = cache
         .cells
         .iter()
@@ -842,10 +839,7 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
             (-1.0, 1)
         );
     }
-    let cache = rkyv::from_bytes::<converter::shared::CellCache, rkyv::rancor::Error>(
-        &fs::read(output.join("cell_cache.rkyv")).unwrap(),
-    )
-    .unwrap();
+    let cache = common::runtime_cache(&output, "cell_cache.rkyv");
     for (id, offset) in [
         (0xB00, 3.0f32),
         (0xB10, 5.0),

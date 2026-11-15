@@ -333,10 +333,19 @@ pub(crate) fn write_tables<'a>(
     conn: &Connection,
     logs: impl IntoIterator<Item = (usize, &'a EventLog)>,
 ) -> Result<()> {
+    write_tables_mode(conn, logs, false)
+}
+
+/// Keep snapshot replacement shared while native history supplies eight-byte semantic keys.
+fn write_tables_mode<'a>(
+    conn: &Connection,
+    logs: impl IntoIterator<Item = (usize, &'a EventLog)>,
+    native: bool,
+) -> Result<()> {
     // Check each failure while streaming, before dropping the preceding snapshot.
     // Main-database staging pages stay on disk even if the caller uses memory temp tables.
     conn.execute_batch("SAVEPOINT record_diagnostics_snapshot;")?;
-    let result = write_snapshot(conn, logs);
+    let result = write_snapshot(conn, logs, native);
     match result {
         Ok(()) => {
             conn.execute_batch("RELEASE record_diagnostics_snapshot;")?;
@@ -355,6 +364,7 @@ pub(crate) fn write_tables<'a>(
 fn write_snapshot<'a>(
     conn: &Connection,
     logs: impl IntoIterator<Item = (usize, &'a EventLog)>,
+    native: bool,
 ) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE _record_diagnostics_stage(
@@ -419,14 +429,19 @@ fn write_snapshot<'a>(
         CREATE INDEX record_diagnostics_form ON record_diagnostics(form_id);")?;
     // A PK-ordered scan gives reproducible IDs without an event-count-sized sort buffer.
     // The physical history lookup uses its (plugin_id,source_record_offset) primary key.
-    let mut source = conn.prepare(
+    let identity_column = if native {
+        "h.form_id"
+    } else {
+        "COALESCE(h.form_id,s.form_id)"
+    };
+    let mut source = conn.prepare(&format!(
         "SELECT s.plugin_id,s.source_record_offset,s.source_form_id,
-            COALESCE(h.form_id,s.form_id),s.record_type,s.stage,s.field,s.occurrence,
+            {identity_column},s.record_type,s.stage,s.field,s.occurrence,
             s.link_value,s.category,s.action,s.reason,s.field_truncated,s.reason_truncated
         FROM _record_diagnostics_stage s LEFT JOIN record_overrides h
         ON h.plugin_id=s.plugin_id AND h.source_record_offset=s.source_record_offset
-        ORDER BY s.plugin_id,s.event_key",
-    )?;
+        ORDER BY s.plugin_id,s.event_key"
+    ))?;
     let mut rows = source.query([])?;
     let mut earlier = conn.prepare(
         "SELECT deleted=0 FROM record_overrides
@@ -438,7 +453,10 @@ fn write_snapshot<'a>(
     while let Some(row) = rows.next()? {
         let plugin_id: i64 = row.get(0)?;
         let offset: Option<i64> = row.get(1)?;
-        let form_id: Option<u32> = row.get(3)?;
+        let form_id: Option<i64> = row.get(3)?;
+        if !native {
+            form_id.map(u32::try_from).transpose()?;
+        }
         let category: String = row.get(9)?;
         let mut action: String = row.get(10)?;
         if category == "record"
@@ -476,6 +494,175 @@ fn write_snapshot<'a>(
     drop(source);
     conn.execute_batch("DROP TABLE _record_diagnostics_stage;")?;
     Ok(())
+}
+
+/// Publish source-identified diagnostic events in the caller's complete native world transaction.
+/// Semantic form IDs are enriched from physical history; native link words are labelled explicitly.
+pub fn write_native_tables(
+    tx: &rusqlite::Transaction<'_>,
+    result: &super::native::NativeReadResult,
+    identity: &shared::pack_identity::PackIdentity,
+) -> Result<()> {
+    if shared::pack_identity::PackIdentity::read_sql(tx)?.digest() != identity.digest() {
+        return Err(eyre!(
+            "native diagnostics belong to a different pack allocation"
+        ));
+    }
+    let mut logs = Vec::new();
+    for (name, diagnostics) in &result.diagnostics {
+        let owner = identity
+            .table()
+            .id(name)
+            .ok_or_else(|| eyre!("unknown native diagnostic supplier {name}"))?;
+        let priority = identity
+            .order()
+            .iter()
+            .position(|id| *id == owner)
+            .ok_or_else(|| eyre!("native diagnostic supplier is not loaded"))?;
+        logs.push((priority, &diagnostics.event_log));
+    }
+    tx.execute_batch("SAVEPOINT native_record_diagnostics_snapshot")?;
+    let outcome = (|| -> Result<()> {
+        write_tables_mode(tx, logs, true)?;
+        tx.execute_batch("ALTER TABLE record_diagnostics ADD COLUMN link_value_kind TEXT NOT NULL DEFAULT 'source_form_id';
+            ALTER TABLE record_diagnostics ADD COLUMN source_link_identity TEXT;
+            ALTER TABLE record_diagnostics ADD COLUMN link_outcome TEXT;")?;
+        let mut source = tx.prepare("SELECT diagnostic_id,plugin_id,link_value,category,form_id FROM record_diagnostics ORDER BY diagnostic_id")?;
+        let mut rows = source.query([])?;
+        let mut update = tx.prepare("UPDATE record_diagnostics SET source_link_identity=?1,link_outcome=?2 WHERE diagnostic_id=?3")?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let supplier: usize = row.get(1)?;
+            let word: Option<u32> = row.get(2)?;
+            identity.optional_key(row.get(4)?)?;
+            let Some(word) = word else {
+                continue;
+            };
+            let key = super::source_identity::native_key(word, supplier, identity);
+            let named = key
+                .map(|key| identity.table().named(key).map(|name| name.to_string()))
+                .transpose()?;
+            let category: String = row.get(3)?;
+            let outcome = if word == 0 {
+                "null"
+            } else if category == "link" {
+                "cleared"
+            } else if key.is_some() {
+                "observed"
+            } else {
+                "unresolved"
+            };
+            update.execute(params![named, outcome, id])?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => {
+            tx.execute_batch("RELEASE native_record_diagnostics_snapshot")?;
+            Ok(())
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO native_record_diagnostics_snapshot; RELEASE native_record_diagnostics_snapshot")?;
+            Err(error)
+        }
+    }
+}
+
+/// One portable native recovery event, with raw link words explicitly identified as source facts.
+#[derive(Debug, serde::Serialize)]
+pub struct NativeDiagnostic {
+    pub diagnostic_id: u64,
+    pub plugin: String,
+    pub source_record_offset: Option<u64>,
+    pub source_form_id: Option<u32>,
+    pub record_type: Option<String>,
+    pub stage: String,
+    pub field: Option<String>,
+    pub occurrence: u64,
+    pub source_link_word: Option<u32>,
+    pub source_link_identity: Option<shared::form_key::NamedFormKey>,
+    pub link_outcome: Option<String>,
+    pub category: String,
+    pub action: String,
+    pub reason: String,
+    pub field_truncated: bool,
+    pub reason_truncated: bool,
+}
+
+/// Bounded portable diagnostic output never serializes pack-local integers as semantic IDs.
+#[derive(Debug, serde::Serialize)]
+pub struct NativeDiagnosticReport {
+    pub form_id: shared::form_key::NamedFormKey,
+    pub events: Vec<NativeDiagnostic>,
+    pub total_events: u64,
+    pub truncated: bool,
+}
+
+/// Authenticate the allocation before exposing native diagnostic rows for one named identity.
+pub fn read_native_for_form(
+    path: &std::path::Path,
+    form: &shared::form_key::NamedFormKey,
+) -> Result<NativeDiagnosticReport> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    let key = identity
+        .table()
+        .intern(form)?
+        .ok_or_else(|| eyre!("null has no native record diagnostics"))?;
+    let total_events: u64 = connection.query_row(
+        "SELECT count(*) FROM record_diagnostics WHERE form_id=?1",
+        [key.to_sql_i64()],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare("SELECT diagnostic_id,plugin_id,source_record_offset,source_form_id,record_type,stage,field,occurrence,link_value,source_link_identity,link_outcome,category,action,reason,field_truncated,reason_truncated,link_value_kind FROM record_diagnostics WHERE form_id=?1 ORDER BY diagnostic_id LIMIT 4096")?;
+    let mut rows = statement.query([key.to_sql_i64()])?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next()? {
+        let priority: usize = row.get(1)?;
+        let supplier = identity
+            .order()
+            .get(priority)
+            .and_then(|id| identity.table().entry(*id))
+            .ok_or_else(|| eyre!("unknown native diagnostic supplier; convert again"))?;
+        let source_word: Option<u32> = row.get(8)?;
+        let stored_name: Option<String> = row.get(9)?;
+        let expected = source_word
+            .and_then(|word| super::source_identity::native_key(word, priority, &identity))
+            .map(|key| identity.table().named(key))
+            .transpose()?;
+        if row.get::<_, String>(16)? != "source_form_id"
+            || stored_name != expected.as_ref().map(ToString::to_string)
+        {
+            return Err(eyre!(
+                "native diagnostic source context is invalid; convert again"
+            ));
+        }
+        events.push(NativeDiagnostic {
+            diagnostic_id: row.get(0)?,
+            plugin: supplier.display_name.clone(),
+            source_record_offset: row.get(2)?,
+            source_form_id: row.get(3)?,
+            record_type: row.get(4)?,
+            stage: row.get(5)?,
+            field: row.get(6)?,
+            occurrence: row.get(7)?,
+            source_link_word: source_word,
+            source_link_identity: expected,
+            link_outcome: row.get(10)?,
+            category: row.get(11)?,
+            action: row.get(12)?,
+            reason: row.get(13)?,
+            field_truncated: row.get(14)?,
+            reason_truncated: row.get(15)?,
+        });
+    }
+    let truncated = total_events > events.len() as u64;
+    Ok(NativeDiagnosticReport {
+        form_id: identity.table().named(key)?,
+        events,
+        total_events,
+        truncated,
+    })
 }
 
 #[cfg(test)]

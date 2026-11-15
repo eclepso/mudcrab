@@ -1,5 +1,5 @@
 //! Synthetic public legacy-reader publication regressions; no installed inputs.
-use converter::esm::{EsmParser, cell_cache::write_cell_cache};
+use converter::esm::EsmParser;
 use rusqlite::Connection;
 use std::{
     fs,
@@ -328,14 +328,28 @@ fn malformed_terrain_and_native_arrays_cannot_replace_complete_candidates() {
     assert_eq!(ids(&conn), [0x800, 0x810, 0x0100_0801, 0x0100_0802]);
     assert_eq!(fields(&conn, 0x800, b"VHGT"), [heightmap(2.0)]);
     assert_eq!(fields(&conn, 0x810, b"EDID"), [b"EarlierGrass\0".to_vec()]);
-    let merged = EsmParser::merge_plugins(&paths).unwrap();
+    let merged = EsmParser::merge_plugins_form_keys(&paths).unwrap();
     let cache_path = dir.path().join("cell_cache.rkyv");
-    assert_eq!(write_cell_cache(&merged, &cache_path).unwrap(), 2);
-    let bytes = fs::read(cache_path).unwrap();
-    let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(&bytes).unwrap();
-    assert_eq!(cache.cells[0].cell_id, 0x900);
+    assert_eq!(
+        converter::esm::cell_cache::write_form_key_cell_cache(
+            &merged,
+            &Default::default(),
+            &cache_path,
+            false
+        )
+        .unwrap()
+        .0,
+        2
+    );
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    let file = fs::read(cache_path).unwrap();
+    let mut bytes = rkyv::util::AlignedVec::<16>::with_capacity(file.len());
+    bytes.extend_from_slice(&file);
+    let payload = shared::cache_identity::cell_cache_payload(&identity, &bytes, false).unwrap();
+    let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(payload).unwrap();
+    assert_eq!(cache.cells[0].cell_id, 0x0100_0900);
     assert_eq!(cache.cells[0].heights, vec![16.0; 33 * 33]);
-    assert_eq!(cache.cells[1].cell_id, 0x901);
+    assert_eq!(cache.cells[1].cell_id, 0x0100_0901);
     assert_eq!(cache.cells[1].heights, vec![24.0; 33 * 33]);
 }
 

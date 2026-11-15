@@ -79,6 +79,10 @@ pub struct EngineConfig {
     /// Explicit local report destination. `None` uses the per-user application-data directory.
     pub bug_report_dir: Option<PathBuf>,
     pub worldspace_id: u32,
+    /// Portable request resolved against the authenticated world before gameplay reads.
+    pub worldspace_name: Option<shared::form_key::NamedFormKey>,
+    /// Immutable world scope used only for checked request/output translation.
+    pub bound_identity: Option<std::sync::Arc<shared::pack_identity::PackIdentity>>,
     pub start_grid: (i32, i32),
     pub stream_radius: i32,
     pub unload_radius: i32,
@@ -136,6 +140,8 @@ pub struct EngineConfig {
     pub tone_map_params: Option<PathBuf>,
     pub image_space: Option<u32>,
     pub image_space_weather: Option<u32>,
+    pub image_space_name: Option<shared::form_key::NamedFormKey>,
+    pub image_space_weather_name: Option<shared::form_key::NamedFormKey>,
     pub image_space_slot: Option<ImageSpaceSlot>,
     /// Seed a live world camera from a validated one-pose shots file.
     pub start_shot: Option<PathBuf>,
@@ -226,6 +232,8 @@ impl Default for EngineConfig {
             assets_dir: PathBuf::from("modern_assets"),
             bug_report_dir: None,
             worldspace_id: 0x3c,
+            worldspace_name: None,
+            bound_identity: None,
             start_grid: (0, 0),
             // Skyrim's default `uGridsToLoad=5`.
             stream_radius: 2,
@@ -269,6 +277,8 @@ impl Default for EngineConfig {
             tone_map_params: None,
             image_space: None,
             image_space_weather: None,
+            image_space_name: None,
+            image_space_weather_name: None,
             image_space_slot: None,
             start_shot: None,
             stdin_console: false,
@@ -339,7 +349,7 @@ Streams converted cells from a world database. With no options it reads
 
 Assets and start position:
   --assets <dir>                        converted asset directory to stream (default: modern_assets)
-  --worldspace <id>                     worldspace form id, decimal or 0x-hex (default: 0x3c)
+  --worldspace <id>                     worldspace LOCAL:Plugin or checked decimal/0x-hex request (default: 0x3c)
   --grid-x <cell>                       starting cell x (default: 0)
   --grid-y <cell>                       starting cell y (default: 0)
   --start-shot <file>                  start the live camera at one exterior shot pose
@@ -401,8 +411,8 @@ Benchmark and profiling:
   --grade-preset <json>                approved-look JSON override (snapshot-srgb and Cool Gray sky)
   --tone-map <tony|retail-curve>       display transform (default: tony); retail curve is experimental
   --tone-map-params <json>             explicit curve/scales and fixed luminance samples; requires selected IMGS
-  --image-space <FormID>               load an authored IMGS record for record-srgb experiments
-  --image-space-weather <FormID>       select an authored WTHR image-space slot, not live weather
+  --image-space <LOCAL:Plugin|id>      load an authored IMGS via the authenticated world table
+  --image-space-weather <LOCAL:Plugin|id> select an authored WTHR image-space slot
   --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
@@ -619,13 +629,14 @@ impl EngineConfig {
     /// Select only explicitly authored data; this does not simulate effective weather.
     pub fn image_space_selection(&self) -> color_eyre::Result<Option<ImageSpaceSelection>> {
         use color_eyre::eyre::ensure;
+        let direct = self.image_space.is_some() || self.image_space_name.is_some();
+        let weather = self.image_space_weather.is_some() || self.image_space_weather_name.is_some();
         ensure!(
-            self.image_space.is_none()
-                || (self.image_space_weather.is_none() && self.image_space_slot.is_none()),
+            !direct || (!weather && self.image_space_slot.is_none()),
             "--image-space cannot be combined with --image-space-weather or --image-space-slot"
         );
         ensure!(
-            self.image_space_weather.is_some() == self.image_space_slot.is_some(),
+            weather == self.image_space_slot.is_some(),
             "--image-space-weather and --image-space-slot must be supplied together"
         );
         let selection = self
@@ -637,11 +648,11 @@ impl EngineConfig {
                     .map(|(form_id, slot)| ImageSpaceSelection::Weather { form_id, slot })
             });
         ensure!(
-            self.color_grade != SceneGradeMode::RecordSrgb || selection.is_some(),
+            self.color_grade != SceneGradeMode::RecordSrgb || direct || weather,
             "record-srgb requires an explicit --image-space or --image-space-weather with --image-space-slot"
         );
         ensure!(
-            self.tone_map != SceneToneMapMode::RetailCurve || selection.is_some(),
+            self.tone_map != SceneToneMapMode::RetailCurve || direct || weather,
             "retail-curve requires an explicit --image-space or --image-space-weather with --image-space-slot"
         );
         Ok(selection)
@@ -824,13 +835,19 @@ impl EngineConfig {
                         "a worldspace form id, decimal or 0x-hex",
                         args.next(),
                     )?;
-                    config.worldspace_id = parse_u32(&value).ok_or_else(|| {
-                        ConfigError::invalid_value(
-                            "--worldspace",
-                            Some(value),
-                            "a worldspace form id, decimal or 0x-hex",
-                        )
-                    })?;
+                    if let Some(id) = parse_u32(&value) {
+                        config.worldspace_id = id;
+                        config.worldspace_name = None;
+                    } else {
+                        config.worldspace_name =
+                            Some(parse_named_request(&value).ok_or_else(|| {
+                                ConfigError::invalid_value(
+                                    "--worldspace",
+                                    Some(value),
+                                    "a worldspace form id, decimal or 0x-hex, or LOCAL:Plugin",
+                                )
+                            })?);
+                    }
                 }
                 "--grid-x" => {
                     config.start_grid.0 = take_value("--grid-x", "a cell coordinate", args.next())?;
@@ -1196,13 +1213,20 @@ impl EngineConfig {
                 "--image-space" => {
                     let raw =
                         take_raw("--image-space", "a FormID, decimal or 0x-hex", args.next())?;
-                    config.image_space = Some(parse_u32(&raw).ok_or_else(|| {
-                        ConfigError::invalid_value(
-                            "--image-space",
-                            Some(raw),
-                            "a FormID, decimal or 0x-hex",
-                        )
-                    })?);
+                    if let Some(id) = parse_u32(&raw) {
+                        config.image_space = Some(id);
+                        config.image_space_name = None;
+                    } else {
+                        config.image_space = None;
+                        config.image_space_name =
+                            Some(parse_named_request(&raw).ok_or_else(|| {
+                                ConfigError::invalid_value(
+                                    "--image-space",
+                                    Some(raw),
+                                    "a FormID, decimal or 0x-hex, or LOCAL:Plugin",
+                                )
+                            })?);
+                    }
                 }
                 "--image-space-weather" => {
                     let raw = take_raw(
@@ -1210,13 +1234,20 @@ impl EngineConfig {
                         "a FormID, decimal or 0x-hex",
                         args.next(),
                     )?;
-                    config.image_space_weather = Some(parse_u32(&raw).ok_or_else(|| {
-                        ConfigError::invalid_value(
-                            "--image-space-weather",
-                            Some(raw),
-                            "a FormID, decimal or 0x-hex",
-                        )
-                    })?);
+                    if let Some(id) = parse_u32(&raw) {
+                        config.image_space_weather = Some(id);
+                        config.image_space_weather_name = None;
+                    } else {
+                        config.image_space_weather = None;
+                        config.image_space_weather_name =
+                            Some(parse_named_request(&raw).ok_or_else(|| {
+                                ConfigError::invalid_value(
+                                    "--image-space-weather",
+                                    Some(raw),
+                                    "a FormID, decimal or 0x-hex, or LOCAL:Plugin",
+                                )
+                            })?);
+                    }
                 }
                 "--image-space-slot" => {
                     let raw = take_raw(
@@ -1510,6 +1541,83 @@ fn parse_u32(value: &str) -> Option<u32> {
         )
 }
 
+/// Parse portable CLI identity without assigning it a runtime handle before pack authentication.
+fn parse_named_request(value: &str) -> Option<shared::form_key::NamedFormKey> {
+    let named = value.parse::<shared::form_key::NamedFormKey>().ok()?;
+    named.parts().is_some().then_some(named)
+}
+
+/// Resolve an authenticated gameplay request to its portable spelling.
+pub(crate) fn named_runtime_request(
+    identity: &shared::pack_identity::PackIdentity,
+    value: u32,
+) -> color_eyre::Result<shared::form_key::NamedFormKey> {
+    let key = identity
+        .runtime_key(value)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("zero is not a record identity"))?;
+    Ok(identity.table().named(key)?)
+}
+
+/// Resolve a portable request or a legacy request word through this exact authenticated table.
+pub(crate) fn external_request(
+    value: &serde_json::Value,
+    version: u32,
+    identity: &shared::pack_identity::PackIdentity,
+) -> color_eyre::Result<Option<u32>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if version == 2 {
+        let named: shared::form_key::NamedFormKey = serde_json::from_value(value.clone())?;
+        let key = identity
+            .table()
+            .intern(&named)?
+            .ok_or_else(|| color_eyre::eyre::eyre!("null has no runtime record identity"))?;
+        return Ok(Some(identity.runtime_id(key)?));
+    }
+    color_eyre::eyre::ensure!(version == 1, "unsupported external identity schema");
+    let legacy = value.as_u64().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| color_eyre::eyre::eyre!("legacy identity requests must be checked 32-bit words; use schema 2 and LOCAL:Plugin"))?;
+    named_runtime_request(identity, legacy)?;
+    Ok(Some(legacy))
+}
+
+impl EngineConfig {
+    /// Bind all command-line identity requests before any content or canonical payload is read.
+    pub fn resolve_pack_identity(
+        &mut self,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> color_eyre::Result<()> {
+        let bind = |legacy: u32,
+                    named: &Option<shared::form_key::NamedFormKey>|
+         -> color_eyre::Result<u32> {
+            if let Some(named) = named {
+                let key = identity
+                    .table()
+                    .intern(named)?
+                    .ok_or_else(|| color_eyre::eyre::eyre!("null is not a requested record"))?;
+                identity.runtime_id(key)
+            } else {
+                named_runtime_request(identity, legacy)?;
+                Ok(legacy)
+            }
+        };
+        self.worldspace_id = bind(self.worldspace_id, &self.worldspace_name)?;
+        self.worldspace_name = Some(named_runtime_request(identity, self.worldspace_id)?);
+        if self.image_space.is_some() || self.image_space_name.is_some() {
+            self.image_space = Some(bind(self.image_space.unwrap_or(0), &self.image_space_name)?);
+        }
+        if self.image_space_weather.is_some() || self.image_space_weather_name.is_some() {
+            self.image_space_weather = Some(bind(
+                self.image_space_weather.unwrap_or(0),
+                &self.image_space_weather_name,
+            )?);
+        }
+        self.image_space_selection()?;
+        self.bound_identity = Some(std::sync::Arc::new(identity.clone()));
+        Ok(())
+    }
+}
+
 /// The value of a value-taking option, as written.
 ///
 /// A missing value, or one that is another option, is an error rather than
@@ -1675,9 +1783,65 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+/// Asymmetric in-memory allocation for external request/capture regression fixtures.
+#[cfg(test)]
+pub(crate) fn identity_request_fixture() -> shared::pack_identity::PackIdentity {
+    use shared::plugin_table::{PluginFacts, PluginFlags, PluginTable};
+    let table = PluginTable::fresh(vec![
+        (
+            "Zulu.esm".into(),
+            PluginFacts {
+                content_hash: Some([0x31; 32]),
+                ..Default::default()
+            },
+        ),
+        (
+            "Alpha.esl".into(),
+            PluginFacts {
+                content_hash: Some([0x42; 32]),
+                flags: PluginFlags {
+                    light: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+    ])
+    .unwrap();
+    let order = vec![
+        table.id("Zulu.esm").unwrap(),
+        table.id("Alpha.esl").unwrap(),
+    ];
+    shared::pack_identity::PackIdentity::new(table, order).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named selections and legacy request words must agree through the authenticated table.
+    #[test]
+    fn named_cli_requests_resolve_without_guessing_packed_integer_namespaces() {
+        let identity = identity_request_fixture();
+        let mut config = run_config(&[
+            "--worldspace",
+            "00003C:Zulu.esm",
+            "--image-space",
+            "000ABC:Alpha.esl",
+        ]);
+        config.resolve_pack_identity(&identity).unwrap();
+        assert_eq!(config.worldspace_id, 0x3c);
+        assert_eq!(config.image_space, Some(0xFE00_0ABC));
+        assert_eq!(
+            config.worldspace_name.unwrap().to_string(),
+            "00003C:Zulu.esm"
+        );
+        let mut wrong_namespace = EngineConfig {
+            worldspace_id: 0x0100_003c,
+            ..Default::default()
+        };
+        assert!(wrong_namespace.resolve_pack_identity(&identity).is_err());
+    }
 
     /// This file, so the tests can read the parser's own match arms back out of
     /// it instead of keeping a second list of option names in step by hand.
@@ -3334,7 +3498,7 @@ mod tests {
         assert_eq!(
             parse_error(&["--worldspace", "0xzz"]).to_string(),
             "option '--worldspace' does not accept '0xzz': expected a worldspace form id, \
-             decimal or 0x-hex. Run with --help to list every option."
+             decimal or 0x-hex, or LOCAL:Plugin. Run with --help to list every option."
         );
     }
 

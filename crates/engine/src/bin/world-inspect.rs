@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const CELL_SIZE: f32 = 4096.0;
 
 fn main() -> Result<()> {
@@ -36,14 +36,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Options {
     assets: PathBuf,
     worldspace: u32,
+    worldspace_name: Option<shared::form_key::NamedFormKey>,
     grid_x: i32,
     grid_y: i32,
     radius: i32,
     reference: Option<u32>,
+    reference_name: Option<shared::form_key::NamedFormKey>,
     output: Option<PathBuf>,
 }
 
@@ -55,11 +57,12 @@ impl Options {
                 "usage: world-inspect <assets> <worldspace> <grid-x> <grid-y> [--radius N] [--reference FORM_ID] [--output report.json]"
             )
         })?);
-        let worldspace = parse_number(args.next(), "worldspace")?;
+        let (worldspace, worldspace_name) = parse_identity(args.next(), "worldspace")?;
         let grid_x = parse_i32(args.next(), "grid-x")?;
         let grid_y = parse_i32(args.next(), "grid-y")?;
         let mut radius = 0;
         let mut reference = None;
+        let mut reference_name = None;
         let mut output = None;
         while let Some(argument) = args.next() {
             let argument = argument
@@ -67,7 +70,11 @@ impl Options {
                 .map_err(|_| color_eyre::eyre::eyre!("argument is not valid UTF-8"))?;
             match argument.as_str() {
                 "--radius" => radius = parse_i32(args.next(), "radius")?,
-                "--reference" => reference = Some(parse_number(args.next(), "reference")?),
+                "--reference" => {
+                    let (legacy, named) = parse_identity(args.next(), "reference")?;
+                    reference = named.is_none().then_some(legacy);
+                    reference_name = named;
+                }
                 "--output" => {
                     output = Some(PathBuf::from(
                         args.next()
@@ -84,10 +91,12 @@ impl Options {
         Ok(Self {
             assets,
             worldspace,
+            worldspace_name,
             grid_x,
             grid_y,
             radius,
             reference,
+            reference_name,
             output,
         })
     }
@@ -279,6 +288,28 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
         shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION,
         shared::WORLD_DATABASE_SCHEMA_VERSION
     );
+    let identity = shared::world_assets::install_runtime_identity_functions(&connection)?;
+    let bind = |word: u32, name: &Option<shared::form_key::NamedFormKey>| -> Result<u32> {
+        if let Some(name) = name {
+            let key = identity
+                .table()
+                .intern(name)?
+                .ok_or_else(|| color_eyre::eyre::eyre!("null is not a record request"))?;
+            identity.runtime_id(key)
+        } else {
+            named_id(&identity, word)?;
+            Ok(word)
+        }
+    };
+    let mut bound = options.clone();
+    bound.worldspace = bind(options.worldspace, &options.worldspace_name)?;
+    if options.reference.is_some() || options.reference_name.is_some() {
+        bound.reference = Some(bind(
+            options.reference.unwrap_or(0),
+            &options.reference_name,
+        )?);
+    }
+    let options = &bound;
     let cache = CellCache::open(&assets.join("cell_cache.rkyv"))?;
     let lod_manifest = lod_contract_status(&assets, &connection);
     let lod_chunks = load_lod_chunks(&connection, &assets, options.worldspace)?;
@@ -290,7 +321,7 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
             let grid_y = options.grid_y + y;
             let cell_id = connection
                 .query_row(
-                    "SELECT id FROM cells WHERE worldspace_id=?1 AND grid_x=?2 AND grid_y=?3",
+                    "SELECT runtime_id(id) FROM cells WHERE worldspace_id=stored_key(?1) AND grid_x=?2 AND grid_y=?3",
                     params![options.worldspace, grid_x, grid_y],
                     |row| row.get::<_, u32>(0),
                 )
@@ -322,7 +353,7 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
                 }
             });
             cells.push(CellReport {
-                cell_id: hex_id(cell_id),
+                cell_id: named_id(&identity, cell_id)?,
                 grid: [grid_x, grid_y],
                 reference_count: cell_rows.len(),
                 terrain,
@@ -345,8 +376,8 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
 
     let references = rows
         .iter()
-        .map(|row| reference_report(row, &inspected))
-        .collect::<Vec<_>>();
+        .map(|row| reference_report(row, &inspected, &identity))
+        .collect::<Result<Vec<_>>>()?;
     let assets_report = inspected.into_values().collect::<Vec<_>>();
     let summary = InspectionSummary {
         requested_cells: ((options.radius * 2 + 1).pow(2)) as usize,
@@ -387,10 +418,13 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
     Ok(InspectionReport {
         format_version: FORMAT_VERSION,
         assets_root: assets.display().to_string(),
-        worldspace_id: hex_id(options.worldspace),
+        worldspace_id: named_id(&identity, options.worldspace)?,
         center_grid: [options.grid_x, options.grid_y],
         radius: options.radius,
-        reference_filter: options.reference.map(hex_id),
+        reference_filter: options
+            .reference
+            .map(|value| named_id(&identity, value))
+            .transpose()?,
         database_schema,
         converter_manifest: contract_status(&assets.join("conversion-manifest.json"), "complete"),
         integration_report: contract_status(&assets.join("integration-report.json"), "passed"),
@@ -454,7 +488,7 @@ fn load_lod_chunks(
         "SELECT tier, anchor_x, anchor_y, payload_path, content_hash,
                 bounds_min_x, bounds_min_y, bounds_min_z,
                 bounds_max_x, bounds_max_y, bounds_max_z, source_cells
-         FROM lod_chunks WHERE worldspace_id = ?1 ORDER BY tier, anchor_x, anchor_y",
+         FROM lod_chunks WHERE worldspace_id = stored_key(?1) ORDER BY tier, anchor_x, anchor_y",
     )?;
     let rows = statement.query_map([worldspace], |row| {
         Ok((
@@ -520,15 +554,15 @@ fn load_references(
     reference: Option<u32>,
 ) -> Result<Vec<ReferenceRow>> {
     let sql =
-        "SELECT r.id,r.cell_id,r.base_form_id,s.editor_id,s.model_path,r.pos_x,r.pos_y,r.pos_z,
+        "SELECT runtime_id(r.id),runtime_id(r.cell_id),runtime_id(r.base_form_id),s.editor_id,s.model_path,r.pos_x,r.pos_y,r.pos_z,
                 r.rot_x,r.rot_y,r.rot_z,r.scale,
                 COALESCE(s.bounds_min_x,-64),COALESCE(s.bounds_min_y,-64),COALESCE(s.bounds_min_z,-64),
                 COALESCE(s.bounds_max_x,64),COALESCE(s.bounds_max_y,64),COALESCE(s.bounds_max_z,64),
                 COALESCE(s.bounds_valid,0)
          FROM exterior_spatial x JOIN \"references\" r ON r.id=x.id
          LEFT JOIN statics s ON s.id=r.base_form_id
-         WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<?5
-           AND (?6 IS NULL OR r.id=?6)
+         WHERE x.worldspace_id=stored_key(?1) AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<?5
+           AND (?6 IS NULL OR r.id=stored_key(?6))
          ORDER BY r.id";
     let min_x = grid_x as f32 * CELL_SIZE;
     let min_y = grid_y as f32 * CELL_SIZE;
@@ -563,7 +597,11 @@ fn load_references(
         .map_err(Into::into)
 }
 
-fn reference_report(row: &ReferenceRow, assets: &BTreeMap<String, AssetReport>) -> ReferenceReport {
+fn reference_report(
+    row: &ReferenceRow,
+    assets: &BTreeMap<String, AssetReport>,
+    identity: &shared::pack_identity::PackIdentity,
+) -> Result<ReferenceReport> {
     use bevy::prelude::{Mat4, Quat, Vec3};
     let position = Vec3::from_array(row.position);
     let world_position = WorldPosition::from_creation_units(position);
@@ -597,10 +635,10 @@ fn reference_report(row: &ReferenceRow, assets: &BTreeMap<String, AssetReport>) 
             max: bounds.max.to_array(),
         }
     });
-    ReferenceReport {
-        form_id: hex_id(row.form_id),
-        cell_id: hex_id(row.cell_id),
-        base_form_id: hex_id(row.base_form_id),
+    Ok(ReferenceReport {
+        form_id: named_id(identity, row.form_id)?,
+        cell_id: named_id(identity, row.cell_id)?,
+        base_form_id: named_id(identity, row.base_form_id)?,
         editor_id: row.editor_id.clone(),
         source_model: row.model_path.clone(),
         runtime_model,
@@ -612,7 +650,7 @@ fn reference_report(row: &ReferenceRow, assets: &BTreeMap<String, AssetReport>) 
         source_bounds,
         transformed_bounds,
         diagnostic: diagnostic.to_owned(),
-    }
+    })
 }
 
 fn inspect_glb(assets_root: &Path, runtime_model: &str) -> AssetReport {
@@ -853,8 +891,29 @@ fn converted_model_path(path: String) -> Option<String> {
     Some(converted.to_string_lossy().replace('\\', "/"))
 }
 
-fn hex_id(value: u32) -> String {
-    format!("{value:08X}")
+/// Name a checked gameplay request without serializing runtime slots or pack-local integers.
+fn named_id(identity: &shared::pack_identity::PackIdentity, value: u32) -> Result<String> {
+    let key = identity
+        .runtime_key(value)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("zero is not a record identity"))?;
+    Ok(identity.table().named(key)?.to_string())
+}
+
+/// Keep portable names unresolved until the actual world allocation is authenticated.
+fn parse_identity(
+    value: Option<std::ffi::OsString>,
+    name: &str,
+) -> Result<(u32, Option<shared::form_key::NamedFormKey>)> {
+    let value = value
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing {name}"))?;
+    if value.contains(':') {
+        let named: shared::form_key::NamedFormKey = value.parse()?;
+        color_eyre::eyre::ensure!(named.parts().is_some(), "null is not a requested record");
+        Ok((0, Some(named)))
+    } else {
+        Ok((parse_number(Some(value.into()), name)?, None))
+    }
 }
 
 fn parse_number(value: Option<std::ffi::OsString>, name: &str) -> Result<u32> {
@@ -1018,10 +1077,12 @@ mod tests {
         let options = Options {
             assets: directory.path().to_owned(),
             worldspace: 0x3c,
+            worldspace_name: None,
             grid_x: 0,
             grid_y: 0,
             radius: 0,
             reference: None,
+            reference_name: None,
             output: None,
         };
         let error = inspect_world(&options).unwrap_err();

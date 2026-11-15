@@ -629,11 +629,19 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// world bounds overlap it. Needs `statics.bounds_*`, which exist only after
 /// `finalize_world_database` has read the converted models. Safe to run again: it replaces
 /// every `contained = 0` row. Returns the number of rows written.
-pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
+pub fn add_overlap_rows(conn: &mut Connection) -> color_eyre::Result<u64> {
+    let identity = shared::pack_identity::PackIdentity::read_sql(conn)?;
+    let version: u32 = conn.query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
+        row.get(0)
+    })?;
+    color_eyre::eyre::ensure!(
+        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "world room data is out of date; convert again"
+    );
     if !table_exists(conn, "room_bounds")? || !table_exists(conn, "reference_rooms")? {
         return Ok(0);
     }
-    // A reused older database may lack the bounds columns; with no rooms there is nothing to do.
+    // A current world may hold no rooms; only compatible worlds reach the optional bounds pass.
     let has_rooms: bool =
         conn.query_row("SELECT EXISTS(SELECT 1 FROM room_bounds)", [], |row| {
             row.get(0)
@@ -646,7 +654,7 @@ pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
     if !has_rooms || !has_bounds {
         return Ok(0);
     }
-    let mut rooms_by_cell: BTreeMap<u32, Vec<Room>> = BTreeMap::new();
+    let mut rooms_by_cell: BTreeMap<i64, Vec<(i64, RoomBox)>> = BTreeMap::new();
     {
         let mut statement = conn.prepare(
             "SELECT ref_id, cell_id, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, half_x, half_y, half_z FROM room_bounds ORDER BY ref_id",
@@ -654,8 +662,8 @@ pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
         let rows = statement.query_map([], |row| {
             let f = |index: usize| row.get::<_, f32>(index);
             Ok((
-                row.get::<_, u32>(0)?,
-                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
                 [f(2)?, f(3)?, f(4)?],
                 [f(5)?, f(6)?, f(7)?],
                 [f(8)?, f(9)?, f(10)?],
@@ -663,10 +671,12 @@ pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
         })?;
         for row in rows {
             let (ref_id, cell, position, rotation, half) = row?;
-            rooms_by_cell.entry(cell).or_default().push(Room {
-                ref_id,
-                shape: RoomBox::new(position, rotation, half),
-            });
+            let ref_id = identity.required_key(ref_id)?.to_sql_i64();
+            let cell = identity.required_key(cell)?.to_sql_i64();
+            rooms_by_cell
+                .entry(cell)
+                .or_default()
+                .push((ref_id, RoomBox::new(position, rotation, half)));
         }
     }
     let tx = conn.transaction()?;
@@ -677,18 +687,30 @@ pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
             "SELECT r.id, r.cell_id, r.pos_x, r.pos_y, r.pos_z, r.rot_x, r.rot_y, r.rot_z, r.scale,
                     s.bounds_min_x, s.bounds_min_y, s.bounds_min_z, s.bounds_max_x, s.bounds_max_y, s.bounds_max_z
              FROM \"references\" r JOIN statics s ON s.id = r.base_form_id
-             WHERE s.bounds_valid = 1 AND r.base_form_id NOT IN (?1, ?2)
+             WHERE s.bounds_valid = 1 AND (?1 IS NULL OR r.base_form_id<>?1) AND (?2 IS NULL OR r.base_form_id<>?2)
                AND r.cell_id IN (SELECT cell_id FROM room_bounds)
              ORDER BY r.id",
         )?;
         let mut insert = tx.prepare(
             "INSERT OR IGNORE INTO reference_rooms(reference_id, room_ref, contained) VALUES (?1, ?2, 0)",
         )?;
-        let mut rows = select.query(params![ROOM_MARKER_BASE, PORTAL_MARKER_BASE])?;
+        let marker = |local| {
+            identity
+                .table()
+                .id("Skyrim.esm")
+                .map(|owner| {
+                    shared::form_key::FormKey::new(owner, local).map(|key| key.to_sql_i64())
+                })
+                .transpose()
+        };
+        let mut rows = select.query(params![
+            marker(ROOM_MARKER_BASE)?,
+            marker(PORTAL_MARKER_BASE)?
+        ])?;
         while let Some(row) = rows.next()? {
             let f = |index: usize| row.get::<_, f32>(index);
-            let id: u32 = row.get(0)?;
-            let cell: u32 = row.get(1)?;
+            let id = identity.required_key(row.get(0)?)?.to_sql_i64();
+            let cell = identity.required_key(row.get(1)?)?.to_sql_i64();
             let corners = placed_bounds_corners(
                 [f(9)?, f(10)?, f(11)?],
                 [f(12)?, f(13)?, f(14)?],
@@ -699,12 +721,12 @@ pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
             let Some(rooms) = rooms_by_cell.get(&cell) else {
                 continue;
             };
-            for room in rooms
+            for (room_ref, _) in rooms
                 .iter()
-                .filter(|room| room.shape.overlaps_points(&corners))
+                .filter(|(_, shape)| shape.overlaps_points(&corners))
             {
                 // The pivot rows (contained = 1) win: the key is (reference, room).
-                written += insert.execute(params![id, room.ref_id])? as u64;
+                written += insert.execute(params![id, room_ref])? as u64;
             }
         }
     }

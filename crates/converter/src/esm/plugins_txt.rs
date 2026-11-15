@@ -344,6 +344,62 @@ pub(crate) fn read_with_selection_diagnostics(
     )
 }
 
+/// Native publication selects the same inputs without runtime slot admission caps.
+pub(crate) fn read_form_key_with_selection_diagnostics(
+    path: &Path,
+    data_dir: &Path,
+    ccc: Option<&Path>,
+    ini: Option<&Path>,
+    notices: &mut Vec<String>,
+    skipped_plugins: &mut Vec<String>,
+    selection_warnings: &mut Vec<CreationFallbackWarning>,
+) -> Result<Vec<PathBuf>> {
+    read_with_capacity(
+        SelectionInputs {
+            path,
+            data_dir,
+            ccc,
+            ini,
+        },
+        notices,
+        skipped_plugins,
+        selection_warnings,
+        false,
+    )
+}
+
+/// Recover discovered inputs under the native owner allocation.
+pub(crate) fn recover_form_key_discovered(
+    paths: Vec<PathBuf>,
+    notices: &mut Vec<String>,
+    skipped_plugins: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let candidates = paths.clone();
+    let mut warnings = Warnings::default();
+    let paths = unique_plugin_candidates(paths, &mut warnings);
+    let paths = usable_plugins(paths, &mut warnings);
+    warnings.finish(notices);
+    let paths = load_order::order_discovered_form_key_plugins(paths, notices, &mut Vec::new())?;
+    record_recovery_skips(&candidates, &paths, skipped_plugins);
+    Ok(paths)
+}
+
+/// Keep explicit profile priority and recover bad dependencies without slot caps.
+pub(crate) fn recover_form_key_with_diagnostics(
+    paths: Vec<PathBuf>,
+    notices: &mut Vec<String>,
+    skipped_plugins: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let candidates = paths.clone();
+    let mut warnings = Warnings::default();
+    let paths = unique_plugin_candidates(paths, &mut warnings);
+    let paths = usable_plugins(paths, &mut warnings);
+    warnings.finish(notices);
+    let paths = load_order::recover_ordered_form_key_plugins(paths, notices, &mut Vec::new())?;
+    record_recovery_skips(&candidates, &paths, skipped_plugins);
+    Ok(paths)
+}
+
 /// Explicit selection inputs keep capacity independent of official and Creation Club ordering.
 struct SelectionInputs<'a> {
     path: &'a Path,

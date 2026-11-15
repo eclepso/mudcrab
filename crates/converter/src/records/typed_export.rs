@@ -25,6 +25,71 @@ struct RecordView<'a> {
     localization: &'a BTreeMap<usize, serde_json::Value>,
 }
 
+/// Stream the paired native report with named root/group identities and unchanged source facts.
+pub(crate) fn write_native_record<W: Write>(
+    writer: &mut W,
+    key: Option<shared::form_key::FormKey>,
+    record: &super::native::NativeRecord,
+    table: &shared::plugin_table::PluginTable,
+    localization: &BTreeMap<usize, serde_json::Value>,
+) -> serde_json::Result<()> {
+    serde_json::to_writer(
+        writer,
+        &NativeRecordView {
+            key,
+            record,
+            table,
+            localization,
+        },
+    )
+}
+
+struct NativeRecordView<'a> {
+    key: Option<shared::form_key::FormKey>,
+    record: &'a super::native::NativeRecord,
+    table: &'a shared::plugin_table::PluginTable,
+    localization: &'a BTreeMap<usize, serde_json::Value>,
+}
+
+impl Serialize for NativeRecordView<'_> {
+    /// Keep the established envelope and scalar policy while naming all semantic identities.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        let named = |key: Option<shared::form_key::FormKey>| {
+            key.map_or(Ok(shared::form_key::NamedFormKey::Null), |key| {
+                self.table.named(key)
+            })
+            .map_err(S::Error::custom)
+        };
+        let record = &self.record.decoded;
+        let mut output = serializer.serialize_struct("TypedRecord", 20)?;
+        output.serialize_field("form_id", &named(self.key)?)?;
+        output.serialize_field("source_form_id", &record.source_form_id)?;
+        output.serialize_field("record_type", &record.record_type)?;
+        output.serialize_field("flags", &record.flags)?;
+        output.serialize_field("load_order", &record.load_order)?;
+        output.serialize_field("version_control", &record.version_control)?;
+        output.serialize_field("form_version", &record.form_version)?;
+        output.serialize_field("header_unknown", &record.header_unknown)?;
+        output.serialize_field("cell_form_id", &named(self.record.cell)?)?;
+        output.serialize_field("worldspace_form_id", &named(self.record.worldspace)?)?;
+        output.serialize_field("topic_form_id", &named(self.record.topic)?)?;
+        output.serialize_field("source_topic_form_id", &record.source_topic_form_id)?;
+        output.serialize_field("topic_group_offset", &record.topic_group_offset)?;
+        output.serialize_field("source_record_offset", &record.source_record_offset)?;
+        output.serialize_field("fields", &FieldsView(&record.fields))?;
+        output.serialize_field("rejected_fields", &record.rejected_fields)?;
+        output.serialize_field("payload_complete", &record.payload_complete)?;
+        output.serialize_field("supported", &record.supported)?;
+        output.serialize_field("localization", self.localization)?;
+        output.serialize_field(
+            "source_payload_sha256",
+            &crate::cache::hash_bytes(&record.raw_payload),
+        )?;
+        output.end()
+    }
+}
+
 impl Serialize for RecordView<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let record = self.record;
@@ -110,6 +175,9 @@ impl Serialize for ValueView<'_> {
                 serializer.serialize_newtype_variant("Value", 4, "LocalizedString", value)
             }
             Value::FormId(value) => {
+                serializer.serialize_newtype_variant("Value", 5, "FormId", value)
+            }
+            Value::NativeFormKey(value) => {
                 serializer.serialize_newtype_variant("Value", 5, "FormId", value)
             }
             Value::Bytes(value) => serializer.serialize_newtype_variant("Value", 6, "Bytes", value),

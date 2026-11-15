@@ -20,7 +20,7 @@ use std::{
     time::Instant,
 };
 
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 const KIND: &str = "mudcrab_base_database";
 const RECEIPT: &str = "receipt.json";
 
@@ -44,6 +44,7 @@ struct Receipt {
     complete: bool,
     key: String,
     identity: serde_json::Value,
+    plugin_table_digest: String,
     files: BTreeMap<String, Payload>,
 }
 
@@ -111,6 +112,20 @@ fn source_fingerprint() -> String {
         include_bytes!("actor_models.rs"),
         include_bytes!("animation/authoring.rs"),
         include_bytes!("esm/mod.rs"),
+        include_bytes!("esm/form_keys.rs"),
+        include_bytes!("esm/form_key_merge.rs"),
+        include_bytes!("esm/form_key_store.rs"),
+        include_bytes!("esm/form_key_projection.rs"),
+        include_bytes!("esm/form_key_world.rs"),
+        include_bytes!("records/native.rs"),
+        include_bytes!("records/source_identity.rs"),
+        include_bytes!("../../shared/src/form_key.rs"),
+        include_bytes!("../../shared/src/plugin_table.rs"),
+        include_bytes!("../../shared/src/source_form_id.rs"),
+        include_bytes!("../../shared/src/pack_identity.rs"),
+        include_bytes!("../../shared/src/cache_identity.rs"),
+        include_bytes!("../../shared/src/records.rs"),
+        include_bytes!("../../shared/src/records_context.rs"),
         include_bytes!("esm/binary.rs"),
         include_bytes!("esm/mmap_reader.rs"),
         include_bytes!("esm/load_order.rs"),
@@ -214,8 +229,17 @@ fn identity_with_program(
     let Ok(program_sha256) = program() else {
         return Ok(None);
     };
+    // A cache proof uses the same original headers/order/content allocation as production.
+    // Invalid source headers merely disable this optional cache; the reader owns local recovery.
+    let scope = match crate::esm::form_keys::FormKeyOrder::read(plugins)
+        .and_then(|order| order.pack_identity())
+    {
+        Ok(scope) => scope,
+        Err(_) => return Ok(None),
+    };
     let inputs = serde_json::json!({
         "cache_format": FORMAT,
+        "plugin_table_digest":scope.digest_hex(),
         "converter_schema": CONVERTER_SCHEMA_VERSION,
         "database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
         "reader": inhouse::configured_reader_identity(config)?,
@@ -286,6 +310,8 @@ fn receipt_matches(receipt: &Receipt, identity: &Identity) -> bool {
         && receipt.complete
         && receipt.key == identity.key
         && receipt.identity == identity.inputs
+        && Some(receipt.plugin_table_digest.as_str())
+            == identity.inputs["plugin_table_digest"].as_str()
         && receipt.files.keys().map(String::as_str).collect::<Vec<_>>() == {
             let mut expected = outputs(identity.reader);
             expected.sort_unstable();
@@ -326,6 +352,14 @@ fn validate_bundle(directory: &Path, identity: &Identity) -> Result<()> {
         directory.join("skyrim_world.db"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
+    shared::world_assets::validate_world_database(&directory.join("skyrim_world.db"))?;
+    let scope = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    ensure!(
+        identity.inputs["plugin_table_digest"].as_str() == Some(scope.digest_hex().as_str()),
+        "database-cache allocation differs from its source proof; convert again"
+    );
+    shared::records::RecordContextReader::new(&connection)
+        .wrap_err("database-cache native context is invalid; convert again")?;
     validate_database(&connection)?;
     if identity.reader == RecordReader::Inhouse {
         for table in [
@@ -554,6 +588,8 @@ pub(super) fn store(
             },
         );
     }
+    // Authenticate the private generation before a receipt can certify it for future restores.
+    validate_bundle(temporary.path(), identity)?;
     // The pending copies are private inodes. Only their fully durable receipt is published.
     let receipt = Receipt {
         kind: KIND.to_owned(),
@@ -561,6 +597,12 @@ pub(super) fn store(
         complete: true,
         key: identity.key.clone(),
         identity: identity.inputs.clone(),
+        plugin_table_digest: identity.inputs["plugin_table_digest"]
+            .as_str()
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("database-cache source has no allocation proof")
+            })?
+            .to_owned(),
         files,
     };
     let mut receipt_file = fs::File::create(temporary.path().join(RECEIPT))?;
@@ -682,21 +724,35 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let records = EsmParser::convert_plugins_with_reader(
+        let conversion = EsmParser::convert_plugins_with_reader_and_schemas(
             &plugins,
             &staging.join("skyrim_world.db"),
             config.record_reader,
             &staging.join("vfs"),
+            &config.language,
+            None,
         )
         .unwrap();
         inhouse::write_database_profile(
             &staging,
             &staging.join("skyrim_world.db"),
-            &std::collections::BTreeMap::new(),
+            &conversion.phases,
         )
         .unwrap();
-        inhouse::write_terrain_caches(&records, &staging.join("skyrim_world.db"), &staging)
+        let native = conversion.native.unwrap();
+        for preserved in [false, true] {
+            crate::esm::cell_cache::write_form_key_cell_cache(
+                &native,
+                &conversion.source_offsets,
+                &staging.join(if preserved {
+                    "cell_cache_preserved.rkyv"
+                } else {
+                    "cell_cache.rkyv"
+                }),
+                preserved,
+            )
             .unwrap();
+        }
         inhouse::write_configured_reader_identity(&staging, &config).unwrap();
         write_conversion_notes(&staging, &ConversionNotes::default()).unwrap();
         let cache = directory.path().join("cache");
@@ -714,6 +770,36 @@ mod tests {
         let path = fixture.directory.path().join(name);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// The previous receipt format cannot certify the new identity-bearing SQL/cache generation.
+    #[test]
+    fn database_bundle_format_two_is_refused_even_when_all_hashes_match() {
+        let fixture = fixture();
+        store(
+            &fixture.cache,
+            &fixture.identity,
+            &fixture.staging,
+            &Cancellation::new(),
+        )
+        .unwrap();
+        let receipt_path = fixture.cache.join(&fixture.identity.key).join(RECEIPT);
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        receipt["format_version"] = serde_json::json!(2);
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let target = destination(&fixture, "old-format-target");
+        assert!(
+            restore(
+                &fixture.cache,
+                &fixture.identity,
+                &target,
+                &Cancellation::new()
+            )
+            .unwrap()
+            .is_none(),
+            "old receipt must miss instead of restoring an old pack"
+        );
     }
 
     #[test]

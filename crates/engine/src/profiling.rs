@@ -782,7 +782,7 @@ impl ProfilingState {
         write_json(
             &root.join("metadata.json"),
             &Metadata {
-                format_version: 2,
+                format_version: 3,
                 engine_version: env!("CARGO_PKG_VERSION"),
                 bevy_version: "0.19",
                 generated_unix_ms: unix_ms(),
@@ -803,7 +803,7 @@ impl ProfilingState {
                     .as_ref()
                     .map(|window| window.physical_resolution),
                 window: self.window.clone(),
-                worldspace_id: config.worldspace_id,
+                worldspace_id: portable_worldspace(config)?,
                 start_grid: config.start_grid,
                 stream_radius: config.stream_radius,
                 synthetic_instances: config.synthetic_instances,
@@ -824,12 +824,25 @@ impl ProfilingState {
         write_json(
             &root.join("streaming.json"),
             &StreamingProfile {
+                format_version: 2,
                 aggregate: streaming.cloned(),
-                timeline: self.timeline.clone(),
+                timeline: self
+                    .timeline
+                    .iter()
+                    .map(|event| {
+                        let mut event = event.clone();
+                        event.subject =
+                            portable_subject(&event.subject, config.bound_identity.as_deref())?;
+                        Ok(event)
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?,
             },
         )?;
         if let Some(trace) = &self.trace {
-            write_json(&root.join("streaming-frames.json"), &trace.report())?;
+            write_json(
+                &root.join("streaming-frames.json"),
+                &trace.named_report(config.bound_identity.as_deref())?,
+            )?;
         }
         write_json(&root.join("renderer.json"), renderer)?;
         if let Some(draw_submission) = &self.draw_submission {
@@ -1099,7 +1112,7 @@ struct Metadata {
     build_profile: &'static str,
     resolution: Option<[u32; 2]>,
     window: Option<WindowMetadata>,
-    worldspace_id: u32,
+    worldspace_id: shared::form_key::NamedFormKey,
     start_grid: (i32, i32),
     stream_radius: i32,
     synthetic_instances: usize,
@@ -1394,6 +1407,7 @@ fn gpu_profile(
 
 #[derive(Serialize)]
 struct StreamingProfile {
+    format_version: u32,
     aggregate: Option<StreamingMetrics>,
     timeline: Vec<TimelineEvent>,
 }
@@ -1656,6 +1670,73 @@ fn summary_markdown(
         ));
     }
     output
+}
+
+/// Runtime handles remain private; every identity-bearing output uses the bound world scope.
+fn portable_worldspace(config: &EngineConfig) -> std::io::Result<shared::form_key::NamedFormKey> {
+    match config.bound_identity.as_deref() {
+        Some(identity) => crate::config::named_runtime_request(identity, config.worldspace_id)
+            .map_err(std::io::Error::other),
+        None if config.benchmark_only
+            || config.synthetic_instances > 0
+            || config.material_fixture
+            || config.terrain_water_fixture
+            || config.transform_bounds_fixture
+            || config.renderer_fixture
+            || config.physics_fixture =>
+        {
+            Ok(shared::form_key::NamedFormKey::Null)
+        }
+        None => Err(std::io::Error::other(
+            "profiling output requires bound world identity",
+        )),
+    }
+}
+
+fn portable_subject(
+    subject: &str,
+    identity: Option<&shared::pack_identity::PackIdentity>,
+) -> std::io::Result<String> {
+    let portable = |word: &str, stored: bool| -> std::io::Result<String> {
+        let identity = identity.ok_or_else(|| {
+            std::io::Error::other("timeline output requires bound world identity")
+        })?;
+        let key = if stored {
+            let packed = word.parse::<i64>().map_err(std::io::Error::other)?;
+            identity
+                .required_key(packed)
+                .map_err(std::io::Error::other)?
+        } else {
+            let word = word.parse::<u32>().map_err(std::io::Error::other)?;
+            identity
+                .runtime_key(word)
+                .map_err(std::io::Error::other)?
+                .ok_or_else(|| std::io::Error::other("null timeline identity"))?
+        };
+        Ok(identity
+            .table()
+            .named(key)
+            .map_err(std::io::Error::other)?
+            .to_string())
+    };
+    for (prefix, stored) in [
+        ("Exterior { worldspace_id: ", false),
+        ("ChunkKey { worldspace_id: ", true),
+    ] {
+        if let Some(rest) = subject.strip_prefix(prefix) {
+            let (word, suffix) = rest
+                .split_once(',')
+                .ok_or_else(|| std::io::Error::other("malformed timeline identity"))?;
+            return Ok(format!("{prefix}{},{}", portable(word, stored)?, suffix));
+        }
+    }
+    if let Some(word) = subject
+        .strip_prefix("Interior(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Ok(format!("Interior({})", portable(word, false)?));
+    }
+    Ok(subject.to_owned())
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -2506,10 +2587,41 @@ mod tests {
 
     /// Verify aggregate bundle files are written without a frame sidecar when tracing is disabled.
     #[test]
+    fn profiling_identity_requires_binding_and_keeps_owner_separate_from_priority() {
+        let identity = crate::config::identity_request_fixture();
+        assert_eq!(
+            portable_subject(
+                "Exterior { worldspace_id: 60, grid_x: 1, grid_y: -2 }",
+                Some(&identity)
+            )
+            .unwrap(),
+            "Exterior { worldspace_id: 00003C:Zulu.esm, grid_x: 1, grid_y: -2 }"
+        );
+        assert_eq!(
+            portable_subject(
+                "ChunkKey { worldspace_id: 33554492, tier: Tier4 }",
+                Some(&identity)
+            )
+            .unwrap(),
+            "ChunkKey { worldspace_id: 00003C:Zulu.esm, tier: Tier4 }"
+        );
+        assert!(portable_subject("Interior(60)", None).is_err());
+        assert!(
+            portable_subject(
+                "Exterior { worldspace_id: 16777276, grid_x: 0, grid_y: 0 }",
+                Some(&identity)
+            )
+            .is_err()
+        );
+        assert!(portable_worldspace(&EngineConfig::default()).is_err());
+    }
+
+    #[test]
     fn writes_complete_profile_bundle() {
         let directory = tempfile::tempdir().unwrap();
         let config = EngineConfig {
             profile_output_dir: Some(directory.path().to_owned()),
+            bound_identity: Some(Arc::new(crate::config::identity_request_fixture())),
             profile_scenario: "synthetic".into(),
             ..Default::default()
         };
@@ -2549,7 +2661,7 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.path().join("metadata.json")).unwrap())
                 .unwrap();
-        assert_eq!(metadata["format_version"], 2);
+        assert_eq!(metadata["format_version"], 3);
         assert!(metadata["resolution"].is_null());
         assert!(summary.contains("GPU pass timings are unavailable"));
         assert!(
@@ -2579,6 +2691,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = EngineConfig {
             profile_output_dir: Some(directory.path().to_owned()),
+            bound_identity: Some(Arc::new(crate::config::identity_request_fixture())),
             profile_scenario: "vulkan".into(),
             ..Default::default()
         };

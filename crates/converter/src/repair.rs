@@ -144,8 +144,11 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
     let mut manifest: ConversionManifest = serde_json::from_slice(&original_bytes)?;
     ensure!(
         manifest.schema_version == CONVERTER_SCHEMA_VERSION,
-        "repair requires the current manifest schema"
+        "repair requires the current manifest schema; convert again"
     );
+    if output.join("skyrim_world.db").exists() {
+        manifest.validate_world_generation(&output)?;
+    }
     ensure!(
         !manifest.failures.is_empty(),
         "manifest has no failed inputs to repair"

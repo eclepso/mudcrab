@@ -88,7 +88,7 @@ pub struct SlotAttributes {
 /// [`TerrainCellMesh::validate`] refuses first.
 pub fn expand_slots(
     cell: &TerrainCellMesh,
-    ids: &HashMap<u32, u16>,
+    ids: &HashMap<u64, u16>,
 ) -> Result<SlotAttributes, String> {
     let stride = usize::from(cell.slot_stride);
     if !shared::terrain_mesh::TERRAIN_SLOT_STRIDES.contains(&cell.slot_stride)
@@ -212,7 +212,7 @@ pub fn has_zero_normal(cell: &TerrainCellMesh) -> bool {
 /// triangles reproduce today's four quadrant meshes (`build_terrain_quadrant_mesh`) exactly,
 /// stacked in quadrant order; indices are `u32` so the collider reads the same buffers it does
 /// for a quadrant.
-pub fn build_merged_mesh(cell: &TerrainCellMesh, ids: &HashMap<u32, u16>) -> Result<Mesh, String> {
+pub fn build_merged_mesh(cell: &TerrainCellMesh, ids: &HashMap<u64, u16>) -> Result<Mesh, String> {
     let slots = expand_slots(cell, ids)?;
     let mut positions = Vec::with_capacity(CELL_MESH_VERTICES);
     let mut normals = Vec::with_capacity(CELL_MESH_VERTICES);

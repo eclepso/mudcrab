@@ -5,6 +5,33 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Read the current authenticated wire format, then expose checked gameplay handles solely
+/// for existing geometry/recovery oracles. No old bytes are accepted by this fixture helper.
+#[allow(dead_code)]
+pub fn runtime_cache(output: &Path, name: &str) -> shared::CellCache {
+    let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&database).unwrap();
+    let mut cache =
+        converter::esm::cell_cache::read_form_key_cell_cache(&output.join(name)).unwrap();
+    let runtime = |key| {
+        u64::from(
+            identity
+                .runtime_id(shared::cache_identity::required(&identity, key).unwrap())
+                .unwrap(),
+        )
+    };
+    for cell in &mut cache.cells {
+        cell.cell_id = runtime(cell.cell_id);
+        cell.water_type_form_id = cell.water_type_form_id.map(runtime);
+        for layer in &mut cell.layers {
+            if layer.texture_form_id != 0 {
+                layer.texture_form_id = runtime(layer.texture_form_id);
+            }
+        }
+    }
+    cache
+}
+
 /// Keep deterministic pipeline fixtures independent of GPU availability.
 // Each test crate uses only some of these helpers.
 #[allow(dead_code)]

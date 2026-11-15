@@ -8,7 +8,7 @@
 //! Per-vertex weights are stored for slots 1 and up; the slot 0 weight is implied as
 //! `max(0, 1 - sum of the others)`, as the shader computes it today.
 //!
-//! Slots name land textures by LTEX FormID in load-order numbering (0 = the default texture),
+//! Slots name land textures by Pack-scoped LTEX FormKey (0 = the default texture),
 //! not by table id, so a cell depends only on its own records: adding or removing a landscape
 //! texture elsewhere never makes it stale. The engine maps FormIDs to the u16 ids of the
 //! game-wide [`LandTextureTable`] at load.
@@ -32,7 +32,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::collections::HashMap;
 
 /// Bumped whenever the layout below changes; part of every derived-data key.
-pub const TERRAIN_MESH_FORMAT_VERSION: u32 = 1;
+pub const TERRAIN_MESH_FORMAT_VERSION: u32 = 2;
 /// The slot strides a cell may use: 8 normally, 16 when a quadrant needs more than 8.
 pub const TERRAIN_SLOT_STRIDES: [u8; 2] = [8, 16];
 /// The most slots a quadrant can carry; the converter refuses a quadrant that needs more.
@@ -46,7 +46,7 @@ pub const CELL_MESH_VERTICES: usize = 4 * QUADRANT_VERTICES;
 /// Creation units between neighbouring vertices (4096 / 32).
 pub const TERRAIN_VERTEX_SPACING: f32 = 128.0;
 /// The slot value and table entry of the default texture (a quadrant with no BTXT).
-pub const DEFAULT_LAND_TEXTURE_FORM_ID: u32 = 0;
+pub const DEFAULT_LAND_TEXTURE_FORM_ID: u64 = 0;
 /// Land texture repeats across one cell: the one UV constant both sides use.
 pub const TERRAIN_UV_REPEATS_PER_CELL: f32 = crate::LAND_TEXTURE_REPEATS_PER_CELL;
 /// The texture-array size classes, in texels per side. A source goes into the smallest class
@@ -73,10 +73,10 @@ pub const fn terrain_chunk_for_cell(grid_x: i32, grid_y: i32) -> (i32, i32) {
 }
 
 /// Path of the chunk file holding exterior cell (`grid_x`, `grid_y`) of `worldspace_id`
-/// (load-order numbering), relative to the converted output root.
-pub fn terrain_chunk_path(worldspace_id: u32, grid_x: i32, grid_y: i32) -> String {
+/// (pack-scoped FormKey), relative to the converted output root.
+pub fn terrain_chunk_path(worldspace_id: u64, grid_x: i32, grid_y: i32) -> String {
     let (chunk_x, chunk_y) = terrain_chunk_for_cell(grid_x, grid_y);
-    format!("terrain/{worldspace_id:08x}/chunk_{chunk_x}_{chunk_y}.rkyv")
+    format!("terrain/{worldspace_id:016x}/chunk_{chunk_x}_{chunk_y}.rkyv")
 }
 /// The block formats diffuse arrays keep as-is: BC1 and BC3 (vanilla) and BC7.
 pub const DIFFUSE_FORMATS: [LandTextureFormat; 3] = [
@@ -168,8 +168,8 @@ pub fn quadrant_triangles(quadrant: usize) -> Vec<[u16; 3]> {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, PartialEq)]
 #[rkyv(bytecheck())]
 pub struct TerrainCellMesh {
-    /// The CELL FormID, in load-order numbering.
-    pub cell_id: u32,
+    /// The checked pack-scoped CELL FormKey.
+    pub cell_id: u64,
     /// The derived-data key this mesh was built from (#185): a hash of the LAND record, its
     /// plugin's master list, the LTEX and TXST records it uses and
     /// [`TERRAIN_MESH_FORMAT_VERSION`].
@@ -183,9 +183,9 @@ pub struct TerrainCellMesh {
     pub vertex_colors: Vec<u8>,
     /// Slots per quadrant: one of [`TERRAIN_SLOT_STRIDES`].
     pub slot_stride: u8,
-    /// 4 x `slot_stride` LTEX FormIDs (load-order numbering), quadrant by quadrant; slot 0 is
+    /// 4 x `slot_stride` pack-scoped LTEX FormKeys, quadrant by quadrant; slot 0 is
     /// the base, 0 the default texture. Slots past a quadrant's count are 0.
-    pub quadrant_slots: Vec<u32>,
+    pub quadrant_slots: Vec<u64>,
     /// Per quadrant: how many slots are in use (1..=`slot_stride`).
     pub quadrant_slot_counts: [u8; 4],
     /// [`CELL_MESH_VERTICES`] x `slot_stride` weights, 0..=255 for 0..=1, vertex by vertex.
@@ -198,8 +198,8 @@ pub struct TerrainCellMesh {
 #[rkyv(bytecheck())]
 pub struct TerrainChunkFile {
     pub format_version: u32,
-    /// The WRLD FormID, in load-order numbering.
-    pub worldspace_id: u32,
+    /// The checked pack-scoped WRLD FormKey.
+    pub worldspace_id: u64,
     pub cells: Vec<TerrainCellMesh>,
 }
 
@@ -252,8 +252,8 @@ pub struct ArrayLayer {
 pub struct LandTextureEntry {
     /// The id the engine puts in the per-vertex slot attribute: the entry's index.
     pub id: u16,
-    /// LTEX FormID in load-order numbering; [`DEFAULT_LAND_TEXTURE_FORM_ID`] for the default.
-    pub ltex_form_id: u32,
+    /// Pack-scoped LTEX FormKey; [`DEFAULT_LAND_TEXTURE_FORM_ID`] for the default.
+    pub ltex_form_id: u64,
     pub diffuse: ArrayLayer,
     /// None when the texture set has no normal map.
     pub normal: Option<ArrayLayer>,
@@ -351,7 +351,7 @@ pub enum TerrainMeshError {
     UnknownTexture {
         quadrant: usize,
         slot: usize,
-        ltex_form_id: u32,
+        ltex_form_id: u64,
     },
     ImpliedWeightSet {
         vertex: usize,
@@ -361,7 +361,7 @@ pub enum TerrainMeshError {
         id: u16,
     },
     TableDuplicate {
-        ltex_form_id: u32,
+        ltex_form_id: u64,
     },
     TableArray {
         id: u16,
@@ -578,7 +578,7 @@ impl LandTextureTable {
     }
 
     /// LTEX FormID to table id, built once per load.
-    pub fn ids_by_form_id(&self) -> HashMap<u32, u16> {
+    pub fn ids_by_form_id(&self) -> HashMap<u64, u16> {
         self.entries
             .iter()
             .map(|entry| (entry.ltex_form_id, entry.id))
@@ -590,7 +590,7 @@ impl TerrainCellMesh {
     /// Checks lengths, slot lists and weights against the layout, and that every slot's
     /// texture is in the table (`ids` from [`LandTextureTable::ids_by_form_id`]). The converter
     /// calls it before writing a cell, and the engine before using one.
-    pub fn validate(&self, ids: &HashMap<u32, u16>) -> Result<(), TerrainMeshError> {
+    pub fn validate(&self, ids: &HashMap<u64, u16>) -> Result<(), TerrainMeshError> {
         if !TERRAIN_SLOT_STRIDES.contains(&self.slot_stride) {
             return Err(TerrainMeshError::SlotStride {
                 found: self.slot_stride,
@@ -674,7 +674,7 @@ mod tests {
                 .map(|id| LandTextureEntry {
                     id,
                     // Entry 0 is the default texture; the rest stand for LTEX 0x100, 0x101...
-                    ltex_form_id: if id == 0 { 0 } else { 0xFF + u32::from(id) },
+                    ltex_form_id: if id == 0 { 0 } else { 0xFF + u64::from(id) },
                     diffuse: ArrayLayer {
                         array: 0,
                         layer: id,
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(terrain_chunk_for_cell(-4, -5), (-1, -2));
         assert_eq!(
             terrain_chunk_path(0x3C, 5, -1),
-            "terrain/0000003c/chunk_1_-1.rkyv"
+            "terrain/000000000000003c/chunk_1_-1.rkyv"
         );
     }
 

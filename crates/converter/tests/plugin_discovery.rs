@@ -12,6 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+fn stored_key(connection: &Connection, owner: &str, local: u32) -> shared::form_key::FormKey {
+    let identity = shared::pack_identity::PackIdentity::read_sql(connection).unwrap();
+    shared::form_key::FormKey::new(identity.table().id(owner).unwrap(), local).unwrap()
+}
+
 /// Encode a synthetic subrecord without relying on the parser under test.
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
     [tag.as_slice(), &(bytes.len() as u16).to_le_bytes(), bytes].concat()
@@ -450,7 +455,7 @@ async fn explicit_regular_override_beats_a_master_listed_after_it() {
     assert_eq!(setting, (222.0, "A.esp".to_string()));
     let object: (String, String, String) = conn.query_row(
         "SELECT s.editor_id, p.name, f.plugin_name FROM statics s JOIN records r ON r.form_id=s.id
-         JOIN plugins p ON p.priority=r.load_order JOIN formid_map f ON f.form_id=s.id WHERE s.id=3",
+         JOIN plugins p ON p.priority=r.load_order JOIN formid_map f ON f.form_id=s.id WHERE f.plugin_name='skyrim.esm' AND f.internal_id=3",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).unwrap();
     assert_eq!(
@@ -673,7 +678,7 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
             setting,
             (f64::from(height), winner.to_string(), "b.esm".to_string())
         );
-        for (id, owner, local, editor, source) in [
+        for (_legacy_id, owner, local, editor, source) in [
             (0x01000811u32, "b.esm", 0x811, "MasterOverride", "A.esp"),
             (0xfe000812, "light.esl", 0x812, "LightOverride", "A.esp"),
             (0xfe001813, "small.esp", 0x813, "SmallOwned", "Small.esp"),
@@ -684,7 +689,7 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
                     "SELECT f.plugin_name, f.internal_id, s.editor_id, p.name FROM formid_map f
                  JOIN statics s ON s.id=f.form_id JOIN records r ON r.form_id=f.form_id
                  JOIN plugins p ON p.priority=r.load_order WHERE f.form_id=?1",
-                    [id],
+                    [stored_key(&conn, owner, local).to_sql_i64()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
@@ -699,9 +704,11 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
             );
         }
         let heightmap: Vec<u8> = conn
-            .query_row("SELECT heightmap FROM land WHERE cell_id=16", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT heightmap FROM land WHERE cell_id=?1",
+                [stored_key(&conn, "Skyrim.esm", 0x10).to_sql_i64()],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(
             f32::from_le_bytes(heightmap[..4].try_into().unwrap()),
@@ -709,11 +716,16 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
         );
         let mmap = converter::esm::cell_cache::validate_cell_cache(&output.join("cell_cache.rkyv"))
             .unwrap();
-        let cache = rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(&mmap).unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+        let payload = shared::cache_identity::cell_cache_payload(&identity, &mmap, false).unwrap();
+        let cache =
+            rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(payload).unwrap();
         let land = cache
             .cells
             .iter()
-            .find(|land| land.cell_id == 0x10)
+            .find(|land| {
+                u64::from(land.cell_id) == stored_key(&conn, "Skyrim.esm", 0x10).to_packed()
+            })
             .unwrap();
         assert!(
             land.heights
@@ -811,12 +823,12 @@ fn header_errors_include_the_plugin_path_and_framed_record_errors_recover_locall
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&[path], &db).unwrap();
     let conn = Connection::open(db).unwrap();
-    let ids: Vec<u32> = conn
+    let ids: Vec<u64> = conn
         .prepare("SELECT form_id FROM records ORDER BY form_id")
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(ids, [0x801]);
+    assert_eq!(ids, [0x0100_0801]);
 }

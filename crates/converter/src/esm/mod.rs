@@ -21,7 +21,9 @@ mod environment;
 pub mod exporter;
 pub mod extractors;
 pub mod form_key_merge;
+pub(crate) mod form_key_projection;
 pub mod form_key_store;
+pub mod form_key_world;
 pub mod form_keys;
 pub mod inhouse;
 mod inhouse_script_properties;
@@ -71,6 +73,8 @@ pub(crate) struct RecordConversion {
     pub(crate) notices: Vec<String>,
     /// In-house stage seconds for the database profile; legacy exports record none.
     pub(crate) phases: std::collections::BTreeMap<String, f64>,
+    pub(crate) native: Option<form_key_merge::FormKeyConversion>,
+    pub(crate) source_offsets: HashMap<shared::form_key::FormKey, u64>,
 }
 
 /// Populate the common plugin metadata contract without allocating each complete input.
@@ -161,19 +165,7 @@ impl EsmParser {
         string_sources: inhouse::StringSources<'_>,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
     ) -> Result<RecordConversion> {
-        match reader {
-            crate::config::RecordReader::Legacy => {
-                Self::convert_legacy_plugins_report(plugin_paths, db_path, string_sources)
-            }
-            crate::config::RecordReader::Inhouse => {
-                inhouse::convert_plugins_with_string_sources_report(
-                    plugin_paths,
-                    db_path,
-                    string_sources,
-                    schemas,
-                )
-            }
-        }
+        form_key_world::convert(plugin_paths, db_path, reader, string_sources, schemas)
     }
     /// Parses .esm files and exports world data to skyrim_world.db
     pub fn convert_plugins(plugin_paths: &[PathBuf], db_path: &Path) -> Result<()> {
@@ -200,10 +192,12 @@ impl EsmParser {
             .first()
             .and_then(|path| path.parent())
             .unwrap_or(Path::new("."));
-        Self::convert_legacy_plugins_report(
+        form_key_world::convert(
             plugin_paths,
             db_path,
+            crate::config::RecordReader::Legacy,
             inhouse::StringSources::default_language(inhouse::StringRoots::PluginLooseFirst(loose)),
+            None,
         )
     }
 
@@ -507,6 +501,8 @@ impl EsmParser {
             warnings: summaries,
             notices,
             phases: std::collections::BTreeMap::new(),
+            native: None,
+            source_offsets: HashMap::new(),
         })
     }
 }
@@ -911,6 +907,26 @@ fn remap_record_at_sites(
     remap_optional: impl Fn(usize, &[u8], usize, u32, bool) -> Result<u32>,
     strict: bool,
 ) -> Result<()> {
+    remap_record_at_sites_with_origins(
+        record,
+        plugin_name,
+        warnings,
+        remap_with_validation,
+        remap_optional,
+        strict,
+    )
+    .map(|_| ())
+}
+
+/// Retain original occurrence indices when unusable optional fields are removed.
+fn remap_record_at_sites_with_origins(
+    record: &mut RawRecord,
+    plugin_name: &str,
+    warnings: &RemapWarnings,
+    remap_with_validation: impl Fn(u32, bool) -> Result<u32>,
+    remap_optional: impl Fn(usize, &[u8], usize, u32, bool) -> Result<u32>,
+    strict: bool,
+) -> Result<Vec<usize>> {
     let record_type = record.record_type;
     let remap = |form_id| remap_with_validation(form_id, strict);
     let remap_group = |form_id| remap_with_validation(form_id, true);
@@ -921,7 +937,7 @@ fn remap_record_at_sites(
         // for deletion. Unused parent/body links cannot invalidate a tombstone.
         record.cell_form_id = None;
         record.worldspace_form_id = None;
-        return Ok(());
+        return Ok(Vec::new());
     }
     record.cell_form_id = record.cell_form_id.map(&remap_group).transpose()?;
     record.worldspace_form_id = record.worldspace_form_id.map(&remap_group).transpose()?;
@@ -1086,6 +1102,9 @@ fn remap_record_at_sites(
             );
         }
     }
+    let kept = (0..record.subrecords.len())
+        .filter(|index| malformed_subrecords.binary_search(index).is_err())
+        .collect();
     if !malformed_subrecords.is_empty() {
         // Indices are sorted by traversal order. Remove only those occurrences, so a
         // repeated field such as XAPR keeps its valid siblings and their relative order.
@@ -1096,7 +1115,7 @@ fn remap_record_at_sites(
             keep
         });
     }
-    Ok(())
+    Ok(kept)
 }
 
 #[cfg(test)]

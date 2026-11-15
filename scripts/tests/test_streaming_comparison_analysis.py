@@ -69,18 +69,18 @@ class CampaignTests(unittest.TestCase):
                             "scenes": {"identity_tracking_complete": True, "lifetime_unique_failed": 0},
                             "cpu_spans_ms": {"scene/spawn_batch": 2, "streaming/frame_commit": 3},
                             "completion_latencies_ms": {"assets/model_ready": 800} if count == 20 else {},
-                            "camera": {"worldspace_id": 60, "world_position": [2048, 100, 2048 - distance]},
+                            "camera": {"worldspace_id": "00003C:Skyrim.esm", "world_position": [2048, 100, 2048 - distance]},
                             "process_memory_gib": 0, "gpu": None, "adaptive": None,
                             "streaming_benchmark_route": {"phase": phase, "elapsed_ms": elapsed, "real_elapsed_ms": elapsed,
                               "cpu_settled_elapsed_ms": 60 if elapsed >= 60 else None,
                               "movement_started_elapsed_ms": 80 if elapsed >= 80 else None,
                               "movement_finished_elapsed_ms": 160 if elapsed >= 160 else None,
                               "tail_finished_elapsed_ms": 250 if elapsed >= 250 else None, "route_distance_units": distance}})
-        trace = {"format_version": 1, "dropped_samples": 0, "samples": samples}
+        trace = {"format_version": 2, "dropped_samples": 0, "samples": samples}
         aggregate = {key: 0 for key in ANALYSIS.FAILURE_KEYS}
         aggregate.update(asset_failures=[], assets_ready=22, requests_submitted=1, responses_received=1, unloaded_cells=0)
-        timeline = [{"elapsed_ms": 5, "frame": 1, "subject": "Exterior { worldspace_id: 60, grid_x: 0, grid_y: -1 }", "stage": "requested"},
-                    {"elapsed_ms": 60, "frame": 6, "subject": "Exterior { worldspace_id: 60, grid_x: 0, grid_y: -1 }", "stage": "committed"}]
+        timeline = [{"elapsed_ms": 5, "frame": 1, "subject": "Exterior { worldspace_id: 00003C:Skyrim.esm, grid_x: 0, grid_y: -1 }", "stage": "requested"},
+                    {"elapsed_ms": 60, "frame": 6, "subject": "Exterior { worldspace_id: 00003C:Skyrim.esm, grid_x: 0, grid_y: -1 }", "stage": "committed"}]
         run = {**record, "input_hashes_before": self.hashes, "input_hashes_after": self.hashes,
                "launch_utc_epoch": 999.0, "launch_monotonic": 100.0, "end_utc_epoch": 1000.01, "end_monotonic": 101.01}
         route = {"expected_startup": self.expected, "speed": 100, "movement_duration_secs": 0.08, "tail_duration_secs": 0.09,
@@ -92,11 +92,11 @@ class CampaignTests(unittest.TestCase):
         for name, value in {"run.json": run, "route.json": route, "report.json": report, "rss.json": rss,
                             "profile/streaming-frames.json": trace, "profile/streaming.json": {"aggregate": aggregate, "timeline": timeline},
                             "profile/cpu-spans.json": cpu,
-                            "profile/metadata.json": {"run_id": run_id, "scenario": f"comparison-{scenario}-{mode}",
+                            "profile/metadata.json": {"format_version": 3, "run_id": run_id, "scenario": f"comparison-{scenario}-{mode}",
                                                                     "commit": "test", "build_profile": "quick",
                                                                     "resolution": [3200, 1802],
                                                                     "window": {"physical_resolution": [3200, 1802]},
-                                                                    "worldspace_id": 60, "start_grid": [5, -12],
+                                                                    "worldspace_id": "00003C:Skyrim.esm", "start_grid": [5, -12],
                                                                     "stream_radius": 2}}.items():
             write_json(directory / name, value)
         return record, trace
@@ -385,7 +385,7 @@ class CampaignTests(unittest.TestCase):
     def test_catalog_hash_mismatch_cannot_supply_apparently_valid_coverage(self):
         self.fixture()
         catalog = self.root / "route-cell-catalog.json"
-        write_json(catalog, {"worldspace_id": 60, "cell_size_units": 4096, "stream_radius": 0,
+        write_json(catalog, {"schema_version": 2, "worldspace_id": "00003C:Skyrim.esm", "cell_size_units": 4096, "stream_radius": 0,
                              "existing_cells": [[0, -1]], "database_sha256": "changed-db"})
         self.experiment["route_cell_catalog"] = str(catalog)
         with self.assertRaisesRegex(ValueError, "database hash"):
@@ -435,22 +435,28 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertNotIn("readiness.process_launch_to_cpu_settled_ms", result["metrics"])
 
+    def test_cell_catalog_numeric_identity_is_refused(self):
+        for value in (60, 73014446780):
+            with self.assertRaisesRegex(ValueError, "numeric"):
+                ANALYSIS.cell_coverage([], [], {"schema_version": 2, "worldspace_id": value,
+                    "cell_size_units": 4096, "stream_radius": 0, "existing_cells": []})
+
     def test_cell_coverage_uses_commits_and_unloads_not_requests_or_empty_db_cells(self):
         samples = [
-            {"main_frame": 1, "elapsed_ms": 10, "delta_ms": 10, "camera": {"worldspace_id": 60, "world_position": [2048, 0, 2048]}},
-            {"main_frame": 2, "elapsed_ms": 30, "delta_ms": 20, "camera": {"worldspace_id": 60, "world_position": [6144, 0, 2048]}},
+            {"main_frame": 1, "elapsed_ms": 10, "delta_ms": 10, "camera": {"worldspace_id": "00003C:Skyrim.esm", "world_position": [2048, 0, 2048]}},
+            {"main_frame": 2, "elapsed_ms": 30, "delta_ms": 20, "camera": {"worldspace_id": "00003C:Skyrim.esm", "world_position": [6144, 0, 2048]}},
         ]
-        timeline = [{"elapsed_ms": 0, "subject": "Exterior { worldspace_id: 60, grid_x: 0, grid_y: -1 }", "stage": "committed"},
-                    {"elapsed_ms": 20, "subject": "Exterior { worldspace_id: 60, grid_x: 1, grid_y: -1 }", "stage": "requested"}]
-        catalog = {"worldspace_id": 60, "cell_size_units": 4096, "stream_radius": 0, "existing_cells": [[0, -1], [1, -1]]}
+        timeline = [{"elapsed_ms": 0, "subject": "Exterior { worldspace_id: 00003C:Skyrim.esm, grid_x: 0, grid_y: -1 }", "stage": "committed"},
+                    {"elapsed_ms": 20, "subject": "Exterior { worldspace_id: 00003C:Skyrim.esm, grid_x: 1, grid_y: -1 }", "stage": "requested"}]
+        catalog = {"schema_version": 2, "worldspace_id": "00003C:Skyrim.esm", "cell_size_units": 4096, "stream_radius": 0, "existing_cells": [[0, -1], [1, -1]]}
         observations = ANALYSIS.cell_coverage(samples, timeline, catalog)
         summary = ANALYSIS.coverage_summary(samples, observations)
         self.assertEqual(observations[1]["missing"], 0)
         self.assertEqual(observations[2]["missing"], 1)
         self.assertAlmostEqual(summary["missing_committed_cell_seconds"], 0.02)
-        timeline.append({"elapsed_ms": 25, "subject": "Exterior { worldspace_id: 60, grid_x: 1, grid_y: -1 }", "stage": "committed"})
+        timeline.append({"elapsed_ms": 25, "subject": "Exterior { worldspace_id: 00003C:Skyrim.esm, grid_x: 1, grid_y: -1 }", "stage": "committed"})
         self.assertEqual(ANALYSIS.cell_coverage(samples, timeline, catalog)[2]["missing"], 0)
-        timeline.append({"elapsed_ms": 26, "subject": "Exterior { worldspace_id: 60, grid_x: 1, grid_y: -1 }", "stage": "unloaded"})
+        timeline.append({"elapsed_ms": 26, "subject": "Exterior { worldspace_id: 00003C:Skyrim.esm, grid_x: 1, grid_y: -1 }", "stage": "unloaded"})
         self.assertEqual(ANALYSIS.cell_coverage(samples, timeline, catalog)[2]["missing"], 1)
         catalog["existing_cells"] = [[0, -1]]
         self.assertEqual(ANALYSIS.cell_coverage(samples, timeline, catalog)[2]["desired"], 0)

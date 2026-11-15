@@ -89,7 +89,7 @@ pub struct TerrainClasses {
     pub diffuse: Vec<ClassSlot>,
     pub normal: Vec<ClassSlot>,
     /// LTEX FormID to table id, built once.
-    pub ids_by_form_id: HashMap<u32, u16>,
+    pub ids_by_form_id: HashMap<u64, u16>,
     /// Per table id: the packed diffuse word `class << 16 | layer` and the packed normal word, or
     /// [`NO_NORMAL_WORD`]. The shader reads these to find an entry's class slot and layer.
     pub entry_words: Vec<[u32; 2]>,
@@ -287,7 +287,7 @@ pub(crate) mod tests {
             entries: (0..textures)
                 .map(|id| LandTextureEntry {
                     id,
-                    ltex_form_id: if id == 0 { 0 } else { 0xFF + u32::from(id) },
+                    ltex_form_id: if id == 0 { 0 } else { 0xFF + u64::from(id) },
                     diffuse: match id {
                         3 => ArrayLayer { array: 2, layer: 1 },
                         id if id % 3 == 1 => ArrayLayer {

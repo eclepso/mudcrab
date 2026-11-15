@@ -1192,36 +1192,35 @@ mod tests {
 
     #[test]
     fn changed_database_grade_drives_record_mode_and_console_restores_approved() {
-        use shared::records::{ArchivedRecordData, ArchivedSubRecord};
+        use shared::records::ArchivedSubRecord;
         let directory = tempfile::tempdir().unwrap();
-        let connection =
+        let mut connection =
             rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
         connection.execute_batch("CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(9); CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB); CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT,priority INTEGER); INSERT INTO plugins VALUES(1,'Winner.esm',7); CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);").unwrap();
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        let identity = crate::world::test_support::install(&mut connection);
         let write_record = |brightness: f32| {
             let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let record = ArchivedRecordData {
-                subrecords: vec![
-                    ArchivedSubRecord {
-                        tag: *b"CNAM",
-                        data: bytes(&[1.23, brightness, 1.49]),
-                    },
-                    ArchivedSubRecord {
-                        tag: *b"TNAM",
-                        data: bytes(&[0.23, 0.31, 0.47, 0.59]),
-                    },
-                    ArchivedSubRecord {
-                        tag: *b"HNAM",
-                        data: bytes(&[11., 12., 13., 14., 15., 16., 17., 18., 19.]),
-                    },
-                ],
-            };
-            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&record).unwrap();
-            connection
-                .execute(
-                    "INSERT OR REPLACE INTO records VALUES(100,'IMGS',7,?1)",
-                    [encoded.as_slice()],
-                )
-                .unwrap();
+            let fields = vec![
+                ArchivedSubRecord {
+                    tag: *b"CNAM",
+                    data: bytes(&[1.23, brightness, 1.49]),
+                },
+                ArchivedSubRecord {
+                    tag: *b"TNAM",
+                    data: bytes(&[0.23, 0.31, 0.47, 0.59]),
+                },
+                ArchivedSubRecord {
+                    tag: *b"HNAM",
+                    data: bytes(&[11., 12., 13., 14., 15., 16., 17., 18., 19.]),
+                },
+            ];
+            crate::world::test_support::insert(&connection, &identity, 100, "IMGS", 7, fields);
         };
         let config = crate::config::EngineConfig {
             assets_dir: directory.path().into(),

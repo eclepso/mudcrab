@@ -230,7 +230,7 @@ pub enum DefaultTextureSource {
 /// so the LTEX has no table entry and its cells fall back to the default texture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedTerrainTexture {
-    pub ltex_form_id: u32,
+    pub ltex_form_id: u64,
     /// The converted texture path the LTEX would have used, when one was resolved.
     pub source: Option<String>,
     pub reason: String,
@@ -239,9 +239,9 @@ pub struct SkippedTerrainTexture {
 /// A cell left out of the merged terrain, with its reason; the engine falls back for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedCell {
-    pub cell_id: u32,
+    pub cell_id: u64,
     /// The worldspace the LAND sits in, when it could be read.
-    pub worldspace_id: Option<u32>,
+    pub worldspace_id: Option<u64>,
     /// The cell's grid square, when it could be read.
     pub grid: Option<[i32; 2]>,
     pub reason: String,
@@ -250,7 +250,7 @@ pub struct SkippedCell {
 /// One worldspace's share of the chunk files written, as the report serializes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldspaceChunks {
-    pub worldspace_id: u32,
+    pub worldspace_id: u64,
     /// Chunk files written for this worldspace.
     pub files: u64,
     /// Cell meshes written across those files.
@@ -313,6 +313,300 @@ pub struct TerrainReport {
     pub warnings: Vec<String>,
 }
 
+impl TerrainReport {
+    /// Serialize declared record identities as names while preserving scalar report fields.
+    pub fn to_portable_value(
+        &self,
+        identity: &shared::pack_identity::PackIdentity,
+    ) -> Result<serde_json::Value> {
+        fn name_fields(
+            value: &mut serde_json::Value,
+            identity: &shared::pack_identity::PackIdentity,
+        ) -> Result<()> {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (name, value) in fields {
+                        if matches!(
+                            name.as_str(),
+                            "ltex_form_id" | "source_ltex_form_id" | "cell_id" | "worldspace_id"
+                        ) && !value.is_null()
+                        {
+                            let packed = value
+                                .as_u64()
+                                .ok_or_else(|| eyre!("invalid semantic terrain report identity"))?;
+                            *value = match shared::cache_identity::optional(identity, packed)? {
+                                Some(key) => serde_json::to_value(identity.table().named(key)?)?,
+                                None => serde_json::Value::Null,
+                            };
+                        } else {
+                            name_fields(value, identity)?;
+                        }
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        name_fields(value, identity)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        let mut value = serde_json::to_value(self)?;
+        name_fields(&mut value, identity)?;
+        Ok(value)
+    }
+}
+
+/// Native records in the existing full/light owner order, independently of numeric allocation.
+fn native_records_of<'a>(
+    conversion: &'a crate::esm::form_key_merge::FormKeyConversion,
+    kind: &[u8; 4],
+) -> Vec<(
+    shared::form_key::FormKey,
+    &'a crate::esm::form_key_merge::FormKeyRecord,
+)> {
+    let mut records = conversion
+        .records
+        .iter()
+        .filter(|(_, record)| record.canonical_record().record_type == *kind)
+        .map(|(&key, record)| (key, record))
+        .collect::<Vec<_>>();
+    records.sort_by_key(|(key, _)| {
+        conversion
+            .order
+            .identity_sort_tuple(*key)
+            .expect("allocated native record")
+    });
+    records
+}
+
+/// Resolve an LTEX's TXST through its physical site rather than its native four-byte word.
+fn native_texture_paths(
+    conversion: &crate::esm::form_key_merge::FormKeyConversion,
+    record: &crate::esm::form_key_merge::FormKeyRecord,
+) -> std::result::Result<(String, Option<String>), String> {
+    let key = crate::esm::cell_cache::form_key_field(record, b"TNAM", 0)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "it names no usable texture set".to_owned())?;
+    let txst = conversion
+        .records
+        .get(&key)
+        .filter(|record| record.canonical_record().record_type == *b"TXST")
+        .ok_or_else(|| "its texture set is absent".to_owned())?;
+    let view = SubrecordView::new(&txst.canonical_record().subrecords);
+    let diffuse = view
+        .get_string(b"TX00")
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "its texture set names no diffuse texture".to_owned())?;
+    let normal = view
+        .get_string(b"TX01")
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| converted_texture_path(&path, "normal"))
+        .transpose()?;
+    Ok((converted_texture_path(&diffuse, "diffuse")?, normal))
+}
+
+/// Build the production terrain generation directly from cap-free native FormKey winners.
+pub fn build_form_key_merged_terrain(
+    staging: &Path,
+    conversion: &crate::esm::form_key_merge::FormKeyConversion,
+    source_offsets: &HashMap<shared::form_key::FormKey, u64>,
+    options: &TerrainOptions,
+) -> Result<TerrainReport> {
+    use sha2::{Digest, Sha256};
+    let started = Instant::now();
+    let identity = conversion.order.pack_identity()?;
+    let arrays_started = Instant::now();
+    let mut pre_skipped = Vec::new();
+    let mut sources = Vec::new();
+    for (key, record) in native_records_of(conversion, b"LTEX") {
+        match native_texture_paths(conversion, record) {
+            Ok((diffuse, normal)) => sources.push(LandTextureSource {
+                ltex_form_id: key.to_packed(),
+                diffuse: staging.join(diffuse),
+                normal: normal.map(|path| staging.join(path)),
+            }),
+            Err(reason) => pre_skipped.push(SkippedTerrainTexture {
+                ltex_form_id: key.to_packed(),
+                source: None,
+                reason,
+            }),
+        }
+    }
+    let defaults = match options.default_texture {
+        TerrainDefaultTexture::White => None,
+        TerrainDefaultTexture::SkyrimIni => {
+            Some(landscape_defaults(options.terrain_ini.as_deref())?)
+        }
+    };
+    let ini_sha256 = defaults
+        .as_ref()
+        .and_then(|defaults| defaults.ini_sha256.clone());
+    let (default, default_source) =
+        default_source_native(staging, conversion, defaults.as_ref(), &mut pre_skipped)?;
+    let array_options = ArrayOptions {
+        allow_downscale: options.allow_downscale,
+        ..ArrayOptions::default()
+    };
+    let (mut table, mut array_report) = crate::terrain_arrays::build_form_key_land_texture_arrays(
+        &identity,
+        &sources,
+        default,
+        staging,
+        &array_options,
+    )?;
+    let arrays_ms = arrays_started.elapsed().as_millis();
+    let known = table
+        .entries
+        .iter()
+        .map(|entry| entry.ltex_form_id)
+        .filter(|key| *key != 0)
+        .collect::<HashSet<_>>();
+    let meshes_started = Instant::now();
+    let (selected, land_warnings) =
+        crate::esm::cell_cache::native_land_winners(conversion, source_offsets)?;
+    let mut placed = Vec::new();
+    let mut skipped_cells = Vec::new();
+    let mut stats = CellStats::default();
+    for (cell_key, land_key) in selected {
+        let land = &conversion.records[&land_key];
+        let attempt = (|| -> Result<(PlacedCellMesh, CellMeshReport)> {
+            let cell = conversion
+                .records
+                .get(&cell_key)
+                .filter(|record| record.canonical_record().record_type == *b"CELL")
+                .ok_or_else(|| eyre!("parent CELL is absent"))?;
+            let (x, y, _) = extract_cell_info(&cell.canonical_record().subrecords);
+            let (Some(grid_x), Some(grid_y)) = (x, y) else {
+                bail!("parent CELL has no exterior grid");
+            };
+            let world = cell
+                .worldspace
+                .or(land.worldspace)
+                .ok_or_else(|| eyre!("parent worldspace is absent"))?;
+            let mut hash = Sha256::new();
+            hash.update(b"FormKey terrain cell v2\0");
+            hash.update(identity.digest());
+            hash.update(land_key.to_packed().to_le_bytes());
+            for (signature, data) in &land.canonical_record().subrecords {
+                hash.update(signature);
+                hash.update((data.len() as u64).to_le_bytes());
+                hash.update(data);
+            }
+            for layer in crate::esm::cell_cache::form_key_texture_layers(land)? {
+                hash.update(layer.texture_form_id.to_le_bytes());
+                hash.update([u8::from(known.contains(&layer.texture_form_id))]);
+            }
+            let (mesh, report) = crate::esm::terrain_mesh::build_form_key_cell_mesh(
+                cell_key,
+                land,
+                &known,
+                hash.finalize().into(),
+            )?;
+            Ok((
+                PlacedCellMesh {
+                    worldspace_id: world.to_packed(),
+                    grid_x,
+                    grid_y,
+                    mesh,
+                },
+                report,
+            ))
+        })();
+        match attempt {
+            Ok((cell, report)) => {
+                stats.observe(&report);
+                placed.push(cell);
+            }
+            Err(error) => skipped_cells.push(SkippedCell {
+                cell_id: cell_key.to_packed(),
+                worldspace_id: land.worldspace.map(shared::form_key::FormKey::to_packed),
+                grid: None,
+                reason: error.to_string(),
+            }),
+        }
+    }
+    let meshes_ms = meshes_started.elapsed().as_millis();
+    let chunks_started = Instant::now();
+    let chunk_files = chunk_paths(&placed);
+    let chunk_report =
+        crate::terrain_chunks::write_form_key_terrain_chunks(staging, &identity, placed)?;
+    let chunks_ms = chunks_started.elapsed().as_millis();
+    for texture in &mut array_report.textures {
+        if let Some(source) = &texture.source {
+            texture.source = Some(relative_path(staging, Path::new(source)));
+        }
+    }
+    for skipped in &mut array_report.skipped {
+        skipped.source = relative_path(staging, Path::new(&skipped.source));
+    }
+    let default_texture_source = reconcile_default_source(default_source, &array_report);
+    table.settings = Some(land_texture_settings(
+        &default_texture_source,
+        options,
+        ini_sha256,
+    ));
+    fs::write(
+        staging.join(LAND_TEXTURE_TABLE_PATH),
+        table.to_portable_json(&identity)?,
+    )?;
+    let mut warnings = land_warnings;
+    warnings.extend(array_report.named_warnings(&identity)?);
+    for skipped in &pre_skipped {
+        let name = match shared::cache_identity::optional(&identity, skipped.ltex_form_id)? {
+            Some(key) => identity.table().named(key)?.to_string(),
+            None => "default land texture".to_owned(),
+        };
+        warnings.push(format!(
+            "warning: land texture {name} skipped: {}",
+            skipped.reason
+        ));
+    }
+    for cell in &skipped_cells {
+        warnings.push(format!(
+            "warning: terrain CELL {} skipped: {}",
+            identity
+                .table()
+                .named(shared::cache_identity::required(&identity, cell.cell_id)?)?,
+            cell.reason
+        ));
+    }
+    pre_skipped.extend(array_report.skipped.iter().map(skipped_from_array));
+    Ok(TerrainReport {
+        default_texture: array_report.default_texture,
+        default_texture_source,
+        arrays: array_report.arrays,
+        textures: array_report.textures,
+        skipped_textures: pre_skipped,
+        cells_written: chunk_report.cells as u64,
+        cells_over_six_slots: stats.cells_over_six_slots,
+        cells_needing_stride_16: stats.cells_needing_stride_16,
+        cells_with_default_texture: stats.cells_with_default_texture,
+        skipped_layers: stats.skipped_layers,
+        overridden_layers: stats.overridden_layers,
+        skipped_cells,
+        chunk_files,
+        chunk_bytes: chunk_report.bytes,
+        worldspaces: chunk_report
+            .worldspaces
+            .iter()
+            .map(|world| WorldspaceChunks {
+                worldspace_id: world.worldspace_id,
+                files: world.files as u64,
+                cells: world.cells as u64,
+            })
+            .collect(),
+        timings: TerrainTimings {
+            arrays_ms,
+            meshes_ms,
+            chunks_ms,
+            total_ms: started.elapsed().as_millis(),
+        },
+        warnings,
+    })
+}
+
 /// Builds the merged terrain of one conversion into `staging`.
 ///
 /// `merged` is the winning-record map the world database was exported from (a caller with the
@@ -342,12 +636,12 @@ pub fn build_merged_terrain(
     for record in records_of(merged, b"LTEX") {
         match texture_paths(merged, record) {
             Ok((diffuse, normal)) => sources.push(LandTextureSource {
-                ltex_form_id: record.form_id,
+                ltex_form_id: u64::from(record.form_id),
                 diffuse: staging.join(diffuse),
                 normal: normal.map(|normal| staging.join(normal)),
             }),
             Err(reason) => pre_skipped.push(SkippedTerrainTexture {
-                ltex_form_id: record.form_id,
+                ltex_form_id: u64::from(record.form_id),
                 source: None,
                 reason,
             }),
@@ -379,8 +673,8 @@ pub fn build_merged_terrain(
     let known: HashSet<u32> = table
         .entries
         .iter()
-        .map(|entry| entry.ltex_form_id)
-        .filter(|form_id| *form_id != DEFAULT_LAND_TEXTURE_FORM_ID)
+        .map(|entry| u32::try_from(entry.ltex_form_id).expect("legacy terrain API uses u32 inputs"))
+        .filter(|form_id| u64::from(*form_id) != DEFAULT_LAND_TEXTURE_FORM_ID)
         .collect();
 
     // 2. One merged mesh per exterior cell with a LAND record.
@@ -432,7 +726,12 @@ pub fn build_merged_terrain(
         ini_sha256,
     ));
     let table_file = staging.join(LAND_TEXTURE_TABLE_PATH);
-    fs::write(&table_file, serde_json::to_vec_pretty(&table)?)
+    let connection = rusqlite::Connection::open_with_flags(
+        staging.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
+    fs::write(&table_file, table.to_portable_json(&identity)?)
         .wrap_err_with(|| format!("failed to rewrite {}", table_file.display()))?;
     let mut warnings = land_warnings;
     warnings.extend(array_report.warnings());
@@ -570,6 +869,60 @@ pub async fn run_merged_terrain_stage(
     Ok(())
 }
 
+/// Run native terrain compilation against the already authenticated source generation.
+pub async fn run_form_key_merged_terrain_stage(
+    staging: &Path,
+    conversion: std::sync::Arc<crate::esm::form_key_merge::FormKeyConversion>,
+    source_offsets: HashMap<shared::form_key::FormKey, u64>,
+    options: &TerrainOptions,
+    progress_tx: &Sender<ProgressEvent>,
+    report: &mut PipelineReport,
+) -> Result<()> {
+    let started = Instant::now();
+    let _ = progress_tx
+        .send(ProgressEvent::new(
+            ProgressStage::LodChunks,
+            0,
+            1,
+            None,
+            "Building merged terrain",
+        ))
+        .await;
+    let staging = staging.to_path_buf();
+    let options = options.clone();
+    let terrain = spawn_blocking(move || {
+        build_form_key_merged_terrain(&staging, &conversion, &source_offsets, &options)
+    })
+    .await
+    .wrap_err("the merged terrain worker panicked")??;
+    // Everything the stage wrote is published by name, as the LOD stage does with its payloads.
+    report
+        .artifacts
+        .push(PathBuf::from(LAND_TEXTURE_TABLE_PATH));
+    report.artifacts.extend(
+        terrain
+            .arrays
+            .iter()
+            .map(|array| PathBuf::from(&array.path)),
+    );
+    report
+        .artifacts
+        .extend(terrain.chunk_files.iter().map(PathBuf::from));
+    report.terrain_warnings = terrain.warnings.clone();
+    report.terrain_elapsed_ms = started.elapsed().as_millis();
+    report.terrain = Some(terrain);
+    let _ = progress_tx
+        .send(ProgressEvent::new(
+            ProgressStage::LodChunks,
+            1,
+            1,
+            None,
+            "Built merged terrain",
+        ))
+        .await;
+    Ok(())
+}
+
 /// The #185 derived-data key of one cell's merged terrain, exactly as a conversion computes it.
 ///
 /// The key hashes the LAND record, the master list of the plugin that declared it
@@ -590,7 +943,7 @@ pub fn cell_key(
     let mut named: BTreeSet<u32> = BTreeSet::new();
     for layer in &layers {
         if layer.texture_form_id != DEFAULT_LAND_TEXTURE_FORM_ID {
-            named.insert(layer.texture_form_id);
+            named.insert(u32::try_from(layer.texture_form_id).expect("native source texture word"));
         }
     }
     // The named LTEX records the table has no entry for: the mesh skips those layers.
@@ -633,8 +986,8 @@ fn cell_mesh(
 ) -> std::result::Result<(PlacedCellMesh, CellMeshReport), SkippedCell> {
     let cell_id = land.cell_form_id.unwrap_or(land.form_id);
     let skip = |grid: Option<[i32; 2]>, reason: String| SkippedCell {
-        cell_id,
-        worldspace_id: land.worldspace_form_id,
+        cell_id: u64::from(cell_id),
+        worldspace_id: land.worldspace_form_id.map(u64::from),
         grid,
         reason,
     };
@@ -668,7 +1021,7 @@ fn cell_mesh(
         .map_err(|error| skip(grid, format!("its mesh cannot be built: {error:#}")))?;
     Ok((
         PlacedCellMesh {
-            worldspace_id,
+            worldspace_id: u64::from(worldspace_id),
             grid_x,
             grid_y,
             mesh,
@@ -823,7 +1176,78 @@ fn default_source(
     let ltex_form_id = records_of(merged, b"LTEX")
         .into_iter()
         .find(|record| texture_paths(merged, record).is_ok_and(|(own, _)| own == diffuse))
-        .map_or(DEFAULT_LAND_TEXTURE_FORM_ID, |record| record.form_id);
+        .map_or(DEFAULT_LAND_TEXTURE_FORM_ID, |record| {
+            u64::from(record.form_id)
+        });
+    let source = LandTextureSource {
+        ltex_form_id,
+        diffuse: staging.join(&diffuse),
+        normal: normal.as_ref().map(|normal| staging.join(normal)),
+    };
+    Ok((
+        Some(source),
+        DefaultTextureSource::SkyrimIni {
+            ini: defaults.ini.clone(),
+            diffuse,
+            normal: normal.take(),
+        },
+    ))
+}
+
+/// Resolve default texture paths using native FormKey records.
+fn default_source_native(
+    staging: &Path,
+    conversion: &crate::esm::form_key_merge::FormKeyConversion,
+    defaults: Option<&LandscapeDefaults>,
+    skipped: &mut Vec<SkippedTerrainTexture>,
+) -> Result<(Option<LandTextureSource>, DefaultTextureSource)> {
+    let Some(defaults) = defaults else {
+        return Ok((None, DefaultTextureSource::White));
+    };
+    let diffuse = match converted_texture_path(&defaults.diffuse, "default diffuse") {
+        Ok(diffuse) => diffuse,
+        Err(reason) => {
+            let reason = format!("the default land texture cannot be resolved: {reason}");
+            skipped.push(SkippedTerrainTexture {
+                ltex_form_id: DEFAULT_LAND_TEXTURE_FORM_ID,
+                source: Some(defaults.diffuse.clone()),
+                reason: reason.clone(),
+            });
+            let normal = (!defaults.normal.trim().is_empty()).then(|| defaults.normal.clone());
+            return Ok((
+                None,
+                DefaultTextureSource::SkyrimIniFallback {
+                    ini: defaults.ini.clone(),
+                    diffuse: defaults.diffuse.clone(),
+                    normal,
+                    reason,
+                },
+            ));
+        }
+    };
+    let mut normal = if defaults.normal.trim().is_empty() {
+        None
+    } else {
+        match converted_texture_path(&defaults.normal, "default normal") {
+            Ok(normal) => Some(normal),
+            Err(reason) => {
+                skipped.push(SkippedTerrainTexture {
+                    ltex_form_id: DEFAULT_LAND_TEXTURE_FORM_ID,
+                    source: Some(defaults.normal.clone()),
+                    reason: format!("the default normal texture cannot be resolved: {reason}"),
+                });
+                None
+            }
+        }
+    };
+    // The label is the lowest LTEX that names the resolved diffuse texture; 0 (the default slot)
+    // when no LTEX does, because then the texture is a file with no record of its own.
+    let ltex_form_id = native_records_of(conversion, b"LTEX")
+        .into_iter()
+        .find(|(_, record)| {
+            native_texture_paths(conversion, record).is_ok_and(|(own, _)| own == diffuse)
+        })
+        .map_or(0, |(key, _)| key.to_packed());
     let source = LandTextureSource {
         ltex_form_id,
         diffuse: staging.join(&diffuse),
@@ -1031,7 +1455,7 @@ fn skipped_from_array(skipped: &SkippedTexture) -> SkippedTerrainTexture {
 
 /// The chunk file of every group the cells land in, the same path rule the chunk writer uses.
 fn chunk_paths(cells: &[PlacedCellMesh]) -> Vec<String> {
-    let groups: BTreeSet<(u32, i32, i32)> = cells
+    let groups: BTreeSet<(u64, i32, i32)> = cells
         .iter()
         .map(|cell| {
             let (chunk_x, chunk_y) = terrain_chunk_for_cell(cell.grid_x, cell.grid_y);
@@ -1279,31 +1703,123 @@ mod tests {
 
     /// Two plugins add a LAND to one exterior cell: the stage builds one mesh, from the later
     /// plugin's LAND, and reports the dropped one — the same choice the cell cache makes.
+    fn native_fixture(
+        records: HashMap<u32, RawRecord>,
+    ) -> crate::esm::form_key_merge::FormKeyConversion {
+        use crate::esm::{
+            form_key_merge::{FormKeyConversion, FormKeyRecord, LinkOutcome, ResolvedLink},
+            form_keys::FormKeyOrder,
+        };
+        let order = FormKeyOrder::from_facts(vec![
+            (
+                "Skyrim.esm".into(),
+                shared::plugin_table::PluginFacts {
+                    content_hash: Some([0x11; 32]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "Update.esm".into(),
+                shared::plugin_table::PluginFacts {
+                    content_hash: Some([0x22; 32]),
+                    ..Default::default()
+                },
+            ),
+        ])
+        .unwrap();
+        let identity = order.pack_identity().unwrap();
+        let key = |word| identity.runtime_key(word).unwrap();
+        let records = records
+            .into_values()
+            .map(|source| {
+                let links = source
+                    .subrecords
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(subrecord, (tag, data))| {
+                        if matches!(
+                            tag.as_slice(),
+                            b"BTXT" | b"ATXT" | b"TNAM" | b"XCWT" | b"NAM2"
+                        ) && data.len() >= 4
+                        {
+                            let word = u32::from_le_bytes(data[..4].try_into().unwrap());
+                            Some(ResolvedLink {
+                                subrecord,
+                                signature: tag.as_slice().try_into().unwrap(),
+                                byte_offset: 0,
+                                source_word: word,
+                                key: key(word),
+                                outcome: if word == 0 {
+                                    LinkOutcome::Null
+                                } else {
+                                    LinkOutcome::Resolved
+                                },
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let cell = source.cell_form_id.and_then(key);
+                let worldspace = source.worldspace_form_id.and_then(key);
+                (
+                    key(source.form_id).unwrap(),
+                    FormKeyRecord {
+                        source,
+                        canonical: None,
+                        canonical_ordinals: vec![],
+                        localized_text: Default::default(),
+                        runtime_omitted: Default::default(),
+                        cell,
+                        worldspace,
+                        links,
+                    },
+                )
+            })
+            .collect();
+        FormKeyConversion {
+            order,
+            records,
+            warnings: vec![],
+            notices: vec![],
+        }
+    }
+
+    fn seed_native_world(root: &Path, conversion: &crate::esm::form_key_merge::FormKeyConversion) {
+        let mut database = rusqlite::Connection::open(root.join("skyrim_world.db")).unwrap();
+        let tx = database.transaction().unwrap();
+        conversion
+            .order
+            .pack_identity()
+            .unwrap()
+            .write_sql(&tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
     #[test]
     fn two_lands_for_one_cell_build_one_mesh_from_the_later_plugin() {
-        // The two LANDs hold different terrain (a VHGT offset of 0.0 vs 1.0, decoding to
-        // heights of 0.0 vs 8.0), so the mesh names its LAND.
         let mut raised = land_at_height(0x1000, 0x3C, 0x100, 1.0);
         raised.form_id = 0x0100_1001;
         for (flat_slot, raised_slot) in [(0, 1), (1, 0)] {
             let mut flat = land_at_height(0x1000, 0x3C, 0x100, 0.0);
             flat.load_order = flat_slot;
             raised.load_order = raised_slot;
-            let records = merged(&[exterior_cell(0x1000, 0x3C, [-44, 37]), flat, raised.clone()]);
-            let masters = BTreeMap::from([
-                (0, Vec::<String>::new()),
-                (1, vec!["Skyrim.esm".to_string()]),
-            ]);
+            let conversion = native_fixture(merged(&[
+                exterior_cell(0x1000, 0x3C, [-44, 37]),
+                flat,
+                raised.clone(),
+            ]));
             let staging = tempfile::tempdir().unwrap();
-            let report = build_merged_terrain(
+            seed_native_world(staging.path(), &conversion);
+            let report = build_form_key_merged_terrain(
                 staging.path(),
-                &records,
-                &masters,
+                &conversion,
                 &HashMap::new(),
                 &TerrainOptions::default(),
             )
             .unwrap();
-            assert_eq!(report.cells_written, 1, "one mesh for the cell");
+            assert_eq!(report.cells_written, 1);
             let chunk = crate::terrain_chunks::read_terrain_chunk(
                 &staging.path().join(&report.chunk_files[0]),
             )
@@ -1314,24 +1830,21 @@ mod tests {
                 chunk.cells[0]
                     .heights
                     .iter()
-                    .all(|height| *height == expected),
-                "the mesh is the slot {raised_slot} LAND's terrain"
+                    .all(|height| *height == expected)
             );
             let warning = report
                 .warnings
                 .iter()
-                .find(|warning| warning.contains("cell 00001000"))
-                .expect("the dropped LAND is reported");
-            let (kept, dropped, kept_slot, dropped_slot) = if raised_slot == 1 {
-                ("01001001", "00001001", 1, 0)
+                .find(|warning| warning.contains("CELL 001000:Skyrim.esm"))
+                .expect("dropped LAND is reported");
+            let (kept, dropped) = if raised_slot == 1 {
+                ("001001:Update.esm", "001001:Skyrim.esm")
             } else {
-                ("00001001", "01001001", 1, 0)
+                ("001001:Skyrim.esm", "001001:Update.esm")
             };
             assert!(
-                warning.contains(&format!("LAND {kept} from load-order slot {kept_slot}"))
-                    && warning.contains(&format!(
-                        "dropped LAND {dropped} from load-order slot {dropped_slot}"
-                    )),
+                warning.contains(&format!("LAND {kept} from source priority 1"))
+                    && warning.contains(&format!("dropped LAND {dropped} from source priority 0")),
                 "{warning}"
             );
         }
@@ -1582,28 +2095,41 @@ mod tests {
         );
     }
 
-    /// Two distinct LANDs for one cell from the same load-order slot stop the terrain build:
-    /// the game's order for that case is not established, so nothing is picked.
+    /// Missing source positions make this one cell ambiguous; usable neighbors remain.
     #[test]
-    fn two_lands_from_one_plugin_for_one_cell_stop_the_terrain_build() {
+    fn ambiguous_land_group_is_skipped_locally() {
         let first = land_at_height(0x1000, 0x3C, 0x100, 0.0);
         let mut second = land_at_height(0x1000, 0x3C, 0x100, 1.0);
         second.form_id = 0x0100_1001;
-        let records = merged(&[exterior_cell(0x1000, 0x3C, [-44, 37]), first, second]);
+        let neighbor = land_at_height(0x2000, 0x3C, 0x100, 3.0);
+        let conversion = native_fixture(merged(&[
+            exterior_cell(0x1000, 0x3C, [-44, 37]),
+            first,
+            second,
+            exterior_cell(0x2000, 0x3C, [8, 9]),
+            neighbor,
+        ]));
         let staging = tempfile::tempdir().unwrap();
-        let error = build_merged_terrain(
+        seed_native_world(staging.path(), &conversion);
+        let report = build_form_key_merged_terrain(
             staging.path(),
-            &records,
-            &masters(0, &["Skyrim.esm"]),
+            &conversion,
             &HashMap::new(),
             &TerrainOptions::default(),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("cell 00001000"), "{error}");
-        assert!(error.contains("00001001"), "{error}");
-        assert!(error.contains("01001001"), "{error}");
-        assert!(error.contains("slot 0"), "{error}");
+        .unwrap();
+        assert_eq!(report.cells_written, 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|line| line.contains("ambiguous") && line.contains("001000:Skyrim.esm"))
+        );
+        let chunk =
+            crate::terrain_chunks::read_terrain_chunk(&staging.path().join(&report.chunk_files[0]))
+                .unwrap();
+        assert_eq!(chunk.cells[0].cell_id, 0x0100_2000);
+        assert!(chunk.cells[0].heights.iter().all(|height| *height == 24.0));
     }
 
     #[test]

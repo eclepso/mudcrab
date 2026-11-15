@@ -188,6 +188,34 @@ pub(crate) struct StreamingTraceReport<'a> {
 }
 
 impl StreamingTrace {
+    /// Serialize portable camera identities only after authentication of this runtime session.
+    pub(crate) fn named_report(
+        &self,
+        identity: Option<&shared::pack_identity::PackIdentity>,
+    ) -> std::io::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self.report()).map_err(std::io::Error::other)?;
+        value["format_version"] = serde_json::json!(2);
+        for sample in value["samples"]
+            .as_array_mut()
+            .expect("trace samples are an array")
+        {
+            if let Some(camera) = sample.get_mut("camera").filter(|value| !value.is_null()) {
+                let word = camera["worldspace_id"]
+                    .as_u64()
+                    .and_then(|word| u32::try_from(word).ok())
+                    .ok_or_else(|| std::io::Error::other("invalid internal camera identity"))?;
+                let identity = identity.ok_or_else(|| {
+                    std::io::Error::other("camera output requires bound world identity")
+                })?;
+                let named = crate::config::named_runtime_request(identity, word)
+                    .map_err(std::io::Error::other)?;
+                camera["worldspace_id"] =
+                    serde_json::to_value(named).map_err(std::io::Error::other)?;
+            }
+        }
+        Ok(value)
+    }
+
     /// Construct only when the caller explicitly enables the trace.
     pub(crate) fn new(sample_capacity: usize, scene_capacity: usize) -> Self {
         Self {
@@ -521,6 +549,27 @@ mod tests {
         assert_eq!(counts.untracked_observation_calls, 3);
         assert_eq!(counts.lifetime_unique_observed, 1);
         assert_eq!(counts.lifetime_unique_cpu_loaded, 0);
+    }
+
+    #[test]
+    fn portable_trace_requires_scope_and_emits_names() {
+        let mut trace = StreamingTrace::new(2, 0);
+        let mut sample = frame(1, BenchmarkWindow::Measured);
+        sample.camera = Some(CameraObservation {
+            worldspace_id: 60,
+            render_origin_grid: [0, 0],
+            world_position: [0.0, 1.0, 2.0],
+            motion: CameraMotion::Stationary,
+        });
+        trace.push_frame(sample);
+        assert!(trace.named_report(None).is_err());
+        let identity = crate::config::identity_request_fixture();
+        let report = trace.named_report(Some(&identity)).unwrap();
+        assert_eq!(report["format_version"], 2);
+        assert_eq!(
+            report["samples"][0]["camera"]["worldspace_id"],
+            "00003C:Zulu.esm"
+        );
     }
 
     /// Verify sidecar serialization preserves null observations, benchmark labels and trace metadata.

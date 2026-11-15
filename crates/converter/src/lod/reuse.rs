@@ -20,6 +20,7 @@ use std::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LodManifest {
     pub build_identity: String,
+    pub plugin_table_digest: String,
     pub converter_schema: u32,
     pub world_database_schema: u32,
     pub chunks: u64,
@@ -37,7 +38,7 @@ pub(crate) struct LodManifest {
 pub(crate) struct LodReuse {
     root: PathBuf,
     manifest: LodManifest,
-    chunks: BTreeMap<(u32, i32, i32, i32), CachedLodChunk>,
+    chunks: BTreeMap<(u64, i32, i32, i32), CachedLodChunk>,
 }
 
 struct CachedLodChunk {

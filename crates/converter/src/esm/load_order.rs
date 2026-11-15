@@ -482,6 +482,65 @@ pub(crate) fn order_discovered_plugins_with_notices(
     ))
 }
 
+/// Native selection applies dependency recovery without runtime slot limits.
+pub(crate) fn order_discovered_form_key_plugins(
+    paths: Vec<PathBuf>,
+    notices: &mut Vec<String>,
+    _skipped_plugins: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let headers = PluginHeaders::read(&paths)?;
+    let skipped = headers.skip_cycles(notices);
+    let mut remaining = vec![0usize; paths.len()];
+    let mut dependents = vec![Vec::new(); paths.len()];
+    for (index, header) in headers.metadata.iter().enumerate() {
+        if skipped[index] {
+            continue;
+        }
+        let mut unique = BTreeSet::new();
+        for master in &header.masters {
+            let dependency = *headers
+                .indices
+                .get(&normalize_plugin_name(master))
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "{}: required master {master} is missing",
+                        paths[index].display()
+                    )
+                })?;
+            if unique.insert(dependency) {
+                remaining[index] += 1;
+                dependents[dependency].push(index);
+            }
+        }
+    }
+    let priority = |index: usize| {
+        (
+            !loads_with_masters(&paths[index], &headers.metadata[index]),
+            index,
+        )
+    };
+    let mut ready = BTreeSet::new();
+    for (index, count) in remaining.iter().enumerate() {
+        if *count == 0 && !skipped[index] {
+            ready.insert(priority(index));
+        }
+    }
+    let mut ordered = Vec::with_capacity(paths.len());
+    while let Some((_, index)) = ready.pop_first() {
+        ordered.push(index);
+        for &dependent in &dependents[index] {
+            remaining[dependent] -= 1;
+            if remaining[dependent] == 0 {
+                ready.insert(priority(dependent));
+            }
+        }
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|index| paths[index].clone())
+        .collect())
+}
+
 /// Recover a profile's existing order without hoisting or inventing a new order.
 /// Plugins placed before one of their masters are skipped with their dependents.
 pub(crate) fn recover_ordered_plugins_with_notices(
@@ -502,6 +561,23 @@ pub(crate) fn recover_ordered_plugins_with_notices(
         notices,
         skipped_plugins,
     ))
+}
+
+/// Native selection applies dependency recovery without runtime slot limits.
+pub(crate) fn recover_ordered_form_key_plugins(
+    paths: Vec<PathBuf>,
+    notices: &mut Vec<String>,
+    _skipped_plugins: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let headers = PluginHeaders::read(&paths)?;
+    let skipped = headers.skip_cycles(notices);
+    let mut ordered: Vec<_> = (0..paths.len()).filter(|&index| !skipped[index]).collect();
+    let skipped = headers.skip_inversions(&ordered, skipped, notices);
+    ordered.retain(|&index| !skipped[index]);
+    Ok(ordered
+        .into_iter()
+        .map(|index| paths[index].clone())
+        .collect())
 }
 
 /// Original owning plugin filename and plugin-local ID, independent of its load-order slot.

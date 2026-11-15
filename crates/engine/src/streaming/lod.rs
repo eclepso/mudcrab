@@ -52,7 +52,7 @@ pub(super) struct LodStreaming {
     generation: u64,
     center: Option<IVec2>,
     /// The worldspace `center` belongs to; a door into another worldspace moves the centre too.
-    worldspace_id: Option<u32>,
+    worldspace_id: Option<u64>,
     requested_queries: HashSet<LodTier>,
     pending_queries: HashSet<LodTier>,
     query_retries: HashMap<LodTier, (u8, Option<Instant>)>,
@@ -112,7 +112,7 @@ impl LodStreaming {
             })
     }
 
-    fn move_center(&mut self, center: IVec2, worldspace_id: u32, distances: &TerrainLodDistances) {
+    fn move_center(&mut self, center: IVec2, worldspace_id: u64, distances: &TerrainLodDistances) {
         self.generation = self.generation.wrapping_add(1);
         self.requested_queries.clear();
         self.pending_queries.clear();
@@ -252,7 +252,7 @@ fn lod_worldspace(stream_radius: i32, space: Option<&ActiveSpace>, configured: u
 fn keep_resident_chunk(
     key: ChunkKey,
     origin: LodOrigin,
-    worldspace_id: u32,
+    worldspace_id: u64,
     center: (i64, i64),
     distances: &TerrainLodDistances,
 ) -> bool {
@@ -296,6 +296,7 @@ pub(super) fn plan_lod_chunks(
     mut profiler: ResMut<ProfilingState>,
     runtime: Option<Res<super::runtime::StreamingRuntime>>,
     mut previous_distances: Local<Option<crate::config::TerrainLodDistances>>,
+    mut declined_world: Local<Option<u32>>,
 ) {
     let started = Instant::now();
     let Ok(camera) = camera.single() else {
@@ -325,6 +326,17 @@ pub(super) fn plan_lod_chunks(
         return;
     };
 
+    let runtime_worldspace_id = worldspace_id;
+    let worldspace_id = match database.storage_worldspace(runtime_worldspace_id) {
+        Ok(key) => key,
+        Err(error) => {
+            if *declined_world != Some(runtime_worldspace_id) {
+                warn!("terrain LOD runtime worldspace request declined: {error}");
+                *declined_world = Some(runtime_worldspace_id);
+            }
+            return;
+        }
+    };
     let center = streaming_center(config.acceptance_screenshot.is_some(), origin.0, camera);
     let distances_changed = previous_distances.as_ref() != Some(&config.terrain_lod);
     *previous_distances = Some(config.terrain_lod);
@@ -351,7 +363,7 @@ pub(super) fn plan_lod_chunks(
             continue;
         }
         let query = query_for(
-            worldspace_id,
+            runtime_worldspace_id,
             tier,
             center,
             query_unload_radius(config.terrain_lod.reach_cells(tier)),

@@ -373,6 +373,7 @@ impl PipelineConfig {
                 cache.display(),
                 staging.display()
             );
+            crate::cache::validate_staging_generation(staging)?;
         }
         Ok(())
     }
@@ -536,6 +537,28 @@ mod tests {
 
     /// A language is part of a string table's file name, so only letters, digits and underscores
     /// are accepted.
+    /// A staging folder from the old persisted identity generation cannot be resumed.
+    #[test]
+    fn old_resume_generation_requires_fresh_conversion_before_payload_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let output = directory.path().join("out");
+        let staging = directory.path().join("out.staging-old");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        let database = rusqlite::Connection::open(staging.join("skyrim_world.db")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(9)",
+            )
+            .unwrap();
+        drop(database);
+        let mut config = PipelineConfig::new(data, output);
+        config.resume_staging = Some(staging);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("convert again"), "{error}");
+    }
+
     #[test]
     fn language_must_be_usable_in_a_file_name() {
         let dir = tempfile::tempdir().unwrap();

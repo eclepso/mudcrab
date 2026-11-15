@@ -109,13 +109,13 @@ impl ChunkAnchor {
 /// and its anchor on that tier's grid (ADR-0010).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkKey {
-    pub worldspace_id: u32,
+    pub worldspace_id: u64,
     pub tier: LodTier,
     pub anchor: ChunkAnchor,
 }
 
 impl ChunkKey {
-    pub const fn new(worldspace_id: u32, tier: LodTier, anchor: ChunkAnchor) -> Self {
+    pub const fn new(worldspace_id: u64, tier: LodTier, anchor: ChunkAnchor) -> Self {
         Self {
             worldspace_id,
             tier,
@@ -210,7 +210,7 @@ pub mod nodes {
 /// the same [`ChunkKey`], so a chunk is never found by directory scan.
 pub fn chunk_payload_path(key: ChunkKey) -> String {
     format!(
-        "lod/{:08x}/{}/cell_{}_{}.glb",
+        "lod/{:016x}/{}/cell_{}_{}.glb",
         key.worldspace_id,
         key.tier.side_cells(),
         key.anchor.x,
@@ -334,9 +334,15 @@ mod tests {
     #[test]
     fn chunk_payload_paths_are_stable_and_unique() {
         let key = ChunkKey::new(0x3c, LodTier::Tier4, ChunkAnchor::new(2, -1));
-        assert_eq!(chunk_payload_path(key), "lod/0000003c/4/cell_2_-1.glb");
+        assert_eq!(
+            chunk_payload_path(key),
+            "lod/000000000000003c/4/cell_2_-1.glb"
+        );
         let other = ChunkKey::new(0x3c, LodTier::Tier8, ChunkAnchor::new(2, -1));
-        assert_eq!(chunk_payload_path(other), "lod/0000003c/8/cell_2_-1.glb");
+        assert_eq!(
+            chunk_payload_path(other),
+            "lod/000000000000003c/8/cell_2_-1.glb"
+        );
         assert_ne!(chunk_payload_path(key), chunk_payload_path(other));
     }
 }

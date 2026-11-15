@@ -59,6 +59,7 @@ pub(crate) struct ObjectTextureCatalog(HashMap<u32, Arc<Vec<TextureSwap>>>);
 
 impl ObjectTextureCatalog {
     pub(crate) fn read(connection: &Connection) -> rusqlite::Result<Self> {
+        shared::world_assets::install_runtime_identity_functions_sql(connection)?;
         let has_table = |name: &str| -> rusqlite::Result<bool> {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -69,9 +70,16 @@ impl ObjectTextureCatalog {
         if !has_table("base_texture_swaps")? {
             return Ok(Self::default());
         }
+        if let Err(error) = crate::world::database::report_runtime_capacity(
+            connection,
+            "base_texture_swaps",
+            &["base_id", "texture_set_id"],
+        ) {
+            bevy::log::warn!("object textures: capacity inspection unavailable: {error}");
+        }
         let has_sets = has_table("texture_sets")?;
         let mut statement = connection.prepare(
-            "SELECT base_id,shape_index,texture_set_id,disposition
+            "SELECT runtime_id_or_null(base_id),shape_index,COALESCE(runtime_id_or_null(texture_set_id),0),disposition
              FROM base_texture_swaps ORDER BY base_id,position",
         )?;
         let rows = statement
@@ -83,14 +91,15 @@ impl ObjectTextureCatalog {
                     row.get::<_, String>(3)?,
                 ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
         // An older or reduced `texture_sets` table (a column missing) must not stop the catalog
         // from loading: its entries then report that no texture-set row is available.
         let mut sets = if has_sets {
             connection
                 .prepare(
                     "SELECT diffuse_path,normal_path,glow_path,height_path,environment_path,
-                            mask_path,specular_path,detail_path FROM texture_sets WHERE id=?1",
+                            mask_path,specular_path,detail_path FROM texture_sets WHERE id=stored_key(?1)",
                 )
                 .ok()
         } else {
