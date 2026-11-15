@@ -170,23 +170,33 @@ fn fidelity_rejects_table_proof_before_decoding_payloads() {
     assert!(error.contains("identity proof"), "{error}");
 }
 
+/// A retained contiguous allocation crosses u32 without manufacturing a sparse plugin table.
 #[test]
-fn sample_keys_above_u32_and_json_exact_integer_range_remain_named() {
-    let owner = PluginId::new(u32::MAX).unwrap();
-    let table = PluginTable::from_entries(vec![PluginEntry {
-        id: owner,
-        display_name: "High.esm".into(),
-        normalized_name: "high.esm".into(),
-        loaded: true,
-        facts: PluginFacts {
-            content_hash: Some([0x3D; 32]),
-            ..Default::default()
-        },
-    }])
-    .unwrap();
+fn sample_keys_above_u32_remain_named() {
+    let owner = PluginId::new(256).unwrap();
+    let entries = (1..=256)
+        .map(|id| {
+            let name = if id == 256 {
+                "High.esm".into()
+            } else {
+                format!("Retained{id:03}.esm")
+            };
+            PluginEntry {
+                id: PluginId::new(id).unwrap(),
+                normalized_name: name.to_lowercase(),
+                display_name: name,
+                loaded: id == 256,
+                facts: PluginFacts {
+                    content_hash: Some([0x3D; 32]),
+                    ..Default::default()
+                },
+            }
+        })
+        .collect();
+    let table = PluginTable::from_entries(entries).unwrap();
     let conn = database_with_identity(PackIdentity::new(table, vec![owner]).unwrap());
     let key = FormKey::new(owner, 0xABCDEF).unwrap();
-    assert_eq!(key.to_packed(), 0x00FF_FFFF_FFAB_CDEF);
+    assert_eq!(key.to_packed(), 0x0000_0001_00AB_CDEF);
     conn.execute(
         "INSERT INTO inhouse_source_records VALUES(?1,'KYWD',?2)",
         rusqlite::params![key.to_sql_i64(), sub(b"EDID", b"High\0")],
@@ -197,6 +207,21 @@ fn sample_keys_above_u32_and_json_exact_integer_range_remain_named() {
         report["occurrences"]["4B595744/45444944"]["samples"][0]["form_id"],
         "ABCDEF:High.esm"
     );
+}
+
+/// Large packed words must name an allocated owner before any portable sample is produced.
+#[test]
+fn fidelity_refuses_unallocated_keys_above_json_exact_integer_range() {
+    let conn = database();
+    let key = FormKey::new(PluginId::new(u32::MAX).unwrap(), 0xABCDEF).unwrap();
+    assert_eq!(key.to_packed(), 0x00FF_FFFF_FFAB_CDEF);
+    conn.execute(
+        "INSERT INTO inhouse_source_records VALUES(?1,'KYWD',?2)",
+        rusqlite::params![key.to_sql_i64(), sub(b"EDID", b"High\0")],
+    )
+    .unwrap();
+    let error = audit_storage(&conn, &schema()).unwrap_err().to_string();
+    assert!(error.contains("unknown plugin owner"), "{error}");
 }
 
 #[test]
