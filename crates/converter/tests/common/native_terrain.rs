@@ -10,8 +10,35 @@ use std::{
 
 pub struct Publication {
     _directory: tempfile::TempDir,
+    #[allow(dead_code)]
+    config: PipelineConfig,
     pub output: PathBuf,
     pub report: PipelineReport,
+}
+
+impl Publication {
+    /// The warm proof uses the exact source, destination and settings of its first run.
+    #[allow(dead_code)]
+    pub async fn repeat(&self) -> PipelineReport {
+        run(self.config.clone()).await
+    }
+
+    /// Inspect the actual verified bundle, including findings that are restored with the DB.
+    #[allow(dead_code)]
+    pub fn database_cache_bundle(&self) -> PathBuf {
+        self.config
+            .ingestion_cache_dir()
+            .join(".database-cache")
+            .join(self.report.database_cache_key.as_ref().unwrap())
+    }
+}
+
+async fn run(config: PipelineConfig) -> PipelineReport {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = AssetPipeline::run_async(config, tx).await.unwrap();
+    drain.await.unwrap();
+    report
 }
 
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
@@ -119,6 +146,22 @@ fn cell(word: u32, x: i32, y: i32, land_word: u32, offset: f32) -> Vec<u8> {
 
 /// Source priority Zulu/Alpha/Patch, allocation Alpha/Patch/Zulu, MAST Alpha/Zulu.
 pub async fn publish(reader: RecordReader, damaged: bool, lod: bool) -> Publication {
+    publish_configured(reader, damaged, lod, true, false).await
+}
+
+/// A cacheable broken-mod run includes a winner warning and an accepted compatibility notice.
+#[allow(dead_code)]
+pub async fn publish_for_database_cache(reader: RecordReader) -> Publication {
+    publish_configured(reader, true, false, false, true).await
+}
+
+async fn publish_configured(
+    reader: RecordReader,
+    damaged: bool,
+    lod: bool,
+    merged_terrain: bool,
+    cache_findings: bool,
+) -> Publication {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     let output = directory.path().join("assets");
@@ -195,11 +238,14 @@ pub async fn publish(reader: RecordReader, damaged: bool, lod: bool) -> Publicat
         fields.extend(weight(17, 0.5));
     }
     fields.extend(sub(b"VNML", &[1, 2, 126].repeat(33 * 33)));
-    let mut patch = group(
-        1,
-        0x0100_0600,
-        &group(6, 0x0100_0700, &record(b"LAND", 0x0100_0800, 0, &fields)),
-    );
+    let mut selected_cell = Vec::new();
+    if cache_findings {
+        // Different LAND identities share a cell. Native source order keeps the following
+        // Zulu-owned override; both conversion and cache selection report this dropped one.
+        selected_cell.extend(land(0x0200_0804, 4.5));
+    }
+    selected_cell.extend(record(b"LAND", 0x0100_0800, 0, &fields));
+    let mut patch = group(1, 0x0100_0600, &group(6, 0x0100_0700, &selected_cell));
     if damaged {
         patch.extend(group(
             1,
@@ -223,6 +269,15 @@ pub async fn publish(reader: RecordReader, damaged: bool, lod: bool) -> Publicat
         0,
         &sub(b"EDID", b"HealthyAfterDamage\0"),
     ));
+    if cache_findings {
+        // An accepted past-MAST self selector produces a real advisory in both readers.
+        patch.extend(record(
+            b"STAT",
+            0xff00_0812,
+            0,
+            &sub(b"EDID", b"AcceptedCompatibilityNeighbor\0"),
+        ));
+    }
     plugin(&data, "Patch.esp", &["Alpha.esm", "Zulu.esm"], &patch);
     let list = directory.path().join("plugins.txt");
     fs::write(&list, "*Zulu.esm\n*Alpha.esm\n*Patch.esp\n").unwrap();
@@ -230,19 +285,17 @@ pub async fn publish(reader: RecordReader, damaged: bool, lod: bool) -> Publicat
     config.plugins_file = Some(list);
     config.record_reader = reader;
     config.no_lod = !lod;
-    config.merged_terrain = true;
+    config.merged_terrain = merged_terrain;
     config.cpu_jobs = 2;
     config.texture_encoder = TextureEncoder::Cpu;
     config.lod_texture_encoder = TextureEncoder::Cpu;
     if lod {
         config.lod_origins.insert("WorldZulu".into(), [0, 0]);
     }
-    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let report = AssetPipeline::run_async(config, tx).await.unwrap();
-    drain.await.unwrap();
+    let report = run(config.clone()).await;
     Publication {
         _directory: directory,
+        config,
         output,
         report,
     }

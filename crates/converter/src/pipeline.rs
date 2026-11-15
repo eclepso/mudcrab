@@ -1162,16 +1162,10 @@ impl AssetPipeline {
                         string_sources,
                         Some(config.schemas()?.as_ref()),
                     )?;
-                database_cache::write_conversion_notes(
-                    staging,
-                    &database_cache::ConversionNotes {
-                        warnings: conversion.warnings.clone(),
-                        notices: conversion.notices.clone(),
-                    },
-                )?;
-                manifest.record_data_complete = Some(conversion.warnings.is_empty());
-                report.warnings.extend(conversion.warnings);
-                report.notices.extend(conversion.notices);
+                let mut record_notes = database_cache::ConversionNotes {
+                    warnings: conversion.warnings,
+                    notices: conversion.notices,
+                };
                 let phases = conversion.phases;
                 let merged = conversion
                     .native
@@ -1193,13 +1187,14 @@ impl AssetPipeline {
                 if config.record_reader == crate::config::RecordReader::Inhouse {
                     crate::esm::inhouse::write_database_profile(staging, &db_path, &phases)?;
                 }
-                let (_, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
-                    &merged,
-                    &source_offsets,
-                    &staging.join("cell_cache.rkyv"),
-                    false,
-                )?;
-                report.warnings.extend(cache_warnings);
+                let (terrain_cells, cache_warnings) =
+                    crate::esm::cell_cache::write_form_key_cell_cache(
+                        &merged,
+                        &source_offsets,
+                        &staging.join("cell_cache.rkyv"),
+                        false,
+                    )?;
+                record_notes.warnings.extend(cache_warnings);
                 if config.record_reader == crate::config::RecordReader::Inhouse {
                     let (_, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
                         &merged,
@@ -1207,9 +1202,23 @@ impl AssetPipeline {
                         &staging.join("cell_cache_preserved.rkyv"),
                         true,
                     )?;
-                    report.warnings.extend(cache_warnings);
+                    record_notes.warnings.extend(cache_warnings);
                 }
-                manifest.record_data_complete = Some(report.warnings.is_empty());
+                let mut seen_notes = std::collections::HashSet::new();
+                record_notes
+                    .warnings
+                    .retain(|warning| seen_notes.insert(warning.clone()));
+                manifest.record_data_complete = Some(record_notes.warnings.is_empty());
+                database_cache::write_conversion_notes(staging, &record_notes)?;
+                report.warnings.extend(record_notes.warnings);
+                report.notices.extend(record_notes.notices);
+                if config.record_reader == crate::config::RecordReader::Inhouse {
+                    crate::esm::inhouse::write_terrain_cache_profile(
+                        staging,
+                        terrain_cells,
+                        terrain_caches_started.elapsed().as_secs_f64(),
+                    )?;
+                }
                 report.phase_elapsed_ms.insert(
                     "terrain_caches".into(),
                     terrain_caches_started.elapsed().as_millis(),

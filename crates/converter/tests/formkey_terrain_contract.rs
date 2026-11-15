@@ -25,6 +25,11 @@ async fn both_readers_publish_paired_terrain_with_exact_physical_link_oracles() 
     for reader in [RecordReader::Legacy, RecordReader::Inhouse] {
         let publication = fixture::publish(reader, true, false).await;
         let output = &publication.output;
+        let report_json = serde_json::to_value(&publication.report).unwrap();
+        assert_eq!(
+            report_json["terrain"]["worldspaces"][0]["worldspace_id"], "000600:Zulu.esm",
+            "terrain report must emit the portable original owner/local identity"
+        );
         let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
         let context = RecordContextReader::new(&database).unwrap();
         let identity = context.identity();
@@ -213,5 +218,157 @@ async fn both_readers_publish_named_lod_cells_bound_to_plugin_table() {
         }
         assert!(names.contains("000700:Zulu.esm"));
         assert!(names.contains("000701:Zulu.esm"));
+    }
+}
+
+fn assert_cached_native_neighbors(output: &std::path::Path) {
+    let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+    let context = RecordContextReader::new(&database).unwrap();
+    let neighbor = context.record(key(0x0300_0801)).unwrap();
+    assert_eq!(neighbor.supplier.get(), 3);
+    assert_eq!(neighbor.source_header, 0x801);
+    assert_eq!(
+        &neighbor.bytes(*b"VHGT").unwrap()[..4],
+        &2.5f32.to_le_bytes()
+    );
+    assert_eq!(
+        context
+            .record(key(0x0200_0810))
+            .unwrap()
+            .text(*b"EDID")
+            .as_deref(),
+        Some("HealthyAfterDamage")
+    );
+    let compatibility = context.record(key(0x0200_0812)).unwrap();
+    assert_eq!(compatibility.supplier.get(), 2);
+    assert_eq!(compatibility.source_header, 0xff00_0812);
+    let damaged: i64 = database
+        .query_row(
+            "SELECT count(*) FROM records WHERE form_id IN (33556482,33556483)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(damaged, 0);
+    let cache =
+        converter::esm::cell_cache::read_form_key_cell_cache(&output.join("cell_cache.rkyv"))
+            .unwrap();
+    assert_eq!(cache.cells.len(), 2);
+    for (cell, height) in [(0x0300_0700, 28.0), (0x0300_0701, 20.0)] {
+        assert_eq!(
+            cache
+                .cells
+                .iter()
+                .find(|entry| entry.cell_id == cell)
+                .unwrap()
+                .heights,
+            vec![height; 33 * 33]
+        );
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("conversion-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["record_data_complete"], false);
+    assert_eq!(manifest["complete"], false);
+}
+
+fn messages(notes: &serde_json::Value, category: &str) -> Vec<String> {
+    notes[category]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn assert_findings_once(expected: &[String], actual: &[String]) {
+    assert_eq!(
+        expected
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected.len(),
+        "one persisted message per finding"
+    );
+    assert_eq!(
+        actual, expected,
+        "restore must retain every finding without replaying it twice"
+    );
+}
+
+/// The shared winner warning exercises source and cache reporting. Frontend admission rejects
+/// the malformed geometry first, so this does not generate a cache-only LAND build error.
+#[tokio::test]
+async fn both_readers_warm_broken_mod_cache_retains_neighbors_and_findings_once() {
+    for reader in [RecordReader::Legacy, RecordReader::Inhouse] {
+        let publication = fixture::publish_for_database_cache(reader).await;
+        assert!(!publication.report.database_cache_hit);
+        assert!(publication.report.database_runtime_records_built > 0);
+        assert!(!publication.report.complete);
+        assert_cached_native_neighbors(&publication.output);
+        let notes_path = publication
+            .database_cache_bundle()
+            .join("conversion-notes.json");
+        let notes_bytes = std::fs::read(&notes_path).unwrap();
+        let notes: serde_json::Value = serde_json::from_slice(&notes_bytes).unwrap();
+        let warnings = messages(&notes, "warnings");
+        let notices = messages(&notes, "notices");
+        assert!(!warnings.is_empty());
+        assert!(
+            !notices.is_empty(),
+            "the accepted FF self header must retain its notice"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("dropped LAND 000804:Patch.esp"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.to_ascii_lowercase().contains("patch.esp")
+                    && !line.contains("dropped LAND")),
+            "a frontend loss must also persist"
+        );
+        assert_findings_once(&warnings, &publication.report.warnings);
+        assert_findings_once(&notices, &publication.report.notices);
+        let names: &[&str] = if reader == RecordReader::Inhouse {
+            &["cell_cache.rkyv", "cell_cache_preserved.rkyv"]
+        } else {
+            &["cell_cache.rkyv"]
+        };
+        let cache_bytes: Vec<_> = names
+            .iter()
+            .map(|name| (*name, std::fs::read(publication.output.join(name)).unwrap()))
+            .collect();
+        let warm = publication.repeat().await;
+        assert!(warm.database_cache_hit, "{warm:?}");
+        assert_eq!(
+            warm.database_cache_key,
+            publication.report.database_cache_key
+        );
+        assert_eq!(
+            warm.database_cache_files,
+            if reader == RecordReader::Inhouse {
+                7
+            } else {
+                4
+            }
+        );
+        assert_eq!(warm.database_runtime_records_built, 0);
+        assert!(!warm.complete);
+        assert_cached_native_neighbors(&publication.output);
+        assert_findings_once(&warnings, &warm.warnings);
+        assert_findings_once(&notices, &warm.notices);
+        assert_eq!(std::fs::read(notes_path).unwrap(), notes_bytes);
+        for (name, expected) in cache_bytes {
+            assert_eq!(
+                std::fs::read(publication.output.join(name)).unwrap(),
+                expected,
+                "{name}"
+            );
+            converter::esm::cell_cache::read_form_key_cell_cache(&publication.output.join(name))
+                .unwrap();
+        }
     }
 }

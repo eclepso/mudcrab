@@ -375,6 +375,7 @@ pub fn export_record_bundle_typed_with_options(
         .ok_or_else(|| color_eyre::eyre::eyre!("native record bundle lost its FormKey context"))?;
     write_database_profile(output, &database_path, &converted.phases)?;
     let record_count = native.records.len();
+    let terrain_started = std::time::Instant::now();
     let terrain_stage = records::profile::ProfileStage::start("terrain_cache_pair");
     let (count, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
         &native,
@@ -399,6 +400,7 @@ pub fn export_record_bundle_typed_with_options(
     for notice in &converted.notices {
         eprintln!("{notice}");
     }
+    write_terrain_cache_profile(output, count, terrain_started.elapsed().as_secs_f64())?;
     terrain_stage.finish(record_count);
     drop(plugins);
     if let Some(work) = separate_work {
@@ -755,6 +757,25 @@ pub(crate) fn write_database_profile(
         count("SELECT coalesce(sum(length(payload)),0) FROM inhouse_source_records")?,
     );
     profile.elapsed_seconds = phases.clone();
+    profile.write(output)
+}
+
+/// Retain the terrain count in the shared profile after both authenticated caches are written.
+pub(crate) fn write_terrain_cache_profile(
+    output: &Path,
+    count: usize,
+    elapsed_seconds: f64,
+) -> Result<()> {
+    let path = output.join(DATABASE_PROFILE_FILE);
+    let mut profile = if path.is_file() {
+        serde_json::from_slice::<DatabaseProfile>(&fs::read(path)?)?
+    } else {
+        DatabaseProfile::new()
+    };
+    profile.counts.insert("terrain_cells".into(), count as u64);
+    profile
+        .elapsed_seconds
+        .insert("total_terrain_caches".into(), elapsed_seconds);
     profile.write(output)
 }
 
