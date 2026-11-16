@@ -298,6 +298,13 @@ fn assert_findings_once(expected: &[String], actual: &[String]) {
 
 fn assert_notices_once(expected: &[String], actual: &[String]) {
     const LOD_NOTICE: &str = "Terrain LOD compilation disabled by --no-lod";
+    const SELECTION_NOTICES: [&str; 5] = [
+        "plugin dawnguard.esm is not installed; skipping",
+        "plugin dragonborn.esm is not installed; skipping",
+        "plugin hearthfires.esm is not installed; skipping",
+        "plugin skyrim.esm is not installed; skipping",
+        "plugin update.esm is not installed; skipping",
+    ];
     assert_eq!(
         actual
             .iter()
@@ -306,9 +313,21 @@ fn assert_notices_once(expected: &[String], actual: &[String]) {
         1,
         "the requested LOD stage reports its disabled state once per run"
     );
+    for notice in SELECTION_NOTICES {
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|message| message.as_str() == notice)
+                .count(),
+            1,
+            "selection notices belong to each fresh run, not the cached reader findings"
+        );
+    }
     let record_notices: Vec<_> = actual
         .iter()
-        .filter(|notice| notice.as_str() != LOD_NOTICE)
+        .filter(|notice| {
+            notice.as_str() != LOD_NOTICE && !SELECTION_NOTICES.contains(&notice.as_str())
+        })
         .cloned()
         .collect();
     assert_findings_once(expected, &record_notices);

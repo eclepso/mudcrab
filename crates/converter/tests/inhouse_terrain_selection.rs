@@ -137,8 +137,8 @@ fn assert_terrain(output: &Path, height: f32, marker: u8) {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let (heightmap, colors): (Vec<u8>, Vec<u8>) = db
         .query_row(
-            "SELECT heightmap,vclr FROM land WHERE cell_id=4096",
-            [],
+            "SELECT heightmap,vclr FROM land WHERE cell_id=?1",
+            [common::stored_key(&db, 0x1000)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();

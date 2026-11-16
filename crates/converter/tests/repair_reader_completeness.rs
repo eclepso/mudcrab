@@ -1,4 +1,5 @@
 //! Asset repair preserves reader-loss and historical completeness uncertainty.
+mod common;
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader,
     esm::types::ArchivedRecordData, repair::repair_failed,
@@ -109,7 +110,7 @@ fn json(path: &Path) -> Value {
 /// Inspect usable records by fixed IDs rather than deriving expected rows from the decoder.
 fn assert_neighbors(output: &Path) {
     let database = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let rows: Vec<(u32, String, Vec<u8>)> = database
+    let rows: Vec<(i64, String, Vec<u8>)> = database
         .prepare("SELECT form_id, record_type, data FROM records ORDER BY form_id")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -128,7 +129,7 @@ fn assert_neighbors(output: &Path) {
                 .filter(|subrecord| subrecord.tag == *b"EDID")
                 .map(|subrecord| subrecord.data)
                 .collect::<Vec<_>>();
-            (id, editor_ids)
+            (common::runtime_id(&database, id), editor_ids)
         })
         .collect::<Vec<_>>();
     assert_eq!(

@@ -601,7 +601,7 @@ async fn ai_families_publish_prior_winners_and_neighbors_after_bad_compression()
         let id = ai::FIRST_ID + index;
         let (load_order, payload): (i64, Vec<u8>) = database.query_row(
             "SELECT source.load_order,source.payload FROM inhouse_source_records source JOIN records ON records.form_id=source.form_id WHERE source.form_id=?",
-            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+            [common::stored_key(&database, id)], |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(load_order, 0);
         assert_eq!(payload, earlier.records[&id].raw_payload);
@@ -610,7 +610,7 @@ async fn ai_families_publish_prior_winners_and_neighbors_after_bad_compression()
         let count: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -618,8 +618,8 @@ async fn ai_families_publish_prior_winners_and_neighbors_after_bad_compression()
     }
     let published: Vec<u8> = database
         .query_row(
-            "SELECT data FROM records WHERE form_id=0x01001E90",
-            [],
+            "SELECT data FROM records WHERE form_id=?1",
+            [common::stored_key(&database, 0x01001E90)],
             |row| row.get(0),
         )
         .unwrap();
@@ -642,8 +642,8 @@ async fn ai_families_publish_prior_winners_and_neighbors_after_bad_compression()
     assert_eq!(values[1].data, 93u32.to_le_bytes());
     let source: Vec<u8> = database
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=0x01001E90",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&database, 0x01001E90)],
             |row| row.get(0),
         )
         .unwrap();

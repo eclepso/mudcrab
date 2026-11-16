@@ -322,26 +322,35 @@ fn assert_published_layers(output: &Path) {
     }
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     // R5 normalizes unresolved texture membership into scalar child rows.
-    let (cell, priority, blob): (u32, u32, Vec<u8>) = db
+    let (cell, priority, blob): (i64, u32, Vec<u8>) = db
         .query_row(
             "SELECT cell_id,load_order,layer_data FROM inhouse_terrain_layers WHERE form_id=?",
-            [LAND_GLOBAL_ID],
+            [common::stored_key(&db, LAND_GLOBAL_ID)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!((cell, priority), (CELL_ID, 2));
+    assert_eq!((cell, priority), (common::stored_key(&db, CELL_ID), 2));
+    let mut layers = rkyv::from_bytes::<Vec<TerrainLayer>, rkyv::rancor::Error>(&blob).unwrap();
+    for layer in &mut layers {
+        if layer.texture_form_id != 0 {
+            layer.texture_form_id = u64::from(common::runtime_id(
+                &db,
+                i64::try_from(layer.texture_form_id).unwrap(),
+            ));
+        }
+    }
     assert_eq!(
-        rkyv::from_bytes::<Vec<TerrainLayer>, rkyv::rancor::Error>(&blob).unwrap(),
+        layers,
         expected_preserved_layers(),
         "SQL layer_data must retain every normalized active source layer"
     );
     let unresolved = db
         .prepare("SELECT texture_form_id FROM inhouse_unresolved_terrain_textures WHERE form_id=? ORDER BY texture_form_id")
         .unwrap()
-        .query_map([LAND_GLOBAL_ID], |row| row.get::<_, u32>(0))
+        .query_map([common::stored_key(&db, LAND_GLOBAL_ID)], |row| row.get::<_, i64>(0))
         .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
+        .map(|row| common::runtime_id(&db, row.unwrap()))
+        .collect::<Vec<_>>();
     assert_eq!(
         unresolved,
         vec![0x844, 0x845, 0x846, 0x847],
@@ -351,7 +360,7 @@ fn assert_published_layers(output: &Path) {
         assert_eq!(
             db.query_row(
                 "SELECT record_type FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
@@ -361,7 +370,7 @@ fn assert_published_layers(output: &Path) {
     let (heightmap, colors): (Vec<u8>, Vec<u8>) = db
         .query_row(
             "SELECT heightmap,vclr FROM land WHERE cell_id=?",
-            [CELL_ID],
+            [common::stored_key(&db, CELL_ID)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -375,7 +384,7 @@ fn assert_source_and_canonical(output: &Path, fields: &[(Vec<u8>, Vec<u8>)]) {
     let (source, priority, payload): (u32, u32, Vec<u8>) = db
         .query_row(
             "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=?",
-            [LAND_GLOBAL_ID],
+            [common::stored_key(&db, LAND_GLOBAL_ID)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
@@ -384,7 +393,7 @@ fn assert_source_and_canonical(output: &Path, fields: &[(Vec<u8>, Vec<u8>)]) {
     let canonical: Vec<u8> = db
         .query_row(
             "SELECT data FROM records WHERE form_id=?",
-            [LAND_GLOBAL_ID],
+            [common::stored_key(&db, LAND_GLOBAL_ID)],
             |row| row.get(0),
         )
         .unwrap();
@@ -392,6 +401,15 @@ fn assert_source_and_canonical(output: &Path, fields: &[(Vec<u8>, Vec<u8>)]) {
         rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&canonical).unwrap();
     assert_eq!(canonical.subrecords.len(), fields.len());
     for (actual, (tag, native)) in canonical.subrecords.iter().zip(fields) {
+        assert_eq!(actual.tag.as_slice(), tag.as_slice());
+        assert_eq!(
+            &actual.data, native,
+            "native source fields remain unchanged"
+        );
+    }
+    let runtime = common::runtime_record(&db, LAND_GLOBAL_ID);
+    assert_eq!(runtime.subrecords.len(), fields.len());
+    for (actual, (tag, native)) in runtime.subrecords.iter().zip(fields) {
         assert_eq!(actual.tag.as_slice(), tag.as_slice());
         let mut expected = native.clone();
         if matches!(tag.as_slice(), b"BTXT" | b"ATXT") {
@@ -522,7 +540,7 @@ async fn malformed_over_capacity_overrides_keep_prior_layers_and_valid_neighbors
             assert_eq!(
                 db.query_row(
                     "SELECT COUNT(*) FROM records WHERE form_id=?",
-                    [id],
+                    [common::stored_key(&db, id)],
                     |row| row.get::<_, u32>(0)
                 )
                 .unwrap(),

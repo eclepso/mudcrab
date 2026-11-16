@@ -1,4 +1,5 @@
 //! Complete exports replace prior world state; subset writes keep unrelated records.
+mod common;
 use converter::esm::{
     EsmParser,
     exporter::{create_tables, export_to_db, export_to_db_with_load_order},
@@ -95,7 +96,7 @@ fn complete_public_exports_replace_prior_records_plugins_and_lod() {
     let owner: String = db
         .query_row("SELECT plugin_name FROM formid_map", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(owner, "base.esm");
+    assert_eq!(owner, "Base.esm");
     assert_eq!(count(&db, "lod"), 0);
     assert_eq!(count(&db, "caller_notes"), 1);
     assert_eq!(count(&db, "conversion_cache"), 1);
@@ -176,9 +177,11 @@ fn failed_complete_export_rolls_back_snapshot_replacement() {
     assert_eq!(count(&db, "plugins"), 1);
     assert_eq!(count(&db, "lod"), 1);
     let sentinel: String = db
-        .query_row("SELECT editor_id FROM statics WHERE id=6144", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT editor_id FROM statics WHERE id=?1",
+            [common::stored_key(&db, 0x1800)],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(sentinel, "RollbackSentinel");
     let schema: u32 = db

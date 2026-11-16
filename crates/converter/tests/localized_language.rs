@@ -1,9 +1,7 @@
 //! Localized plugins' names come from the string tables of the configured language (#195), read
 //! as UTF-8 or, failing that, Windows-1252. Synthetic plugins and tables; no game data.
-use converter::{
-    AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader,
-    esm::types::ArchivedRecordData,
-};
+mod common;
+use converter::{AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader};
 use dummy_content::{Entry, bsa};
 use rusqlite::Connection;
 use std::{fs, path::Path};
@@ -95,14 +93,7 @@ fn names(output: &Path) -> Vec<Option<String>> {
 /// Legacy publishes the selected localized text in canonical `records.data`.
 fn legacy_full(output: &Path, form_id: u32) -> Option<String> {
     let connection = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let bytes: Vec<u8> = connection
-        .query_row(
-            "SELECT data FROM records WHERE form_id=?1",
-            [form_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let record = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap();
+    let record = common::runtime_record(&connection, form_id);
     let full = record
         .subrecords
         .iter()

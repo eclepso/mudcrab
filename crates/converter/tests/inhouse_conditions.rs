@@ -438,14 +438,9 @@ fn unknown_functions_and_malformed_lengths_preserve_neighboring_fields() {
     );
 }
 
-/// Read the canonical public record wire representation, rather than only source bytes.
+/// Authenticate native canonical bytes before the transient runtime-link interpretation.
 fn published_record(database: &Connection, id: u32) -> ArchivedRecordData {
-    let bytes: Vec<u8> = database
-        .query_row("SELECT data FROM records WHERE form_id=?", [id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap()
+    common::runtime_record(database, id)
 }
 
 /// Conversion publishes neighbors, clears broken full/light refs and omits malformed CTDA.

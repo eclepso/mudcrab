@@ -1,4 +1,5 @@
 //! Shared archive ownership, activity and priority through actual synthetic publication.
+mod common;
 
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport, TextureEncoder,
@@ -516,8 +517,8 @@ fn world_origin(output: &Path) -> (i32, i32) {
     validate_database(&connection).unwrap();
     connection
         .query_row(
-            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=1",
-            [],
+            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=?1",
+            [common::stored_key(&connection, 1)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()

@@ -488,7 +488,7 @@ async fn broken_world_mod_publishes_prior_winners_neighbors_and_link_recovery() 
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     for index in 0..world::SIGNATURES.len() {
         let id = world::FIRST_ID + index as u32;
-        let (load_order, payload): (i64, Vec<u8>) = db.query_row("SELECT source.load_order,source.payload FROM inhouse_source_records source JOIN records USING(form_id) WHERE source.form_id=?", [id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let (load_order, payload): (i64, Vec<u8>) = db.query_row("SELECT source.load_order,source.payload FROM inhouse_source_records source JOIN records USING(form_id) WHERE source.form_id=?", [common::stored_key(&db, id)], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(load_order, 0);
         assert_eq!(payload, earlier.records[&id].raw_payload);
     }
@@ -496,7 +496,7 @@ async fn broken_world_mod_publishes_prior_winners_neighbors_and_link_recovery() 
         let count: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -506,7 +506,7 @@ async fn broken_world_mod_publishes_prior_winners_neighbors_and_link_recovery() 
         let payload: Vec<u8> = db
             .query_row(
                 "SELECT payload FROM inhouse_source_records WHERE form_id=?",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();

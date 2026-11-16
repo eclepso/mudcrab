@@ -1,6 +1,7 @@
 //! Synthetic examples of observed legacy and in-house reader differences. `reader_diff` reports
 //! these differences conservatively; this fixture is not a correctness oracle or completeness
 //! gate. See `docs/research/record-reader-divergence.md`.
+mod common;
 
 use converter::reader_diff::{Options, Report, compare};
 use std::{fs, path::Path, process::Command};
@@ -75,6 +76,10 @@ fn light_data() -> Vec<u8> {
 }
 
 fn master_plugin() -> Vec<u8> {
+    master_plugin_with_bytes(b"Caf\xe9\0", 0xDEAD)
+}
+
+fn master_plugin_with_bytes(editor: &[u8], dangling: u32) -> Vec<u8> {
     let cell = record(
         b"CELL",
         CELL,
@@ -92,7 +97,7 @@ fn master_plugin() -> Vec<u8> {
         &[
             sub(b"NAME", &TEXT.to_le_bytes()),
             // XEMI names a light or region that does not exist.
-            sub(b"XEMI", &0xDEADu32.to_le_bytes()),
+            sub(b"XEMI", &dangling.to_le_bytes()),
             sub(b"DATA", &[0; 24]),
         ]
         .concat(),
@@ -106,7 +111,7 @@ fn master_plugin() -> Vec<u8> {
                 record(
                     b"STAT",
                     TEXT,
-                    &[sub(b"EDID", b"Caf\xe9\0"), sub(b"MODL", b"a.nif\0")].concat(),
+                    &[sub(b"EDID", editor), sub(b"MODL", b"a.nif\0")].concat(),
                 ),
                 // MODL before EDID: out of the schema's order.
                 record(
@@ -297,7 +302,8 @@ fn any_field_keys(report: &Report, group: &str) -> Vec<String> {
 }
 
 fn id(value: u32) -> String {
-    format!("{value:08X}")
+    assert_eq!(value >> 24, 0, "these samples belong to Skyrim.esm");
+    format!("{value:06x}:skyrim.esm")
 }
 
 #[test]
@@ -306,8 +312,37 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
     let report = build(root.path());
     eprintln!("{}", converter::reader_diff::summary(&report));
 
-    // Text bytes differ, but the comparator has no field type provenance to assign a cause.
-    assert_eq!(field_keys(&report, "other_length", "STAT EDID"), [id(TEXT)]);
+    // Both current producers preserve original CP1252 bytes and record decoded text separately.
+    assert!(any_field_keys(&report, "STAT EDID").is_empty());
+    for path in [
+        root.path().join("legacy.db"),
+        root.path().join("inhouse/skyrim_world.db"),
+    ] {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(
+            common::native_fields(&connection, TEXT, b"EDID"),
+            [b"Caf\xe9\0".to_vec()]
+        );
+        let reader = shared::records::RecordContextReader::new(&connection).unwrap();
+        let key = reader.identity().runtime_key(TEXT).unwrap().unwrap();
+        assert_eq!(
+            reader.record(key).unwrap().text(*b"EDID").as_deref(),
+            Some("Caf\u{e9}")
+        );
+        let display: String = connection
+            .query_row(
+                "SELECT editor_id FROM statics WHERE id=?1",
+                [key.to_sql_i64()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display, "Caf\u{e9}");
+        let reference = reader
+            .record(reader.identity().runtime_key(DANGLING).unwrap().unwrap())
+            .unwrap();
+        assert_eq!(reference.bytes(*b"XEMI").unwrap(), 0xDEADu32.to_le_bytes());
+        assert_eq!(reference.first_link(*b"XEMI", 0).unwrap(), None);
+    }
     // A known subrecord out of the schema's order is dropped by the in-house decoder.
     assert_eq!(
         field_keys(&report, "omitted_by_inhouse", "STAT EDID"),
@@ -322,11 +357,8 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
         field_keys(&report, "omitted_by_inhouse", "LIGH FNAM"),
         [id(NAN_LIGHT)]
     );
-    // A link-shaped value is reported as bytes without reliable schema context.
-    assert_eq!(
-        field_keys(&report, "other_bytes", "REFR XEMI"),
-        [id(DANGLING)]
-    );
+    // Both readers retain the same native word and separately certify its cleared outcome.
+    assert!(any_field_keys(&report, "REFR XEMI").is_empty());
     // Current main remaps this typed link in both readers, so it converges.
     assert!(any_field_keys(&report, "WTHR IMSP").is_empty());
     // Current main resolves localized text in both readers, so it converges.
@@ -338,6 +370,48 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
         report.tables["statics"].columns["model_path"].samples[0].legacy,
         "\"mod_chest.nif\""
     );
+}
+
+/// Separate authored inputs retain the conservative byte/length labels without inventing
+/// a reader encoding difference or assigning a causal FormID label from untyped bytes.
+#[test]
+fn authenticated_input_differences_keep_untyped_length_and_byte_labels() {
+    let root = tempfile::tempdir().unwrap();
+    let mut databases = Vec::new();
+    for (name, text, link) in [
+        ("cp1252", b"Caf\xe9\0".as_slice(), 0xDEADu32),
+        ("utf8", b"Caf\xc3\xa9\0".as_slice(), 0xBEEF),
+    ] {
+        let folder = root.path().join(name);
+        fs::create_dir(&folder).unwrap();
+        let (data, plugins) = write_inputs(&folder);
+        fs::write(
+            data.join("Skyrim.esm"),
+            master_plugin_with_bytes(text, link),
+        )
+        .unwrap();
+        let paths = converter::esm::read_plugins_txt(&plugins, &data).unwrap();
+        let database = folder.join("skyrim_world.db");
+        converter::esm::EsmParser::convert_plugins(&paths, &database).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            common::native_fields(&connection, TEXT, b"EDID"),
+            [text.to_vec()]
+        );
+        assert_eq!(
+            common::native_fields(&connection, DANGLING, b"XEMI"),
+            [link.to_le_bytes().to_vec()]
+        );
+        databases.push(database);
+    }
+    let report = compare(&databases[0], &databases[1], &Options::default()).unwrap();
+    assert_eq!(field_keys(&report, "other_length", "STAT EDID"), [id(TEXT)]);
+    assert_eq!(
+        field_keys(&report, "other_bytes", "REFR XEMI"),
+        [id(DANGLING)]
+    );
+    assert!(field_keys(&report, "link_cleared", "REFR XEMI").is_empty());
+    assert!(field_keys(&report, "localized_text", "STAT EDID").is_empty());
 }
 
 #[test]

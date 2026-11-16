@@ -163,7 +163,7 @@ async fn deferred_npc_ownership_counts_source_issues_once_through_publication() 
             let count: i64 = database
                 .query_row(
                     "SELECT COUNT(*) FROM records WHERE form_id=?",
-                    [id],
+                    [common::stored_key(&database, id)],
                     |row| row.get(0),
                 )
                 .unwrap();

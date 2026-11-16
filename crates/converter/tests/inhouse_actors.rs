@@ -787,7 +787,7 @@ async fn actor_corruption_is_local_through_real_pack_publication() {
         assert_eq!(
             db.query_row(
                 "SELECT record_type FROM records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
@@ -797,7 +797,7 @@ async fn actor_corruption_is_local_through_real_pack_publication() {
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM records WHERE form_id=?1",
-            [0x0100_3401u32],
+            [common::stored_key(&db, 0x0100_3401u32)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -806,7 +806,7 @@ async fn actor_corruption_is_local_through_real_pack_publication() {
     assert_eq!(
         db.query_row(
             "SELECT load_order FROM records WHERE form_id=?1",
-            [0x2400u32],
+            [common::stored_key(&db, 0x2400u32)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -884,7 +884,7 @@ async fn all_actor_types_recover_bad_compressed_overrides_during_publication() {
         let winner = db
             .query_row(
                 "SELECT record_type,load_order FROM records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
             )
             .unwrap();
@@ -896,7 +896,7 @@ async fn all_actor_types_recover_bad_compressed_overrides_during_publication() {
         assert_eq!(
             db.query_row(
                 "SELECT load_order FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get::<_, u32>(0)
             )
             .unwrap(),
@@ -909,7 +909,7 @@ async fn all_actor_types_recover_bad_compressed_overrides_during_publication() {
             let row = db
                 .query_row(
                     "SELECT record_type,load_order FROM records WHERE form_id=?1",
-                    [neighbor],
+                    [common::stored_key(&db, neighbor)],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
                 )
                 .unwrap();

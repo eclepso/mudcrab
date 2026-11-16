@@ -1,4 +1,5 @@
 //! Nullable runtime projections must preserve reference archive field identity.
+mod common;
 use converter::esm::{inhouse, types::ArchivedRecordData};
 use dummy_content::{esm, layout};
 use rusqlite::Connection;
@@ -104,7 +105,7 @@ fn unresolved_marker_text_preserves_identical_reference_and_record_archives() {
         let archives: (Vec<u8>, Vec<u8>) = database
             .query_row(
                 "SELECT records.data, r.data FROM records JOIN \"references\" r ON r.id=records.form_id WHERE records.form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -113,8 +114,13 @@ fn unresolved_marker_text_preserves_identical_reference_and_record_archives() {
             archives.1, archives.0,
             "reference archive lost fields for {id:08X}"
         );
-        let archived =
+        let canonical =
             rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&archives.0).unwrap();
+        assert_eq!(
+            canonical.subrecords[4].data,
+            (if id == 0x0100_3F11 { 17u32 } else { 100u32 }).to_le_bytes()
+        );
+        let archived = common::runtime_record(&database, id);
         assert_eq!(archived.subrecords[4].tag, *b"FULL");
         assert_eq!(archived.subrecords[4].data, expected);
         assert_eq!(archived.subrecords.len(), 7);
@@ -131,7 +137,7 @@ fn unresolved_marker_text_preserves_identical_reference_and_record_archives() {
         let metadata: (u32, String, String, String, u32, u32, Option<String>, String) = database
             .query_row(
                 "SELECT field_index,signature,field_name,string_table,string_id,load_order,resolved_text,status FROM inhouse_localized_fields WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
             )
             .unwrap();

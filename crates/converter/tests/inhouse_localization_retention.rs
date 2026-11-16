@@ -89,12 +89,7 @@ fn message(id: u32, string_id: u32) -> Vec<u8> {
 
 /// Read the established runtime archive instead of accepting only diagnostic typed data.
 fn published(database: &Connection, id: u32) -> ArchivedRecordData {
-    let bytes: Vec<u8> = database
-        .query_row("SELECT data FROM records WHERE form_id=?", [id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap()
+    common::runtime_record(database, id)
 }
 
 /// Keep repeated native signatures in physical order, including safe empty text leaves.
@@ -117,7 +112,7 @@ fn localized(database: &Connection, id: u32) -> Vec<LocalizedRow> {
              FROM inhouse_localized_fields WHERE form_id=? ORDER BY field_index",
         )
         .unwrap()
-        .query_map([id], |row| {
+        .query_map([common::stored_key(database, id)], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -159,10 +154,44 @@ fn source(database: &Connection, id: u32) -> (u32, u32, Vec<u8>) {
     database
         .query_row(
             "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=?",
-            [id],
+            [common::stored_key(database, id)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap()
+}
+
+/// Native diagnostics retain one counted source-context example per plugin and severity.
+fn localized_summary<'a>(
+    diagnostics: &'a serde_json::Value,
+    category: &str,
+    plugin: &str,
+    count: usize,
+) -> &'a str {
+    assert_eq!(diagnostics["format_version"], 2);
+    let kind = if category == "warnings" {
+        "unusable localized fields"
+    } else {
+        "localized IDs missing from readable tables"
+    };
+    let summaries = diagnostics[category]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap())
+        .filter(|item| item.to_ascii_lowercase().contains(plugin) && item.contains(kind))
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 1, "{diagnostics}");
+    assert!(
+        summaries[0].contains(&format!("{count} {kind}")),
+        "{}",
+        summaries[0]
+    );
+    assert!(summaries[0].contains("first:"));
+    assert!(
+        summaries[0].len() < 1024,
+        "one bounded example, not every occurrence"
+    );
+    summaries[0]
 }
 
 /// Fast actual publication preserves missing, resolved and repeated fields and original IDs.
@@ -282,33 +311,13 @@ fn localized_fields_preserve_zero_missing_resolved_and_repeated_keys() {
     let diagnostics: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
-    assert_eq!(diagnostics["adapter"]["localizedfields.esp"][0], 4);
-    assert_eq!(
-        diagnostics["adapter"]["localizedfields.esp"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+    assert!(
+        localized_summary(&diagnostics, "warnings", "localizedfields.esp", 4)
+            .contains("localized ID Some(42)")
     );
     assert!(
-        diagnostics["adapter"]["localizedfields.esp"][1]
-            .as_str()
-            .unwrap()
-            .len()
-            < 1024
-    );
-    assert!(
-        diagnostics["adapter"]["localizedfields.esp"][1]
-            .as_str()
-            .unwrap()
-            .contains("malformed strings entry for localized ID 42")
-    );
-    assert_eq!(diagnostics["adapter_notices"]["localizedfields.esp"][0], 3);
-    assert!(
-        diagnostics["adapter_notices"]["localizedfields.esp"][1]
-            .as_str()
-            .unwrap()
-            .contains("missing localized ID 17")
+        localized_summary(&diagnostics, "notices", "localizedfields.esp", 3)
+            .contains("localized ID Some(17)")
     );
 }
 
@@ -383,7 +392,7 @@ fn english_text_encoding_is_explicit_and_distinct_from_vmad() {
     let resolved: String = db
         .query_row(
             "SELECT resolved_text FROM inhouse_localized_fields WHERE form_id=?",
-            [0x0200_3F02u32],
+            [common::stored_key(&db, 0x0200_3F02)],
             |row| row.get(0),
         )
         .unwrap();
@@ -407,7 +416,7 @@ fn english_text_encoding_is_explicit_and_distinct_from_vmad() {
     let payload: Vec<u8> = db
         .query_row(
             "SELECT payload FROM inhouse_source_records WHERE form_id=?",
-            [0x0100_3F01u32],
+            [common::stored_key(&db, 0x0100_3F01)],
             |row| row.get(0),
         )
         .unwrap();
@@ -626,7 +635,7 @@ async fn winning_full_and_light_banks_preserve_ids_and_bound_missing_text_notice
     let interior_name: Option<String> = database
         .query_row(
             "SELECT interior_name FROM cells WHERE id=?",
-            [0x0300_3510u32],
+            [common::stored_key(&database, 0x0300_3510)],
             |row| row.get(0),
         )
         .unwrap();
@@ -635,22 +644,24 @@ async fn winning_full_and_light_banks_preserve_ids_and_bound_missing_text_notice
         serde_json::from_slice(&fs::read(output.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
     for (plugin, count) in [("winnerfull.esp", 129), ("secondlight.esl", 1)] {
-        assert!(diagnostics["adapter"].get(plugin).is_none());
-        assert_eq!(diagnostics["adapter_notices"][plugin][0], count);
-        let summary = diagnostics["adapter_notices"][plugin].as_array().unwrap();
-        assert_eq!(
-            summary.len(),
-            2,
-            "retain one bounded example, not every record"
+        assert!(
+            !diagnostics["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains(plugin))
         );
-        assert!(!summary[1].as_str().unwrap().is_empty());
-        assert!(summary[1].as_str().unwrap().len() < 1024);
+        localized_summary(&diagnostics, "notices", plugin, count);
         let notices: Vec<_> = report
             .notices
             .iter()
             .filter(|notice| {
-                notice.contains(plugin)
-                    && notice.contains("localized IDs missing from readable string tables")
+                notice.to_ascii_lowercase().contains(plugin)
+                    && notice.contains("localized IDs missing from readable tables")
             })
             .collect();
         assert_eq!(notices.len(), 1, "{:?}", report.notices);
@@ -890,13 +901,20 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
         serde_json::from_slice(&fs::read(normal.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
     assert_eq!(diagnostics, normal_diagnostics);
-    assert!(diagnostics["adapter"].get("movefixture.esp").is_none());
-    assert_eq!(diagnostics["adapter_notices"]["movefixture.esp"][0], 1);
     assert!(
-        diagnostics["adapter_notices"]["movefixture.esp"][1]
-            .as_str()
+        !diagnostics["warnings"]
+            .as_array()
             .unwrap()
-            .contains("missing localized ID 17")
+            .iter()
+            .any(|value| value
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("movefixture.esp"))
+    );
+    assert!(
+        localized_summary(&diagnostics, "notices", "movefixture.esp", 1)
+            .contains("localized ID Some(17)")
     );
     assert!(!work.join("typed-records.jsonl").exists());
     assert!(!work.join("cell_cache.rkyv").exists());

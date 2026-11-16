@@ -99,7 +99,7 @@ fn twice(check: impl FnOnce(&Path, &Path)) {
                     &data,
                     &data.join("plugins.txt"),
                     output,
-                    &[*b"STAT", *b"NPC_", *b"KYWD", *b"FLST"],
+                    &[*b"TES4", *b"STAT", *b"NPC_", *b"KYWD", *b"FLST"],
                 )
                 .unwrap();
             });
@@ -141,19 +141,33 @@ fn typed_export_is_byte_identical_in_fresh_folders() {
             "record values and multiplicity must stay equal"
         );
         assert!(a == b, "typed export bytes depend on HashMap traversal");
-        let keys: Vec<([u8; 4], u32)> = a
+        let keys: Vec<([u8; 4], serde_json::Value)> = a
             .lines()
             .map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).unwrap();
                 (
                     serde_json::from_value(value["record_type"].clone()).unwrap(),
-                    value["form_id"].as_u64().unwrap() as u32,
+                    value["form_id"].clone(),
                 )
             })
             .collect();
-        assert!(
-            keys.windows(2).all(|pair| pair[0] < pair[1]),
-            "typed lines must sort by signature, then canonical FormID"
+        let mut expected = vec![(*b"TES4", serde_json::Value::Null)];
+        for (kind, first, count) in [
+            (*b"FLST", 0x2000, 128),
+            (*b"KYWD", 0x6000, 1),
+            (*b"NPC_", 0x4000, 128),
+            (*b"STAT", 0x1000, 128),
+        ] {
+            for offset in 0..count {
+                expected.push((
+                    kind,
+                    serde_json::json!(format!("{:06X}:Synthetic.esm", first + offset)),
+                ));
+            }
+        }
+        assert_eq!(
+            keys, expected,
+            "TES4 first, then exact signature/original owner/local order; no pack-allocation sorting"
         );
     });
 }
@@ -173,8 +187,28 @@ fn diagnostics_are_byte_identical_in_fresh_folders() {
             diagnostics["decoder"]["synthetic.esm"]["invalid_links"],
             128
         );
-        // Retain each unresolved ID and the separate missing-bank observation.
-        assert_eq!(diagnostics["adapter"]["synthetic.esm"][0], 129);
+        assert_eq!(diagnostics["format_version"], 2);
+        let db = rusqlite::Connection::open(first.join("skyrim_world.db")).unwrap();
+        assert_eq!(
+            diagnostics["plugin_table_digest"],
+            shared::pack_identity::PackIdentity::read_sql(&db)
+                .unwrap()
+                .digest_hex()
+        );
+        // Retain every unresolved non-null ID and the independent missing-bank observation.
+        let warnings: Vec<_> = diagnostics["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .filter(|warning| warning.contains("inhouse adapter reported"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "warning: synthetic.esm: inhouse adapter reported 129 local decode/lookup issues (first: NPC_ source 0000407F FULL missing localized ID 20607)"
+            ]
+        );
         let query = "SELECT * FROM record_diagnostics ORDER BY diagnostic_id";
         assert_eq!(sql_rows(first, query), sql_rows(second, query));
         assert!(
@@ -189,10 +223,7 @@ fn diagnostics_are_byte_identical_in_fresh_folders() {
             "earliest physical link wins even though its FormID sorts last"
         );
         assert!(
-            diagnostics["adapter"]["synthetic.esm"][1]
-                .as_str()
-                .unwrap()
-                .contains("0000407F"),
+            warnings[0].contains("0000407F"),
             "adapter summaries use physical provenance rather than sorted projection visits"
         );
         let query = "SELECT rowid,* FROM inhouse_localized_fields ORDER BY rowid";

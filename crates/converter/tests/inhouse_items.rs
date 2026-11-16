@@ -332,7 +332,7 @@ async fn malformed_item_override_preserves_prior_winner_and_publishes_neighbors(
             database
                 .query_row(
                     "SELECT COUNT(*) FROM records WHERE form_id=?1",
-                    [id],
+                    [common::stored_key(&database, id)],
                     |row| row.get::<_, u32>(0)
                 )
                 .unwrap(),
@@ -342,7 +342,7 @@ async fn malformed_item_override_preserves_prior_winner_and_publishes_neighbors(
     let blob: Vec<u8> = database
         .query_row(
             "SELECT data FROM records WHERE form_id=?1",
-            [0x0200_0900_u32],
+            [common::stored_key(&database, 0x0200_0900_u32)],
             |row| row.get(0),
         )
         .unwrap();
@@ -637,23 +637,14 @@ async fn every_item_family_preserves_prior_winners_after_corrupt_compressed_over
         let (order, kind, payload): (u32, String, Vec<u8>) = database
             .query_row(
                 "SELECT load_order,record_type,payload FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(order, 2);
         assert_eq!(kind.as_bytes(), signature);
         assert_eq!(payload, prior[index][24..]);
-        let blob: Vec<u8> = database
-            .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let canonical = rkyv::from_bytes::<
-            converter::esm::types::ArchivedRecordData,
-            rkyv::rancor::Error,
-        >(&blob)
-        .unwrap();
+        let canonical = common::runtime_record(&database, id);
         let expected = before_patch.records[&id].to_raw_record().subrecords;
         assert_eq!(canonical.subrecords.len(), expected.len());
         for (actual, (tag, bytes)) in canonical.subrecords.iter().zip(expected) {
@@ -665,7 +656,7 @@ async fn every_item_family_preserves_prior_winners_after_corrupt_compressed_over
         let found: u32 = database
             .query_row(
                 "SELECT load_order FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -673,7 +664,7 @@ async fn every_item_family_preserves_prior_winners_after_corrupt_compressed_over
         let present: u32 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();

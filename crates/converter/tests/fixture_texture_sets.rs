@@ -69,7 +69,7 @@ fn texture_set_physical_slots_reach_the_correct_database_columns() {
         let stored: String = connection
             .query_row(
                 &format!("SELECT {column} FROM texture_sets WHERE id=?1"),
-                [TEXTURE_SET_ID],
+                [common::stored_key(&connection, TEXTURE_SET_ID)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -244,7 +244,7 @@ async fn texture_semantic_migration_rebuilds_meshes_and_textures_of_earlier_prod
             connection
                 .query_row(
                     "SELECT environment_path FROM texture_sets WHERE id=?1",
-                    [TEXTURE_SET_ID],
+                    [common::stored_key(&connection, TEXTURE_SET_ID)],
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
@@ -325,7 +325,10 @@ async fn texture_semantic_migration_rejects_metadata_relabel_of_producer_24_text
         .to_string();
     drain.await.unwrap();
     assert!(
-        error.contains("predate the current texture layout"),
+        error.contains(&format!(
+            "converted assets use converter schema 24; convert again with converter schema {}",
+            CONVERTER_SCHEMA_VERSION
+        )),
         "{error}"
     );
     assert!(!output.exists());
@@ -358,6 +361,7 @@ async fn texture_semantic_migration_rejects_old_staged_mesh_and_texture_proof() 
     config.no_lod = true;
     config.resume_staging = Some(staging.clone());
     fs::create_dir_all(&staging).unwrap();
+    common::current_staging_generation(&staging);
     let mut journal = StagingJournal::open(&staging).unwrap();
     for key in ["meshes/generated.nif", "textures/txst_slot_05.dds"] {
         let entry = &original.entries[key];

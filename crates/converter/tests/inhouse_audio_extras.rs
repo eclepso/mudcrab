@@ -337,20 +337,11 @@ async fn corrupt_compressed_overrides_for_every_family_preserve_real_publication
     let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for (index, tag) in audio::SIGNATURES.iter().enumerate() {
         let id = 0x0200_5900 + index as u32;
-        let (order, kind, payload): (u32, String, Vec<u8>) = database.query_row("SELECT load_order,record_type,payload FROM inhouse_source_records WHERE form_id=?1", [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        let (order, kind, payload): (u32, String, Vec<u8>) = database.query_row("SELECT load_order,record_type,payload FROM inhouse_source_records WHERE form_id=?1", [common::stored_key(&database, id)], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(order, 2);
         assert_eq!(kind.as_bytes(), tag);
         assert_eq!(payload, prior[index][24..]);
-        let blob: Vec<u8> = database
-            .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let canonical = rkyv::from_bytes::<
-            converter::esm::types::ArchivedRecordData,
-            rkyv::rancor::Error,
-        >(&blob)
-        .unwrap();
+        let canonical = common::runtime_record(&database, id);
         let expected = before.records[&id].to_raw_record().subrecords;
         assert_eq!(canonical.subrecords.len(), expected.len());
         for (actual, (signature, bytes)) in canonical.subrecords.iter().zip(expected) {
@@ -362,7 +353,7 @@ async fn corrupt_compressed_overrides_for_every_family_preserve_real_publication
         let actual: u32 = database
             .query_row(
                 "SELECT load_order FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();

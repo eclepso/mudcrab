@@ -310,10 +310,13 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
         assert_eq!(profile["counts"][count].as_u64(), Some(actual), "{count}");
     }
     for phase in [
-        "reader_decode_merge_deferred",
-        "reader_target_validation_and_diagnostics",
-        "runtime_database_export",
-        "provenance_source_records",
+        "native_read",
+        "native_localization",
+        "native_typed_dump",
+        "native_projection",
+        "native_sql_publication",
+        "native_diagnostics",
+        "native_form_key_world",
         "terrain_runtime_cache",
         "terrain_preserved_cache",
     ] {
@@ -326,17 +329,19 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     }
     for id in [0x900, 0x902] {
         assert_eq!(
-            db.query_row("SELECT model_path FROM statics WHERE id=?1", [id], |row| {
-                row.get::<_, String>(0)
-            })
+            db.query_row(
+                "SELECT model_path FROM statics WHERE id=?1",
+                [common::stored_key(&db, id)],
+                |row| { row.get::<_, String>(0) }
+            )
             .unwrap(),
             layout::GENERATED_MODEL_PATH
         );
     }
     assert_eq!(
         db.query_row(
-            "SELECT COUNT(*) FROM records WHERE form_id=2305",
-            [],
+            "SELECT COUNT(*) FROM records WHERE form_id=?1",
+            [common::stored_key(&db, 2305)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -344,17 +349,19 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     );
     assert_eq!(
         db.query_row(
-            "SELECT editor_id, model_path FROM statics WHERE id=2305",
-            [],
+            "SELECT editor_id, model_path FROM statics WHERE id=?1",
+            [common::stored_key(&db, 2305)],
             |row| { Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)) }
         )
         .unwrap(),
         ("DamagedModel".to_owned(), None)
     );
     let safe: Vec<u8> = db
-        .query_row("SELECT data FROM records WHERE form_id=2305", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT data FROM records WHERE form_id=?1",
+            [common::stored_key(&db, 2305)],
+            |row| row.get(0),
+        )
         .unwrap();
     let safe =
         rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&safe)
@@ -368,21 +375,21 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
         text("DamagedModel")
     );
     assert!(!safe.subrecords.iter().any(|field| field.tag == *b"MODL"));
-    let slots: Vec<String> = db.query_row("SELECT mask_path, glow_path, height_path, environment_path, detail_path, specular_path FROM texture_sets WHERE id=2307", [], |row| (0..6).map(|i| row.get(i)).collect()).unwrap();
+    let slots: Vec<String> = db.query_row("SELECT mask_path, glow_path, height_path, environment_path, detail_path, specular_path FROM texture_sets WHERE id=?1", [common::stored_key(&db, 2307)], |row| (0..6).map(|i| row.get(i)).collect()).unwrap();
     assert_eq!(
         slots,
         [2, 3, 4, 5, 6, 7].map(|slot| format!("textures/slot{slot}.dds"))
     );
     assert_eq!(
         db.query_row(
-            "SELECT enable_parent_flags FROM \"references\" WHERE enable_parent_id=18",
-            [],
+            "SELECT enable_parent_flags FROM \"references\" WHERE enable_parent_id=?1",
+            [common::stored_key(&db, 18)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
         1
     );
-    let source: Vec<u8> = db.query_row("SELECT records.data FROM records JOIN \"references\" ON records.form_id=\"references\".id WHERE enable_parent_id=18", [], |row| row.get(0)).unwrap();
+    let source: Vec<u8> = db.query_row("SELECT records.data FROM records JOIN \"references\" ON records.form_id=\"references\".id WHERE enable_parent_id=?1", [common::stored_key(&db, 18)], |row| row.get(0)).unwrap();
     let canonical =
         rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&source)
             .unwrap();
@@ -395,38 +402,45 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
             .data,
         [18, 0, 0, 0, 1, 0xA1, 0xB2, 0xD3]
     );
-    let source: Vec<u8> = db.query_row("SELECT payload FROM inhouse_source_records JOIN \"references\" ON form_id=\"references\".id WHERE enable_parent_id=18", [], |row| row.get(0)).unwrap();
+    let source: Vec<u8> = db.query_row("SELECT payload FROM inhouse_source_records JOIN \"references\" ON form_id=\"references\".id WHERE enable_parent_id=?1", [common::stored_key(&db, 18)], |row| row.get(0)).unwrap();
     assert!(
         source
             .windows(8)
             .any(|bytes| bytes == [18, 0, 0, 0, 1, 0xA1, 0xB2, 0xD3])
     );
     assert_eq!(
-        db.query_row("SELECT full_name FROM npcs WHERE id=16779264", [], |row| {
-            row.get::<_, String>(0)
-        })
+        db.query_row(
+            "SELECT full_name FROM npcs WHERE id=?1",
+            [common::stored_key(&db, 16779264)],
+            |row| { row.get::<_, String>(0) }
+        )
         .unwrap(),
         "Named from archive"
     );
     assert_eq!(
-        db.query_row("SELECT full_name FROM npcs WHERE id=2308", [], |row| row
-            .get::<_, String>(
-            0
-        ))
+        db.query_row(
+            "SELECT full_name FROM npcs WHERE id=?1",
+            [common::stored_key(&db, 2308)],
+            |row| row.get::<_, String>(0)
+        )
         .unwrap(),
         "Krähe"
     );
     assert_eq!(
-        db.query_row("SELECT full_name FROM npcs WHERE id=16779266", [], |row| {
-            row.get::<_, String>(0)
-        })
+        db.query_row(
+            "SELECT full_name FROM npcs WHERE id=?1",
+            [common::stored_key(&db, 16779266)],
+            |row| { row.get::<_, String>(0) }
+        )
         .unwrap(),
         "Localized Krähe"
     );
     assert_eq!(
-        db.query_row("SELECT full_name FROM npcs WHERE id=16779265", [], |row| {
-            row.get::<_, Option<String>>(0)
-        })
+        db.query_row(
+            "SELECT full_name FROM npcs WHERE id=?1",
+            [common::stored_key(&db, 16779265)],
+            |row| { row.get::<_, Option<String>>(0) }
+        )
         .unwrap(),
         None
     );
@@ -439,24 +453,46 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
             .unwrap()
             >= 1
     );
-    assert!(diagnostic["adapter"].get("names.esp").is_none());
-    assert_eq!(diagnostic["adapter_notices"]["names.esp"][0], 1);
-    assert!(
-        diagnostic["adapter_notices"]["names.esp"][1]
-            .as_str()
+    assert_eq!(diagnostic["format_version"], 2);
+    assert_eq!(
+        diagnostic["plugin_table_digest"],
+        shared::pack_identity::PackIdentity::read_sql(&db)
             .unwrap()
-            .contains("01000801 name missing localized ID 99")
+            .digest_hex()
     );
-    let armor: Vec<u8> = db
-        .query_row(
-            "SELECT data FROM records WHERE form_id=16779267",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let armor =
-        rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&armor)
-            .unwrap();
+    assert_eq!(
+        diagnostic["warnings"],
+        serde_json::to_value(&report.warnings).unwrap()
+    );
+    assert_eq!(
+        diagnostic["notices"],
+        serde_json::to_value(&report.notices).unwrap()
+    );
+    assert!(
+        !diagnostic["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("names.esp"))
+    );
+    let name_notices: Vec<_> = diagnostic["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .filter(|notice| notice.contains("names.esp"))
+        .collect();
+    assert_eq!(
+        name_notices,
+        [
+            "notice: names.esp: 1 localized IDs missing from readable string tables (first: NPC_ source 01000801 FULL missing localized ID 99)"
+        ]
+    );
+    assert_eq!(
+        common::native_fields(&db, 0x0100_0803, b"DESC"),
+        vec![0x999u32.to_le_bytes().to_vec()]
+    );
+    let armor = common::runtime_record(&db, 0x0100_0803);
     assert_eq!(
         armor
             .subrecords
@@ -476,8 +512,8 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     assert!(output.join("cell_cache.rkyv").is_file());
     assert_eq!(
         db.query_row(
-            "SELECT length(heightmap), length(vclr) FROM land WHERE cell_id=2560",
-            [],
+            "SELECT length(heightmap), length(vclr) FROM land WHERE cell_id=?1",
+            [common::stored_key(&db, 2560)],
             |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
         )
         .unwrap(),
@@ -485,17 +521,18 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     );
     assert_eq!(
         db.query_row(
-            "SELECT record_type,cell_id FROM records WHERE form_id=2561",
-            [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            "SELECT record_type,cell_id FROM records WHERE form_id=?1",
+            [common::stored_key(&db, 2561)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         )
+        .map(|(kind, cell)| (kind, common::runtime_id(&db, cell)))
         .unwrap(),
         ("LAND".into(), 2560)
     );
     let original_texture_land: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=2561",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 2561)],
             |row| row.get(0),
         )
         .unwrap();
@@ -529,8 +566,8 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     assert_eq!(overlay.weights[0].opacity, 0.625);
     assert_eq!(
         db.query_row(
-            "SELECT COUNT(*) FROM records WHERE form_id=2562",
-            [],
+            "SELECT COUNT(*) FROM records WHERE form_id=?1",
+            [common::stored_key(&db, 2562)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -538,8 +575,8 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     );
     assert_eq!(
         db.query_row(
-            "SELECT count(*) FROM inhouse_source_records WHERE form_id=2562",
-            [],
+            "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 2562)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -816,8 +853,8 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let movement = db
         .query_row(
-            "SELECT forward_walk,forward_run,load_order FROM movement_types WHERE id=219149",
-            [],
+            "SELECT forward_walk,forward_run,load_order FROM movement_types WHERE id=?1",
+            [common::stored_key(&db, 219149)],
             |row| {
                 Ok((
                     row.get::<_, f32>(0)?,
@@ -854,16 +891,18 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
         assert_eq!(
             db.query_row(
                 "SELECT load_order FROM records WHERE form_id=?1",
-                [id + 1],
+                [common::stored_key(&db, u32::try_from(id + 1).unwrap())],
                 |row| row.get::<_, u32>(0)
             )
             .unwrap(),
             0
         );
         assert_eq!(
-            db.query_row("SELECT heightmap FROM land WHERE cell_id=?1", [id], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            db.query_row(
+                "SELECT heightmap FROM land WHERE cell_id=?1",
+                [common::stored_key(&db, u32::try_from(id).unwrap())],
+                |row| { row.get::<_, Vec<u8>>(0) }
+            )
             .unwrap(),
             vhgt(offset)
         );
@@ -880,10 +919,11 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
         );
     }
     assert_eq!(
-        db.query_row("SELECT count(*) FROM statics WHERE id=2304", [], |row| row
-            .get::<_, u32>(
-            0
-        ))
+        db.query_row(
+            "SELECT count(*) FROM statics WHERE id=?1",
+            [common::stored_key(&db, 2304)],
+            |row| row.get::<_, u32>(0)
+        )
         .unwrap(),
         0
     );
@@ -891,8 +931,9 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
         .query_row(
             "SELECT cell_id FROM land WHERE length(heightmap)=0 AND vclr=?1",
             [vec![111u8; 33 * 33 * 3]],
-            |row| row.get::<_, u32>(0),
+            |row| row.get::<_, i64>(0),
         )
+        .map(|key| common::runtime_id(&db, key))
         .unwrap();
     let heightless = cache
         .cells
@@ -905,8 +946,8 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
     assert_eq!(
         db.query_row(
             "SELECT s.editor_id, s.model_path, r.load_order FROM statics s \
-             JOIN records r ON r.form_id = s.id WHERE s.id = 3072",
-            [],
+             JOIN records r ON r.form_id = s.id WHERE s.id = ?1",
+            [common::stored_key(&db, 3072)],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -922,10 +963,12 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
     );
     // History lists both versions; the torn one is skipped with its reason.
     let mut chain = db
-        .prepare("SELECT status, reason FROM record_overrides WHERE form_id = 3072 ORDER BY chain_position")
+        .prepare("SELECT status, reason FROM record_overrides WHERE form_id = ?1 ORDER BY chain_position")
         .unwrap();
     let chain: Vec<(String, Option<String>)> = chain
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([common::stored_key(&db, 3072)], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();

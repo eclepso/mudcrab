@@ -1,7 +1,21 @@
 //! Regression fixtures are generated during the test; no installed game inputs.
+mod common;
 use converter::esm::EsmParser;
 use rusqlite::Connection;
 use std::{fs, path::Path};
+
+/// Keep the recovery oracle in supplier order while authenticating every stored key.
+fn published_ids(connection: &Connection) -> Vec<u32> {
+    let mut ids = connection
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .map(|row| common::runtime_id(connection, row.unwrap()))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
 /// Frame one synthetic native subrecord.
 fn sub(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     [
@@ -69,13 +83,7 @@ fn check(body: Vec<u8>, expected: &[u32]) {
     let db = root.path().join("world.db");
     EsmParser::convert_plugins(&paths, &db).unwrap();
     let conn = Connection::open(db).unwrap();
-    let ids = conn
-        .prepare("SELECT form_id FROM records ORDER BY form_id")
-        .unwrap()
-        .query_map([], |row| row.get::<_, u32>(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
+    let ids = published_ids(&conn);
     assert_eq!(
         (native_ids.as_slice(), ids.as_slice()),
         (expected, expected),
@@ -181,13 +189,7 @@ fn invalid_plugin_name_skips_item_and_preserves_neighbors() {
     let db = root.path().join("world.db");
     EsmParser::convert_plugins(&paths, &db).unwrap();
     let conn = Connection::open(db).unwrap();
-    let ids = conn
-        .prepare("SELECT form_id FROM records ORDER BY form_id")
-        .unwrap()
-        .query_map([], |row| row.get::<_, u32>(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
+    let ids = published_ids(&conn);
     assert_eq!(ids, [0x811, 0x0100_0833]);
 }
 /// A compatibility event is persisted with the resolved ID even without later replay.
@@ -207,8 +209,8 @@ fn projected_header_diagnostic_has_runtime_id() {
     let output = root.path().join("typed");
     converter::esm::inhouse::export_record_bundle(&data, &list, &output).unwrap();
     let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let event: Option<u32> = conn.query_row("SELECT form_id FROM record_diagnostics WHERE category='compatibility' AND source_form_id=33556608", [], |r| r.get(0)).unwrap();
-    assert_eq!(event, Some(0x880));
+    let event: Option<i64> = conn.query_row("SELECT form_id FROM record_diagnostics WHERE category='compatibility' AND source_form_id=33556608", [], |r| r.get(0)).unwrap();
+    assert_eq!(event, Some(common::stored_key(&conn, 0x880)));
 }
 
 /// The public typed reader skips an invalid explicit path before constructing identities.
@@ -365,9 +367,11 @@ fn gmst_canonicalization_reserves_source_key_before_insert_or_delete() {
         EsmParser::convert_plugins(&paths, &db).unwrap();
         let conn = Connection::open(db).unwrap();
         let count: u32 = conn
-            .query_row("SELECT COUNT(*) FROM records WHERE form_id=2048", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE form_id=?1",
+                [common::stored_key(&conn, 0x800)],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
             count,
@@ -376,9 +380,11 @@ fn gmst_canonicalization_reserves_source_key_before_insert_or_delete() {
         );
         if !deleted {
             let bytes: Vec<u8> = conn
-                .query_row("SELECT data FROM records WHERE form_id=2048", [], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT data FROM records WHERE form_id=?1",
+                    [common::stored_key(&conn, 0x800)],
+                    |r| r.get(0),
+                )
                 .unwrap();
             let record = rkyv::from_bytes::<
                 converter::esm::types::ArchivedRecordData,
@@ -397,8 +403,8 @@ fn gmst_canonicalization_reserves_source_key_before_insert_or_delete() {
         }
         let neighbor: u32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM records WHERE form_id=16779281",
-                [],
+                "SELECT COUNT(*) FROM records WHERE form_id=?1",
+                [common::stored_key(&conn, 0x0100_0811)],
                 |r| r.get(0),
             )
             .unwrap();
@@ -450,13 +456,7 @@ fn invalid_name_dependency_closure_keeps_neighbors() {
     let db = root.path().join("world.db");
     EsmParser::convert_plugins(&paths, &db).unwrap();
     let conn = Connection::open(db).unwrap();
-    let ids = conn
-        .prepare("SELECT form_id FROM records ORDER BY form_id")
-        .unwrap()
-        .query_map([], |r| r.get::<_, u32>(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
+    let ids = published_ids(&conn);
     assert_eq!(ids, [0x811, 0x0100_0833]);
     let plugins: u32 = conn
         .query_row("SELECT COUNT(*) FROM plugins", [], |r| r.get(0))
@@ -535,9 +535,11 @@ fn history_uses_source_headers_for_deleted_and_rejected_targets() {
         converter::esm::inhouse::export_record_bundle(&data, &list, &output).unwrap();
         let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
         let bytes: Vec<u8> = conn
-            .query_row("SELECT data FROM records WHERE form_id=2065", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT data FROM records WHERE form_id=?1",
+                [common::stored_key(&conn, 0x811)],
+                |r| r.get(0),
+            )
             .unwrap();
         let record = rkyv::from_bytes::<
             converter::esm::types::ArchivedRecordData,
@@ -551,12 +553,18 @@ fn history_uses_source_headers_for_deleted_and_rejected_targets() {
                 .find(|field| field.tag == *b"XCWT")
                 .unwrap()
                 .data,
-            [0; 4]
+            0x0200_0830u32.to_le_bytes()
+        );
+        assert_eq!(
+            common::runtime_fields(&conn, 0x811, b"XCWT"),
+            [[0; 4].to_vec()]
         );
         let neighbor: u32 = conn
-            .query_row("SELECT COUNT(*) FROM records WHERE form_id=2112", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE form_id=?1",
+                [common::stored_key(&conn, 0x840)],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(neighbor, 1);
         let reasons = conn
@@ -664,9 +672,11 @@ fn deferred_self_link_replay_and_history_share_source_headers() {
         "{reasons:?}"
     );
     let bytes: Vec<u8> = conn
-        .query_row("SELECT data FROM records WHERE form_id=2065", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT data FROM records WHERE form_id=?1",
+            [common::stored_key(&conn, 0x811)],
+            |r| r.get(0),
+        )
         .unwrap();
     let record =
         rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
@@ -678,6 +688,10 @@ fn deferred_self_link_replay_and_history_share_source_headers() {
             .find(|field| field.tag == *b"COED")
             .unwrap()
             .data[4..8],
+        &0x0200_0840u32.to_le_bytes()
+    );
+    assert_eq!(
+        &common::runtime_fields(&conn, 0x811, b"COED")[0][4..8],
         &[0; 4]
     );
     let history = converter::records::history::read_history(&output, Some(&data), 0x811).unwrap();
@@ -694,9 +708,11 @@ fn deferred_self_link_replay_and_history_share_source_headers() {
     assert_eq!(&field.canonical_bytes[4..8], &0x840u32.to_le_bytes());
     assert_eq!(version.diagnostics.invalid_links, 0);
     let neighbor: u32 = conn
-        .query_row("SELECT COUNT(*) FROM records WHERE form_id=2128", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE form_id=?1",
+            [common::stored_key(&conn, 0x850)],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(neighbor, 1);
 }

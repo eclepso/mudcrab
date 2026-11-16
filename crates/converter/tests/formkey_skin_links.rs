@@ -1,4 +1,5 @@
 //! Armature skin texture links use source masters before either reader publishes canonical record keys.
+mod common;
 use converter::esm::{EsmParser, inhouse};
 use rusqlite::Connection;
 use std::fs;
@@ -23,18 +24,7 @@ fn record(tag: &[u8; 4], id: u32, flags: u32, data: &[u8]) -> Vec<u8> {
 
 /// Read every archived occurrence of one field, preserving array order and NULL words.
 fn fields(db: &Connection, id: u32, tag: &[u8; 4]) -> Vec<Vec<u8>> {
-    let bytes: Vec<u8> = db
-        .query_row("SELECT data FROM records WHERE form_id=?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-        .unwrap()
-        .subrecords
-        .into_iter()
-        .filter(|s| &s.tag == tag)
-        .map(|s| s.data)
-        .collect()
+    common::runtime_fields(db, id, tag)
 }
 
 /// Publish localized Base/Filler/Patch with forward self, past-self, master and absent links.
@@ -105,6 +95,11 @@ fn check_skin_links(tag: &[u8; 4]) {
             .into_iter()
             .enumerate()
         {
+            assert_eq!(
+                common::native_fields(&db, 0x0200_0800 + index as u32, tag),
+                [words[index].to_le_bytes().to_vec()],
+                "canonical bytes retain the original supplier-relative word"
+            );
             let expected = word.to_le_bytes().to_vec();
             assert_eq!(
                 fields(&db, 0x0200_0800 + index as u32, tag),

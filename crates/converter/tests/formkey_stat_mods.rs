@@ -1,4 +1,5 @@
 //! STAT MODS uses optional source-master links in both readers after the main merge.
+mod common;
 use converter::esm::{EsmParser, inhouse};
 use rusqlite::Connection;
 use std::fs;
@@ -23,18 +24,7 @@ fn record(tag: &[u8; 4], id: u32, flags: u32, data: &[u8]) -> Vec<u8> {
 
 /// Read every archived occurrence of one field, preserving array order and NULL words.
 fn fields(db: &Connection, id: u32, tag: &[u8; 4]) -> Vec<Vec<u8>> {
-    let bytes: Vec<u8> = db
-        .query_row("SELECT data FROM records WHERE form_id=?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-        .unwrap()
-        .subrecords
-        .into_iter()
-        .filter(|s| &s.tag == tag)
-        .map(|s| s.data)
-        .collect()
+    common::runtime_fields(db, id, tag)
 }
 
 /// Publish localized Base/Filler/Patch with forward self, past-self, master and absent links.
@@ -107,15 +97,28 @@ fn check_stat_mods(light: bool) {
             .into_iter()
             .enumerate()
         {
+            assert_eq!(
+                common::native_fields(&db, own | (0x800 + index as u32), tag),
+                [mods(words[index])],
+                "canonical MODS preserves source words, shape and padding"
+            );
             let expected = mods(word);
-            let (target, disposition): (u32, String) = db
+            let (target, disposition): (i64, String) = db
                 .query_row(
                     "SELECT texture_set_id,disposition FROM base_texture_swaps WHERE base_id=?1",
-                    [own | (0x800 + index as u32)],
+                    [common::stored_key(&db, own | (0x800 + index as u32))],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(target, word, "{path:?}");
+            assert_eq!(
+                target,
+                if word == 0 {
+                    0
+                } else {
+                    common::stored_key(&db, word)
+                },
+                "{path:?}"
+            );
             assert_eq!(
                 disposition,
                 if word == 0 {

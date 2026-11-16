@@ -1,4 +1,5 @@
 //! Publication uses one supplier-self rule for every out-of-range source selector.
+mod common;
 use converter::esm::{EsmParser, inhouse};
 use rusqlite::Connection;
 use std::{fs, path::Path};
@@ -83,13 +84,14 @@ fn past_master_selectors_resolve_to_self_in_both_writers() {
     inhouse::export_record_bundle(&data, &list, &output).unwrap();
     for path in [legacy, output.join("skyrim_world.db")] {
         let conn = Connection::open(path).unwrap();
-        let ids = conn
+        let mut ids = conn
             .prepare("SELECT form_id FROM records ORDER BY form_id")
             .unwrap()
-            .query_map([], |row| row.get::<_, u32>(0))
+            .query_map([], |row| row.get::<_, i64>(0))
             .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
+            .map(|row| common::runtime_id(&conn, row.unwrap()))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
         assert_eq!(
             ids,
             [
@@ -146,14 +148,11 @@ fn navm_onam_projection_preserves_null_after_native_self_resolution() {
     let output = root.path().join("published");
     inhouse::export_record_bundle(&data, &list, &output).unwrap();
     let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let bytes: Vec<u8> = conn
-        .query_row("SELECT data FROM records WHERE form_id=2082", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let archived =
-        rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-            .unwrap();
+    assert_eq!(
+        common::native_fields(&conn, 0x822, b"ONAM"),
+        [0x3f00_003fu32.to_le_bytes().to_vec()]
+    );
+    let archived = common::runtime_record(&conn, 0x822);
     assert_eq!(archived.subrecords.len(), 1);
     assert_eq!(archived.subrecords[0].tag, *b"ONAM");
     assert_eq!(
@@ -175,7 +174,7 @@ fn navm_onam_projection_preserves_null_after_native_self_resolution() {
         event,
         (
             0x3f00_003f,
-            "optional FormID 3F00003F exceeds master list".into()
+            "native source 3F00003F is absent or has a disallowed target type".into()
         )
     );
     let paths = [data.join("Synthetic.esm")];
@@ -194,7 +193,7 @@ fn navm_onam_projection_preserves_null_after_native_self_resolution() {
     );
 }
 
-/// Checked light-width projection preserves old diagnostic rows and valid neighbors.
+/// Native full locals survive when the transient old-width view cannot represent them.
 #[test]
 fn typed_light_width_projection_retains_old_diagnostics_and_neighbors() {
     let root = tempfile::tempdir().unwrap();
@@ -242,19 +241,28 @@ fn typed_light_width_projection_retains_old_diagnostics_and_neighbors() {
     assert!(
         reasons
             .iter()
-            .any(|r| r == "optional light FormID 01001234 is wider than 12 bits"),
+            .any(|r| r == "native source 01001234 is absent or has a disallowed target type"),
         "{reasons:?}"
     );
-    assert!(
-        reasons
-            .iter()
-            .any(|r| r.contains("record light FormID 01001235 is wider than 12 bits")),
-        "{reasons:?}"
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    let wide =
+        shared::form_key::FormKey::new(identity.table().id("Light.esl").unwrap(), 0x1235).unwrap();
+    let wide_count: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE form_id=?1",
+            [wide.to_sql_i64()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        wide_count, 1,
+        "wide native identities must not be dropped or truncated"
     );
+    assert_eq!(identity.runtime_id_if_available(wide).unwrap(), None);
     let count: u32 = conn
         .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
     let paths = [data.join("Base.esm"), data.join("Light.esl")];
     let order = converter::esm::load_order::LoadOrder::read(&paths).unwrap();
     let read = converter::records::read_plugins(&paths, &order).unwrap();
@@ -398,16 +406,7 @@ fn self_selector_publication_keeps_optional_owner_lock_and_diagnostic_id() {
     inhouse::export_record_bundle(&data, &list, &output).unwrap();
     for path in [legacy, output.join("skyrim_world.db")] {
         let conn = Connection::open(path).unwrap();
-        let bytes: Vec<u8> = conn
-            .query_row("SELECT data FROM records WHERE form_id=16779360", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let archived = rkyv::from_bytes::<
-            converter::esm::types::ArchivedRecordData,
-            rkyv::rancor::Error,
-        >(&bytes)
-        .unwrap();
+        let archived = common::runtime_record(&conn, 0x0100_0860);
         let owner = archived
             .subrecords
             .iter()
@@ -418,23 +417,27 @@ fn self_selector_publication_keeps_optional_owner_lock_and_diagnostic_id() {
             0x0100_0830u32.to_le_bytes(),
             "both readers keep optional self owner"
         );
-        let key: Option<u32> = conn
+        let key: Option<i64> = conn
             .query_row(
-                "SELECT lock_key_id FROM reference_details WHERE reference_id=16779376",
-                [],
+                "SELECT lock_key_id FROM reference_details WHERE reference_id=?1",
+                [common::stored_key(&conn, 0x0100_0870)],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(key, Some(0x0100_0840), "opaque XLOC also uses self");
+        assert_eq!(
+            key,
+            Some(common::stored_key(&conn, 0x0100_0840)),
+            "opaque XLOC also uses self"
+        );
     }
     let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let event: Option<u32> = conn.query_row("SELECT form_id FROM record_diagnostics WHERE category='compatibility' AND source_form_id=33556608", [], |r| r.get(0)).unwrap();
+    let event: Option<i64> = conn.query_row("SELECT form_id FROM record_diagnostics WHERE category='compatibility' AND source_form_id=33556608", [], |r| r.get(0)).unwrap();
     assert_eq!(
         event,
-        Some(0x0100_0880),
+        Some(common::stored_key(&conn, 0x0100_0880)),
         "journal the projected runtime ID before the notice"
     );
-    let history: Option<u32> = conn
+    let history: Option<i64> = conn
         .query_row(
             "SELECT form_id FROM record_overrides WHERE source_form_id=33556608",
             [],
@@ -443,7 +446,7 @@ fn self_selector_publication_keeps_optional_owner_lock_and_diagnostic_id() {
         .unwrap();
     assert_eq!(
         history,
-        Some(0x0100_0880),
+        Some(common::stored_key(&conn, 0x0100_0880)),
         "history keeps self runtime ID alongside unproven provenance"
     );
 }
@@ -481,22 +484,20 @@ fn absent_optional_self_target_keeps_old_diagnostic() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(reasons, ["optional FormID 02001234 exceeds master list"]);
+    assert_eq!(
+        reasons,
+        ["native source 02001234 is absent or has a disallowed target type"]
+    );
     let paths = [data.join("Base.esm")];
     let legacy = root.path().join("legacy.db");
     EsmParser::convert_plugins(&paths, &legacy).unwrap();
     for db in [legacy, output.join("skyrim_world.db")] {
         let conn = Connection::open(db).unwrap();
-        let bytes: Vec<u8> = conn
-            .query_row("SELECT data FROM records WHERE form_id=2065", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let record = rkyv::from_bytes::<
-            converter::esm::types::ArchivedRecordData,
-            rkyv::rancor::Error,
-        >(&bytes)
-        .unwrap();
+        assert_eq!(
+            common::native_fields(&conn, 0x811, b"XCWT"),
+            [0x0200_1234u32.to_le_bytes().to_vec()]
+        );
+        let record = common::runtime_record(&conn, 0x811);
         assert_eq!(
             record
                 .subrecords
@@ -567,8 +568,11 @@ fn past_master_group_labels_keep_self_in_both_readers() {
         let conn = Connection::open(path).unwrap();
         let count: u32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM records WHERE form_id IN (2065,2080)",
-                [],
+                "SELECT COUNT(*) FROM records WHERE form_id IN (?1,?2)",
+                [
+                    common::stored_key(&conn, 0x811),
+                    common::stored_key(&conn, 0x820),
+                ],
                 |r| r.get(0),
             )
             .unwrap();

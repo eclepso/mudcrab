@@ -331,9 +331,8 @@ fn script_object(raw: u32) -> Vec<u8> {
 }
 
 /// Read every SQLite schema object and every table row, including virtual shadow tables.
-fn logical_dump(path: &std::path::Path) -> Vec<String> {
-    use rusqlite::{Connection, types::Value};
-    let conn = Connection::open(path).unwrap();
+fn logical_dump(conn: &rusqlite::Connection) -> Vec<String> {
+    use rusqlite::types::Value;
     let schema: Vec<(String, String, Option<String>)> = conn
         .prepare("SELECT type,name,sql FROM sqlite_master ORDER BY type,name,sql")
         .unwrap()
@@ -365,6 +364,452 @@ fn logical_dump(path: &std::path::Path) -> Vec<String> {
             .unwrap();
         rows.sort();
         dump.extend(rows.into_iter().map(|row| format!("{name} {row}")));
+    }
+    dump
+}
+
+/// Independent inverse of fresh native storage: source owner names select the frozen packer.
+/// Neither the production resolver nor its runtime-slot adapter supplies expected packed IDs.
+fn old_key(identity: &shared::pack_identity::PackIdentity, plugins: &[Plugin], stored: i64) -> u32 {
+    let key = identity.required_key(stored).unwrap();
+    let owner = identity.table().entry(key.plugin()).unwrap();
+    let supplier = plugins
+        .iter()
+        .position(|p| p.name.eq_ignore_ascii_case(&owner.display_name))
+        .unwrap();
+    old_pack(
+        plugins,
+        supplier,
+        ((plugins[supplier].masters.len() as u32) << 24) | key.local(),
+    )
+    .unwrap()
+}
+
+/// Closed identity-column audit for every table emitted by the inherited scalar writer.
+/// Supplier indices, row positions, coordinates and non-FormID scalar integers stay unchanged.
+fn identity_columns(table: &str) -> &'static str {
+    match table {
+        "records" => "form_id cell_id worldspace_id",
+        "formid_map" => "form_id",
+        "worldspaces" => "id parent_world",
+        "cells" => "id worldspace_id",
+        "references" => "id cell_id worldspace_id base_form_id enable_parent_id emittance_id",
+        "exterior_spatial" => "id cell_id worldspace_id",
+        "land" => "cell_id",
+        "statics" | "texture_sets" | "grass_types" | "movement_types" | "waters"
+        | "image_spaces" | "lighting_templates" | "climates" => "id",
+        "lights" => "id sound_id lens_id",
+        "emittance" => "id weather_id",
+        "npcs" => "id race_id class_id",
+        "landscape_textures" => "id texture_set_id material_type",
+        "landscape_texture_grasses" => "ltex_id gras_id",
+        "actor_models" => "id race_id skin_armo_id",
+        "actor_model_parts" => "npc_id armature_race_id skin_texture_set_id",
+        "race_movement_links" => "id walk_movt_id run_movt_id",
+        "race_animation_sources" => "race_id",
+        "movement_game_settings" => "id",
+        "base_texture_swaps" => "base_id texture_set_id",
+        "scripts" => "form_id",
+        "cell_environment" => {
+            "cell_id image_space_id acoustic_space_id music_id sky_region_id location_id encounter_zone_id owner_id water_id"
+        }
+        "cell_lighting" => "cell_id lighting_template_id image_space_id",
+        "cell_regions" => "cell_id region_id",
+        "worldspace_environment" => {
+            "worldspace_id climate_id water_id lod_water_id lighting_template_id music_id location_id encounter_zone_id"
+        }
+        "weathers" => {
+            "id precipitation_id visual_effect_id sky_static_id sun_glare_lens_id image_space_sunrise_id image_space_day_id image_space_sunset_id image_space_night_id volumetric_lighting_sunrise_id volumetric_lighting_day_id volumetric_lighting_sunset_id volumetric_lighting_night_id"
+        }
+        "weather_colors" | "weather_directional_ambient" => "weather_id",
+        "climate_weathers" => "climate_id weather_id chance_global_id",
+        "region_weathers" => "region_id weather_id chance_global_id",
+        "door_links" => "ref_id destination_ref_id destination_cell_id destination_worldspace_id",
+        "reference_linked_refs" => "reference_id keyword_id linked_ref_id",
+        "reference_activate_parents" => "reference_id parent_ref_id",
+        "reference_details" => {
+            "reference_id owner_id lock_key_id location_id location_ref_type_id encounter_zone_id attached_ref_id"
+        }
+        "room_bounds" => "ref_id cell_id lighting_template_id image_space_id",
+        "room_portals" => "ref_id cell_id room_a room_b",
+        "room_links" => "room_ref linked_ref",
+        "reference_rooms" => "reference_id room_ref",
+        "projection_omission_samples" => "form_id",
+        "lod" => "cell_id",
+        "lod_chunks" | "lod_chunks_spatial" => "worldspace_id",
+        "schema_info"
+        | "plugins"
+        | "conversion_cache"
+        | "room_graph_stats"
+        | "projection_omission_stats"
+        | "lod_build"
+        | "exterior_spatial_node"
+        | "exterior_spatial_rowid"
+        | "exterior_spatial_parent" => "",
+        other => panic!("unreviewed scalar table {other}; extend the closed differential contract"),
+    }
+}
+
+fn rows(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut select = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+    let width = select.column_count();
+    select
+        .query_map([], |row| (0..width).map(|i| row.get(i)).collect())
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// Compare all inherited schema/rows, while proving each intentional native-format addition.
+fn native_logical_dump(
+    old: &rusqlite::Connection,
+    new: &rusqlite::Connection,
+    plugins: &[Plugin],
+    authored: &std::collections::HashMap<u32, converter::esm::records::RawRecord>,
+) -> Vec<String> {
+    use rusqlite::{params, types::Value};
+    let context = shared::records::RecordContextReader::new(new).unwrap();
+    let identity = context.identity();
+    assert_eq!(identity.order().len(), 3);
+    assert_eq!(
+        new.query_row("SELECT version FROM schema_info", [], |row| row
+            .get::<_, u32>(0))
+            .unwrap(),
+        shared::WORLD_DATABASE_SCHEMA_VERSION
+    );
+    let mut normalized = BTreeMap::new();
+    let mut sites = Vec::new();
+    let keys = new
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(keys.len(), authored.len());
+    for stored in keys {
+        let packed = old_key(identity, plugins, stored);
+        let source = &authored[&packed];
+        let record = context
+            .record(identity.required_key(stored).unwrap())
+            .unwrap();
+        assert_eq!(record.source_header, source.form_id);
+        assert_eq!(
+            identity.order()[source.load_order as usize],
+            record.supplier
+        );
+        assert_eq!(record.source_cell, source.cell_form_id);
+        assert_eq!(record.source_world, source.worldspace_form_id);
+        assert_eq!(
+            new.query_row(
+                "SELECT source_field_count FROM record_context WHERE record_key=?1",
+                [stored],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            source.subrecords.len()
+        );
+        assert_eq!(
+            record.source_ordinals,
+            (0..source.subrecords.len()).collect::<Vec<_>>()
+        );
+        let mut fields = Vec::new();
+        for (ordinal, field) in record.subrecords.iter().enumerate() {
+            assert!(record.is_runtime_usable(ordinal));
+            assert_eq!(
+                (field.tag.as_slice(), field.data.as_slice()),
+                (
+                    source.subrecords[ordinal].0.as_slice(),
+                    source.subrecords[ordinal].1.as_slice()
+                ),
+                "original canonical bytes"
+            );
+            let original:(Vec<u8>,Vec<u8>)=new.query_row("SELECT signature,data FROM record_source_fields WHERE record_key=?1 AND source_ordinal=?2",params![stored,ordinal],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(original, (field.tag.to_vec(), field.data.clone()));
+            let offsets=new.prepare("SELECT byte_offset,source_word FROM resolved_links WHERE record_key=?1 AND source_ordinal=?2 ORDER BY byte_offset").unwrap().query_map(params![stored,ordinal],|row|Ok((row.get::<_,usize>(0)?,row.get::<_,u32>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let mut bytes = field.data.clone();
+            for (offset, raw) in offsets {
+                assert_eq!(
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+                    raw
+                );
+                let expected = old_pack(plugins, source.load_order as usize, raw).unwrap();
+                let actual = record
+                    .resolve_at(ordinal, offset)
+                    .unwrap()
+                    .map(|key| old_key(identity, plugins, key.to_sql_i64()))
+                    .unwrap_or(0);
+                assert_eq!(actual, expected);
+                sites.push((packed, ordinal, offset, raw, expected));
+                bytes[offset..offset + 4].copy_from_slice(&expected.to_le_bytes());
+            }
+            fields.push(shared::records::ArchivedSubRecord {
+                tag: field.tag,
+                data: bytes,
+            });
+        }
+        let archived:(u32,u32,String,u32,Vec<u8>)=new.query_row("SELECT source_form_id,load_order,record_type,flags,payload FROM inhouse_source_records WHERE form_id=?1",[stored],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(
+            archived,
+            (
+                source.form_id,
+                source.load_order,
+                String::from_utf8(source.record_type.to_vec()).unwrap(),
+                source.flags,
+                converter::esm::extractors::serialize_subrecords(&source.subrecords)
+            )
+        );
+        normalized.insert(
+            stored,
+            shared::records::ArchivedRecordData { subrecords: fields },
+        );
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            (0x811, 1, 36, 0x812, 0xfe00_0812),
+            (0x0100_0914, 0, 0, 0x0100_0811, 0x811),
+            (0x0100_0914, 1, 0, 0x812, 0xfe00_0812)
+        ]
+    );
+    let additions = [
+        ("pack_identity", 1),
+        ("pack_plugins", 3),
+        ("canonical_record_contract", 1),
+        ("record_context", 4),
+        ("record_source_fields", 8),
+        ("record_field_origins", 8),
+        ("resolved_links", 3),
+        ("record_text", 3),
+        ("land_context", 0),
+        ("inhouse_source_records", 4),
+        ("inhouse_localized_fields", 0),
+        ("inhouse_terrain_source_order", 0),
+        ("inhouse_terrain_layers", 0),
+        ("inhouse_unresolved_terrain_textures", 0),
+        ("script_properties", 1),
+        ("script_property_values", 1),
+    ];
+    for (table, count) in additions {
+        assert_eq!(
+            new.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            count,
+            "{table}"
+        );
+    }
+    // Every text sidecar matches the exact authored ASCII occurrence, without byte rewriting.
+    for row in new
+        .prepare("SELECT record_key,source_ordinal,text FROM record_text")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, usize>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+    {
+        let (key, ordinal, text) = row.unwrap();
+        let source = &authored[&old_key(identity, plugins, key)];
+        assert_eq!(source.subrecords[ordinal].0.as_slice(), b"EDID");
+        assert_eq!(
+            text,
+            std::str::from_utf8(&source.subrecords[ordinal].1)
+                .unwrap()
+                .trim_end_matches('\0')
+        );
+    }
+    let normalize_value = |value: Value| match value {
+        Value::Null => Value::Null,
+        Value::Integer(0) => Value::Integer(0),
+        Value::Integer(value) => Value::Integer(i64::from(old_key(identity, plugins, value))),
+        other => panic!("invalid identity storage {other:?}"),
+    };
+    let mut properties = rows(new, "script_properties");
+    for row in &mut properties {
+        row[0] = normalize_value(row[0].clone());
+    }
+    assert_eq!(
+        properties,
+        vec![vec![
+            Value::Integer(0x811),
+            Value::Text("Independent".into()),
+            Value::Integer(0),
+            Value::Text("Object".into()),
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1)
+        ]]
+    );
+    let mut values = rows(new, "script_property_values");
+    for row in &mut values {
+        row[0] = normalize_value(row[0].clone());
+        row[4] = normalize_value(row[4].clone());
+    }
+    assert_eq!(
+        values,
+        vec![vec![
+            Value::Integer(0x811),
+            Value::Text("Independent".into()),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0xfe00_0812),
+            Value::Integer(0x3456),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]]
+    );
+    let properties_json = format!(
+        r#"[{{"name":"Object","property_type":1,"status":1,"value":{{"Object":{{"form_id":{},"alias_id":13398}}}}}}]"#,
+        0xfe00_0812u32
+    );
+    assert_eq!(
+        old.query_row("SELECT properties_json FROM scripts", [], |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        properties_json
+    );
+    let mut scripts = rows(new, "scripts");
+    for row in &mut scripts {
+        row[0] = normalize_value(row[0].clone());
+    }
+    assert_eq!(
+        scripts,
+        vec![vec![
+            Value::Integer(0x811),
+            Value::Text("Independent".into()),
+            Value::Blob(script_object(0x812))
+        ]]
+    );
+    let schema = |conn: &rusqlite::Connection| {
+        conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,sql")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let old_schema = schema(old);
+    let new_schema = schema(new);
+    for (kind, name, table, _) in &new_schema {
+        if !old_schema
+            .iter()
+            .any(|(_, old_name, _, _)| old_name == name)
+        {
+            assert!(
+                additions.iter().any(|(extra, _)| *extra == table.as_str()),
+                "unreviewed new schema object {kind} {name} on {table}"
+            );
+        }
+    }
+    // No R-Tree node encodes a hidden identity in this interior-only fixture; still compare
+    // every virtual/shadow row and BLOB exactly, including the empty root node.
+    assert_eq!(
+        new.query_row("SELECT count(*) FROM exterior_spatial", [], |row| row
+            .get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+    let mut dump = Vec::new();
+    for (kind, name, _, sql) in old_schema {
+        let actual = new_schema
+            .iter()
+            .find(|(_, new_name, _, _)| new_name == &name)
+            .unwrap();
+        if name != "scripts" {
+            assert_eq!((&kind, &sql), (&actual.0, &actual.3), "schema {name}");
+        }
+        dump.push(format!("schema {kind} {name} {sql:?}"));
+        if kind != "table" {
+            continue;
+        }
+        let identity_fields = identity_columns(&name);
+        let columns = old
+            .prepare(&format!("SELECT * FROM \"{name}\""))
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut data = rows(new, &name);
+        if name == "scripts" {
+            data = vec![vec![
+                Value::Integer(0x811),
+                Value::Text("Independent".into()),
+                Value::Blob(script_object(0xfe00_0812)),
+                Value::Text(properties_json.clone()),
+            ]];
+        } else {
+            let native_columns = new
+                .prepare(&format!("SELECT * FROM \"{name}\""))
+                .unwrap()
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(columns, native_columns, "all columns {name}");
+            for row in &mut data {
+                let owner = columns
+                    .iter()
+                    .position(|column| matches!(column.as_str(), "form_id" | "id" | "cell_id"))
+                    .and_then(|index| match row[index] {
+                        Value::Integer(value) => Some(value),
+                        _ => None,
+                    });
+                for (index, column) in columns.iter().enumerate() {
+                    if identity_fields
+                        .split_ascii_whitespace()
+                        .any(|key| key == column)
+                    {
+                        row[index] = normalize_value(row[index].clone());
+                    }
+                    if matches!(
+                        (name.as_str(), column.as_str()),
+                        ("records", "data")
+                            | ("cells", "data")
+                            | ("references", "data")
+                            | ("waters", "data")
+                    ) {
+                        let record = &normalized[&owner.unwrap()];
+                        row[index] = Value::Blob(if name == "records" {
+                            rkyv::to_bytes::<rkyv::rancor::Error>(record)
+                                .unwrap()
+                                .to_vec()
+                        } else {
+                            converter::esm::extractors::serialize_subrecords(
+                                &record
+                                    .subrecords
+                                    .iter()
+                                    .map(|field| (field.tag.to_vec(), field.data.clone()))
+                                    .collect::<Vec<_>>(),
+                            )
+                        });
+                    }
+                    if name == "schema_info" && column == "version" {
+                        row[index] = Value::Integer(0);
+                    }
+                }
+            }
+        }
+        let mut data = data
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        data.sort();
+        dump.extend(data.into_iter().map(|row| format!("{name} {row}")));
     }
     dump
 }
@@ -459,8 +904,15 @@ fn synthetic_publication_matches_independent_old_packer_and_cell_cache() {
         paths.push(path);
     }
     let mut expected = std::collections::HashMap::new();
+    let mut authored = std::collections::HashMap::new();
     for (supplier, path) in paths.iter().enumerate() {
         for mut record in parse_plugin_file(path).unwrap() {
+            let mut original = record.clone();
+            original.load_order = supplier as u32;
+            authored.insert(
+                old_pack(&plugins, supplier, record.form_id).unwrap(),
+                original,
+            );
             record.form_id = old_pack(&plugins, supplier, record.form_id).unwrap();
             if record.cell_form_id.is_some() {
                 assert_eq!(record.cell_form_id, Some(0x0200_0913));
@@ -480,8 +932,9 @@ fn synthetic_publication_matches_independent_old_packer_and_cell_cache() {
     }
     assert_eq!(expected[&0x811].load_order, 2);
     assert!(expected.contains_key(&0xfe00_0812));
-    let old_db = root.path().join("old.db");
-    let conn = Connection::open(&old_db).unwrap();
+    // The retained scalar oracle is explicitly unbound and MEMORY ONLY. It never
+    // acquires a native world stamp or a disk-format compatibility adapter.
+    let conn = Connection::open_in_memory().unwrap();
     exporter::create_tables(&conn).unwrap();
     for (priority, path) in paths.iter().enumerate() {
         conn.execute(
@@ -496,18 +949,66 @@ fn synthetic_publication_matches_independent_old_packer_and_cell_cache() {
     }
     exporter::export_to_db_with_load_order(&conn, &expected, &LoadOrder::read(&paths).unwrap())
         .unwrap();
-    drop(conn);
     let new_db = root.path().join("new.db");
     EsmParser::convert_plugins(&paths, &new_db).unwrap();
-    assert_eq!(logical_dump(&old_db), logical_dump(&new_db));
+    let new = Connection::open(&new_db).unwrap();
+    let before = Sha256::digest(std::fs::read(&new_db).unwrap());
+    assert_eq!(
+        logical_dump(&conn),
+        native_logical_dump(&conn, &new, &plugins, &authored)
+    );
+    assert_eq!(
+        Sha256::digest(std::fs::read(&new_db).unwrap()),
+        before,
+        "differential interpretation never changes native SQL"
+    );
     let actual = EsmParser::merge_plugins(&paths).unwrap();
     let old_cache = root.path().join("old.rkyv");
     let new_cache = root.path().join("new.rkyv");
     converter::esm::cell_cache::write_cell_cache(&expected, &old_cache).unwrap();
     converter::esm::cell_cache::write_cell_cache(&actual, &new_cache).unwrap();
     assert_eq!(
+        std::fs::read(&old_cache).unwrap(),
+        std::fs::read(&new_cache).unwrap()
+    );
+    // The genuine native writer adds an authenticated envelope and native identities.
+    // After that explicit representation transition, every payload byte must still agree.
+    let native = EsmParser::merge_plugins_form_keys(&paths).unwrap();
+    let native_cache = root.path().join("native.rkyv");
+    converter::esm::cell_cache::write_form_key_cell_cache(
+        &native,
+        &Default::default(),
+        &native_cache,
+        false,
+    )
+    .unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&new).unwrap();
+    assert_eq!(
+        native.order.pack_identity().unwrap().digest(),
+        identity.digest()
+    );
+    let mut aligned = rkyv::util::AlignedVec::<16>::new();
+    aligned.extend_from_slice(&std::fs::read(native_cache).unwrap());
+    let payload = shared::cache_identity::cell_cache_payload(&identity, &aligned, false).unwrap();
+    let mut cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(payload).unwrap();
+    for cell in &mut cache.cells {
+        cell.cell_id = u64::from(old_key(&identity, &plugins, cell.cell_id as i64));
+        cell.water_type_form_id = cell
+            .water_type_form_id
+            .map(|key| u64::from(old_key(&identity, &plugins, key as i64)));
+        for layer in &mut cell.layers {
+            if layer.texture_form_id != 0 {
+                layer.texture_form_id =
+                    u64::from(old_key(&identity, &plugins, layer.texture_form_id as i64));
+            }
+        }
+    }
+    assert_eq!(
+        rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
+            .unwrap()
+            .as_slice(),
         std::fs::read(old_cache).unwrap(),
-        std::fs::read(new_cache).unwrap()
+        "entire normalized native cache payload, no skipped fields or float tolerances"
     );
 }
 

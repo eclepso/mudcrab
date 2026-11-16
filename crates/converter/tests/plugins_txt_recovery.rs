@@ -1,4 +1,5 @@
 //! Selection recovery must survive the production publication path.
+mod common;
 use converter::{
     AssetPipeline, PipelineConfig,
     esm::{exporter::validate_database, read_plugins_txt},
@@ -95,7 +96,7 @@ async fn unicode_case_player_plugin_name_publishes() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(names, ["Skyrim.esm", "Good.esp", "CAFÉ.esp"]);
-    let (form_id, priority): (u32, u32) = conn
+    let (form_id, priority): (i64, u32) = conn
         .query_row(
             "SELECT form_id, load_order FROM records WHERE record_type='GMST' AND load_order=2",
             [],
@@ -103,7 +104,10 @@ async fn unicode_case_player_plugin_name_publishes() {
         )
         .unwrap();
     // The source owns local slot 1; Good.esp makes the published slot independently equal 2.
-    assert_eq!((form_id, priority), (0x0200_0800, 2));
+    assert_eq!(
+        (common::runtime_id(&conn, form_id), priority),
+        (0x0200_0800, 2)
+    );
     let value: f64 = conn
         .query_row(
             "SELECT value FROM movement_game_settings WHERE editor_id='fJumpHeightMin'",
@@ -343,23 +347,20 @@ fn final_names(conn: &rusqlite::Connection) -> Vec<String> {
 
 /// Decode generic published settings so absent rejected records cannot pass a movement-only query.
 fn final_editors(conn: &rusqlite::Connection) -> Vec<String> {
-    conn.prepare("SELECT data FROM records WHERE record_type='GMST'")
+    let reader = shared::records::RecordContextReader::new(conn).unwrap();
+    let mut statement = conn
+        .prepare("SELECT form_id FROM records WHERE record_type='GMST' ORDER BY form_id")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, i64>(0))
         .unwrap()
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .unwrap()
-        .map(|blob| {
-            let data = rkyv::from_bytes::<
-                converter::esm::types::ArchivedRecordData,
-                rkyv::rancor::Error,
-            >(&blob.unwrap())
-            .unwrap();
-            let editor = &data
-                .subrecords
-                .iter()
-                .find(|sub| sub.tag == *b"EDID")
+        .map(|stored| {
+            let key = reader.identity().required_key(stored.unwrap()).unwrap();
+            reader
+                .record(key)
                 .unwrap()
-                .data;
-            String::from_utf8(editor.strip_suffix(&[0]).unwrap_or(editor).to_vec()).unwrap()
+                .text(*b"EDID")
+                .expect("native setting EDID")
         })
         .collect()
 }
@@ -421,9 +422,9 @@ async fn final_cycle_closure_preserves_player_publication() {
     );
 }
 
-/// A generated 256-full-plugin selection publishes its first 254 and omits overflow dependents.
+/// Native publication keeps every owner and dependent beyond the transient full-slot limit.
 #[tokio::test]
-async fn final_full_slot_overflow_preserves_player_publication() {
+async fn final_full_slot_overflow_preserves_all_native_owners_and_dependents() {
     let (_dir, config) = final_fixture();
     let mut entries = String::new();
     for index in 0..255 {
@@ -450,33 +451,48 @@ async fn final_full_slot_overflow_preserves_player_publication() {
     fs::write(config.plugins_file.as_ref().unwrap(), entries).unwrap();
     let (report, conn) = publish_final_fixture(config).await;
     let expected: Vec<_> = std::iter::once("Skyrim.esm".to_owned())
-        .chain((0..253).map(|index| format!("Full{index:03}.esp")))
+        .chain((0..255).map(|index| format!("Full{index:03}.esp")))
+        .chain(std::iter::once("Dependent.esp".to_owned()))
         .collect();
     assert_eq!(final_names(&conn), expected);
     let editors = final_editors(&conn);
-    assert!(editors.contains(&"fFull252".to_owned()));
-    for omitted in ["fFull253", "fFull254", "fOverflowDependent"] {
-        assert!(!editors.iter().any(|editor| editor == omitted), "{omitted}");
+    for retained in ["fFull252", "fFull253", "fFull254", "fOverflowDependent"] {
+        assert!(
+            editors.iter().any(|editor| editor == retained),
+            "{retained}"
+        );
     }
-    let summaries: Vec<_> = report
-        .notices
-        .iter()
-        .filter(|notice| notice.contains("full plugin slot overflow"))
-        .collect();
-    assert_eq!(summaries.len(), 1, "{:?}", report.notices);
     assert!(
-        summaries[0].contains('2') && summaries[0].contains("Full253.esp"),
-        "{summaries:?}"
+        report.skipped_plugins.is_empty(),
+        "{:?}",
+        report.skipped_plugins
     );
-    assert_eq!(
-        report.skipped_plugins,
-        ["Full253.esp", "Full254.esp", "Dependent.esp"]
+    assert!(
+        !report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("full plugin slot overflow")),
+        "{:?}",
+        report.notices
+    );
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    let last =
+        shared::form_key::FormKey::new(identity.table().id("Full254.esp").unwrap(), 0x800).unwrap();
+    assert!(
+        identity.runtime_id_if_available(last).unwrap().is_none(),
+        "unrepresentable owner must not receive a stand-in handle"
+    );
+    assert!(
+        shared::records::RecordContextReader::new(&conn)
+            .unwrap()
+            .record(last)
+            .is_ok()
     );
 }
 
-/// Light-slot overflow is recoverable through publication, including full plugins depending on it.
+/// Native publication keeps light owners and full dependents past transient light-slot capacity.
 #[tokio::test]
-async fn final_light_slot_overflow_preserves_player_publication() {
+async fn final_light_slot_overflow_preserves_all_native_owners_and_dependents() {
     let (_dir, config) = final_fixture();
     let mut entries = String::new();
     for index in 0..4097 {
@@ -505,30 +521,48 @@ async fn final_light_slot_overflow_preserves_player_publication() {
     fs::write(config.plugins_file.as_ref().unwrap(), entries).unwrap();
     let (report, conn) = publish_final_fixture(config).await;
     let expected: Vec<_> = std::iter::once("Skyrim.esm".to_owned())
-        .chain((0..4096).map(|index| format!("Light{index:04}.esl")))
-        .chain(std::iter::once("Good.esp".to_owned()))
+        .chain((0..4097).map(|index| format!("Light{index:04}.esl")))
+        .chain(["FullDependent.esp".to_owned(), "Good.esp".to_owned()])
         .collect();
     assert_eq!(final_names(&conn), expected);
     let editors = final_editors(&conn);
+    for retained in [
+        "fLight4095",
+        "fLight4096",
+        "fLightOverflowDependent",
+        "fFullNeighbor",
+    ] {
+        assert!(
+            editors.iter().any(|editor| editor == retained),
+            "{retained}"
+        );
+    }
     assert!(
-        editors.contains(&"fLight4095".to_owned()) && editors.contains(&"fFullNeighbor".to_owned())
+        report.skipped_plugins.is_empty(),
+        "{:?}",
+        report.skipped_plugins
     );
     assert!(
-        !editors
+        !report
+            .notices
             .iter()
-            .any(|editor| ["fLight4096", "fLightOverflowDependent"].contains(&editor.as_str()))
+            .any(|notice| notice.contains("light plugin slot overflow")),
+        "{:?}",
+        report.notices
     );
-    assert_eq!(
-        report.skipped_plugins,
-        ["Light4096.esl", "FullDependent.esp"]
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    let last = shared::form_key::FormKey::new(identity.table().id("Light4096.esl").unwrap(), 0x800)
+        .unwrap();
+    assert!(
+        identity.runtime_id_if_available(last).unwrap().is_none(),
+        "unrepresentable light owner must not receive a stand-in handle"
     );
-    let summaries: Vec<_> = report
-        .notices
-        .iter()
-        .filter(|notice| notice.contains("light plugin slot overflow"))
-        .collect();
-    assert_eq!(summaries.len(), 1, "{:?}", report.notices);
-    assert!(summaries[0].contains("Light4096.esl") && !summaries[0].contains(['\r', '\n']));
+    assert!(
+        shared::records::RecordContextReader::new(&conn)
+            .unwrap()
+            .record(last)
+            .is_ok()
+    );
 }
 
 /// Automatic discovery uses the same cycle recovery and retains usable publication.

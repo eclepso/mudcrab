@@ -5,7 +5,7 @@ mod common;
 use converter::{
     AssetPipeline, PipelineConfig,
     config::RecordReader,
-    esm::{inhouse::export_record_bundle_typed, load_order::LoadOrder, types::ArchivedRecordData},
+    esm::{inhouse::export_record_bundle_typed, load_order::LoadOrder},
     records::{DecodedRecord, ReadResult, Value, read_plugins},
 };
 use dummy_content::{esm, inhouse_dialogue as native, layout};
@@ -484,12 +484,7 @@ async fn grouped_info_metadata_exports_and_broken_owners_still_publish_neighbors
         0x0200_4605,
         0x0200_4606,
     ] {
-        let bytes: Vec<u8> = database
-            .query_row("SELECT data FROM records WHERE form_id=?", [id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let record = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap();
+        let record = common::runtime_record(&database, id);
         assert!(
             !record.subrecords.iter().any(|field| field.tag == *b"TPIC"),
             "metadata must not synthesize a runtime subrecord"
@@ -507,8 +502,8 @@ async fn grouped_info_metadata_exports_and_broken_owners_still_publish_neighbors
     }
     let source: (u32, Vec<u8>) = database
         .query_row(
-            "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=0x01004600",
-            [],
+            "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&database, 0x0100_4600)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();

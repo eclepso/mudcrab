@@ -100,6 +100,7 @@ async fn v72_historical_prune_record_cannot_certify_a_removed_source() {
             let staging = temp.path().join("output.staging-resume");
             generate_data(&data);
             fs::create_dir_all(staging.join("meshes")).unwrap();
+            common::current_staging_generation(&staging);
             converter::mesh::MeshConverter::convert_nif_to_glb(
                 &data.join(SOURCE),
                 &staging.join(MESH),
@@ -151,6 +152,7 @@ async fn v72_removed_source_invalidates_previously_verified_pruned_mesh() {
             BTreeSet::from([MISSING_TEXTURE.to_owned()])
         );
         fs::create_dir_all(staging.join("meshes")).unwrap();
+        common::current_staging_generation(&staging);
         fs::copy(output.join(MESH), staging.join(MESH)).unwrap();
         let entry = &manifest.entries[SOURCE];
         StagingJournal::open(&staging)

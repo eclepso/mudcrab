@@ -1,5 +1,7 @@
 //! Complete-export regressions for native source identity and guarded raw access.
-use converter::records::history_source::{SourceQuery, visit_source_history};
+mod common;
+
+use converter::records::history_source::{SourceQuery, visit_native_source_history};
 use converter::records::source_identity::SourceIdentityState;
 use rusqlite::Connection;
 use std::{
@@ -87,14 +89,14 @@ fn unknown_new_signature_and_header_bits_export_without_typed_invention() {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let source: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=6144",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 6144)],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(source, payload);
     let mut count = 0;
-    let summary = visit_source_history(
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Source {
@@ -141,17 +143,33 @@ fn wide_light_body_is_raw_queryable_without_aliasing_adjacent_owner() {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let neighbor: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=4261417524",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 4261417524)],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(neighbor, neighbor_payload); // 0xFE001234 belongs only to the adjacent narrow owner.
-    let (runtime, offset): (Option<u32>, u64) = db.query_row(
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let wide_key =
+        shared::form_key::FormKey::new(identity.table().id("WideA.esl").unwrap(), 0x1234).unwrap();
+    let (stored, offset): (Option<i64>, u64) = db.query_row(
         "SELECT form_id,source_record_offset FROM record_overrides WHERE original_owner='widea.esl' AND full_local=4660", [],
         |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    assert_eq!(runtime, None);
-    let summary = visit_source_history(
+    assert_eq!(stored, Some(wide_key.to_sql_i64()));
+    assert!(
+        identity
+            .runtime_id_if_available(wide_key)
+            .unwrap()
+            .is_none(),
+        "wide local must not receive an aliased runtime handle"
+    );
+    let wide_record = shared::records::RecordContextReader::new(&db)
+        .unwrap()
+        .record(wide_key)
+        .unwrap();
+    assert_eq!(wide_record.text(*b"EDID").as_deref(), Some("wide_original"));
+    assert_ne!(stored, Some(common::stored_key(&db, 0xFE00_1234)));
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Source {
@@ -163,14 +181,15 @@ fn wide_light_body_is_raw_queryable_without_aliasing_adjacent_owner() {
             assert_eq!(v.identity.full_local, Some(0x1234));
             assert_eq!(v.runtime_form_id, None);
             assert!(v.latest_source_candidate);
-            assert!(!v.accepted_source_winner && !v.runtime_record_present);
+            assert!(v.accepted_source_winner && v.runtime_record_present);
+            assert!(v.latest_reader_admitted_candidate);
             assert_eq!(v.raw.unwrap().stored_payload, Some(wide_payload.clone()));
             Ok(())
         },
     )
     .unwrap();
     assert!(summary.fully_raw_available);
-    let summary = visit_source_history(
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Physical {
@@ -190,7 +209,7 @@ fn wide_light_body_is_raw_queryable_without_aliasing_adjacent_owner() {
     let mut changed = fs::read(&path).unwrap();
     changed.push(0x55);
     fs::write(path, changed).unwrap();
-    let rejected = visit_source_history(
+    let rejected = visit_native_source_history(
         &output,
         None,
         SourceQuery::Physical {
@@ -228,13 +247,13 @@ fn malformed_compressed_neighbor_preserves_header_and_later_complete_unknown_rec
     assert_eq!(state, "skipped");
     let later: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=6160",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 6160)],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(later, later_payload);
-    let summary = visit_source_history(
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Source {
@@ -275,13 +294,13 @@ fn malformed_later_header_preserves_failure_and_usable_neighbor() {
     assert!(reason.is_some_and(|text| !text.is_empty()));
     let neighbor: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=6160",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 6160)],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(neighbor, payload);
-    let summary = visit_source_history(
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Physical {
@@ -318,13 +337,13 @@ fn containing_group_limit_returns_header_only_and_keeps_outer_neighbor() {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let later: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=6160",
-            [],
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 6160)],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(later, later_payload);
-    let summary = visit_source_history(
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Source {
@@ -368,8 +387,8 @@ fn generic_master_compatibility_keeps_original_owner_unresolved_and_valid_neighb
         .unwrap();
     assert_eq!(count, 1); // Full raw 0x02000711 is preserved alongside runtime compatibility.
     let restored: Vec<u8> = db.query_row(
-        "SELECT payload FROM inhouse_source_records WHERE form_id=16779025 AND source_form_id=33556241",
-        [], |r| r.get(0),
+        "SELECT payload FROM inhouse_source_records WHERE form_id=?1 AND source_form_id=33556241",
+        [common::stored_key(&db, 16779025)], |r| r.get(0),
     ).unwrap();
     assert_eq!(restored, bad_payload);
     let good: Vec<u8> = db
@@ -380,9 +399,13 @@ fn generic_master_compatibility_keeps_original_owner_unresolved_and_valid_neighb
         )
         .unwrap();
     assert_eq!(good, good_payload); // Full raw 0x01000722.
-    let (runtime, offset): (Option<u32>, u64) = db.query_row("SELECT form_id,source_record_offset FROM record_overrides WHERE source_form_id=33556241", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    assert_eq!(runtime, Some(0x0100_0711));
-    let summary = visit_source_history(
+    let (stored, offset): (Option<i64>, u64) = db.query_row("SELECT form_id,source_record_offset FROM record_overrides WHERE source_form_id=33556241", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(stored, Some(common::stored_key(&db, 0x0100_0711)));
+    assert_eq!(
+        stored.map(|key| common::runtime_id(&db, key)),
+        Some(0x0100_0711)
+    );
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Physical {
@@ -419,7 +442,7 @@ fn source_candidate_admission_fallback_and_deletion_are_independent() {
     plugin(&root, "Patch.esp", &["Base.esm"], 0, &patch);
     let output = export(&root, &["Base.esm", "Patch.esp"], &[*b"STAT"]);
     let mut admission = Vec::new();
-    let summary = visit_source_history(
+    let summary = visit_native_source_history(
         &output,
         None,
         SourceQuery::Source {
@@ -448,7 +471,7 @@ fn source_candidate_admission_fallback_and_deletion_are_independent() {
         ]
     );
     let mut deleted = Vec::new();
-    visit_source_history(
+    visit_native_source_history(
         &output,
         None,
         SourceQuery::Source {

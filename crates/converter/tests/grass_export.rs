@@ -1,8 +1,8 @@
 //! Synthetic grass plugins exercise the merged database, without game assets.
+mod common;
 use converter::esm::{
     EsmParser,
-    exporter::{create_tables, export_to_db, export_to_db_with_load_order, validate_database},
-    load_order::LoadOrder,
+    exporter::{create_tables, export_to_db, validate_database},
 };
 use rusqlite::Connection;
 use std::{fs, path::Path, process::Command};
@@ -79,12 +79,21 @@ fn landscape(id: u32, grasses: &[u32]) -> Vec<u8> {
 
 /// Reads every texture-grass association, sorted by texture then grass.
 fn associations(conn: &Connection) -> Vec<(u32, u32)> {
-    conn.prepare("SELECT ltex_id, gras_id FROM landscape_texture_grasses ORDER BY ltex_id, gras_id")
+    let mut rows: Vec<_> = conn
+        .prepare("SELECT ltex_id, gras_id FROM landscape_texture_grasses")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
         .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
+        .map(|row| {
+            let (texture, grass) = row.unwrap();
+            (
+                common::runtime_id(conn, texture),
+                common::runtime_id(conn, grass),
+            )
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
 }
 
 /// Every GRAS field is projected, and the winning LTEX list resolves full and light-plugin IDs.
@@ -120,7 +129,7 @@ fn exports_all_grass_fields_and_winning_full_and_light_links() {
     let paths = [filler, base, light, patch];
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&paths, &db).unwrap();
-    let conn = Connection::open(db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
         conn.query_row("SELECT version FROM schema_info", [], |row| row
             .get::<_, u32>(0))
@@ -131,7 +140,7 @@ fn exports_all_grass_fields_and_winning_full_and_light_links() {
     let id = 0x01000801u32;
     conn.query_row(
         "SELECT editor_id, model_path, density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags, load_order FROM grass_types WHERE id=?1",
-        [id], |row| {
+        [common::stored_key(&conn, id)], |row| {
             assert_eq!(row.get::<_, String>(0)?, "ModdedGrass");
             assert_eq!(row.get::<_, String>(1)?, "meshes/grass/meadow.v2.glb");
             for (column, expected) in [(2,81), (3,11), (4,73), (5,0x1234), (6,6), (11,5), (12,3)] {
@@ -145,7 +154,7 @@ fn exports_all_grass_fields_and_winning_full_and_light_links() {
     assert_eq!(
         conn.query_row(
             "SELECT density FROM grass_types WHERE id=?1",
-            [0xFE000813u32],
+            [common::stored_key(&conn, 0xFE000813)],
             |row| row.get::<_, u8>(0)
         )
         .unwrap(),
@@ -156,8 +165,8 @@ fn exports_all_grass_fields_and_winning_full_and_light_links() {
         [(0x01000901, id), (0x01000901, 0xFE000813)]
     );
     assert_eq!(conn.query_row(
-        "SELECT plugin_name, internal_id, records.load_order FROM formid_map JOIN records USING(form_id) WHERE form_id=?1",
-        [id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?))).unwrap(),
+        "SELECT pack_plugins.normalized_name, internal_id, records.load_order FROM formid_map JOIN records USING(form_id) JOIN pack_plugins ON pack_plugins.id=(formid_map.form_id >> 24) WHERE form_id=?1",
+        [common::stored_key(&conn, id)], |row| Ok((row.get::<_,String>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?))).unwrap(),
         ("base.esm".into(),0x801,3));
 }
 
@@ -192,20 +201,15 @@ fn deleted_grass_and_replaced_or_deleted_texture_lists_do_not_survive_refresh() 
     );
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(std::slice::from_ref(&base), &db).unwrap();
-    let conn = Connection::open(db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(associations(&conn).len(), 3);
     let effective = EsmParser::merge_plugins(&[base.clone(), patch.clone()]).unwrap();
     assert!(!effective.contains_key(&0x801));
-    export_to_db_with_load_order(
-        &conn,
-        &effective,
-        &LoadOrder::read(&[base.clone(), patch.clone()]).unwrap(),
-    )
-    .unwrap();
+    EsmParser::convert_plugins(&[base.clone(), patch.clone()], &db).unwrap();
     assert_eq!(
         conn.query_row(
-            "SELECT count(*) FROM grass_types WHERE id=2049",
-            [],
+            "SELECT count(*) FROM grass_types WHERE id=?1",
+            [common::stored_key(&conn, 0x801)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -221,15 +225,10 @@ fn deleted_grass_and_replaced_or_deleted_texture_lists_do_not_survive_refresh() 
         landscape(0x901, &[]),
     );
     let paths = [base, patch, clear];
-    export_to_db_with_load_order(
-        &conn,
-        &EsmParser::merge_plugins(&paths).unwrap(),
-        &LoadOrder::read(&paths).unwrap(),
-    )
-    .unwrap();
+    EsmParser::convert_plugins(&paths, &db).unwrap();
     assert!(associations(&conn).is_empty());
-    export_to_db_with_load_order(&conn, &Default::default(), &LoadOrder::read(&[]).unwrap())
-        .unwrap();
+    let empty = plugin(dir.path(), "Empty.esm", &[], 0, Vec::new());
+    EsmParser::convert_plugins(&[empty], &db).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM grass_types", [], |row| row
             .get::<_, u32>(0))
@@ -256,17 +255,20 @@ fn incomplete_rules_and_unsafe_model_paths_are_nullable_without_losing_raw_data(
     );
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&[base], &db).unwrap();
-    let conn = Connection::open(db).unwrap();
-    conn.query_row("SELECT model_path, density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags FROM grass_types WHERE id=2053", [], |row| {
+    let conn = Connection::open(&db).unwrap();
+    conn.query_row("SELECT model_path, density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags FROM grass_types WHERE id=?1", [common::stored_key(&conn, 0x805)], |row| {
         assert_eq!(row.get::<_, Option<String>>(0)?, None);
         assert_eq!((row.get::<_,u8>(1)?,row.get::<_,u8>(2)?,row.get::<_,u8>(3)?), (62,7,88));
         for column in 4..=10 { assert_eq!(row.get::<_,Option<f64>>(column)?,None); }
         Ok(())
     }).unwrap();
     assert_eq!(
-        conn.query_row("SELECT data FROM records WHERE form_id=2053", [], |row| row
-            .get::<_, Vec<u8>>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT data FROM records WHERE form_id=?1",
+            [common::stored_key(&conn, 0x805)],
+            |row| row.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
         converter::esm::extractors::serialize_subrecords(&[
             (b"DATA".to_vec(), vec![62, 7, 88]),
             (b"MODL".to_vec(), b"..\\outside.nif\0".to_vec()),
@@ -295,7 +297,7 @@ fn complete_export_into_a_schema_four_database_stamps_the_current_schema() {
         assert!(validate_database(&conn).is_err());
     }
     EsmParser::convert_plugins(&[base], &db).unwrap();
-    let conn = Connection::open(db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let versions: Vec<u32> = conn
         .prepare("SELECT version FROM schema_info")
         .unwrap()
@@ -331,8 +333,8 @@ fn unusual_authored_values_are_not_clamped_and_nonfinite_fields_are_nullable() {
     );
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&[base], &db).unwrap();
-    let conn = Connection::open(db).unwrap();
-    conn.query_row("SELECT density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags FROM grass_types WHERE id=2055", [], |row| {
+    let conn = Connection::open(&db).unwrap();
+    conn.query_row("SELECT density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags FROM grass_types WHERE id=?1", [common::stored_key(&conn, 0x807)], |row| {
         for column in [0,1,2,9] { assert_eq!(row.get::<_,u8>(column)?, 255); }
         assert_eq!(row.get::<_,u16>(3)?, u16::MAX);
         assert_eq!(row.get::<_,u32>(4)?, u32::MAX);
@@ -384,8 +386,8 @@ fn movement_annotation_preserves_grass(version: u32) {
     let before_links = associations(&conn);
     let before_grass: (u32, Vec<u8>) = conn
         .query_row(
-            "SELECT density, data FROM grass_types JOIN records ON id=form_id WHERE id=2049",
-            [],
+            "SELECT density, data FROM grass_types JOIN records ON id=form_id WHERE id=?1",
+            [common::stored_key(&conn, 0x801)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -395,30 +397,57 @@ fn movement_annotation_preserves_grass(version: u32) {
     // than succeeding without exercising its intentionally partial export.
     conn.execute("DELETE FROM movement_types", []).unwrap();
     drop(conn);
+    let before_database = fs::read(&database).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_movement-profile-annotate"))
         .arg(&database)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if version == shared::WORLD_DATABASE_SCHEMA_VERSION {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "obsolete world must require conversion again"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("convert again"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            before_database,
+            "refusal must not write an old database"
+        );
+    }
     let conn = Connection::open(database).unwrap();
-    assert_eq!(
-        conn.query_row(
-            "SELECT forward_walk FROM movement_types WHERE id=219149",
-            [],
-            |row| row.get::<_, f32>(0)
-        )
-        .unwrap(),
-        85.0
-    );
+    if version == shared::WORLD_DATABASE_SCHEMA_VERSION {
+        assert_eq!(
+            conn.query_row(
+                "SELECT forward_walk FROM movement_types WHERE id=?1",
+                [common::stored_key(&conn, 0x3580d)],
+                |row| row.get::<_, f32>(0)
+            )
+            .unwrap(),
+            85.0
+        );
+    } else {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM movement_types", [], |row| row
+                .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+    }
     assert_eq!(associations(&conn), before_links);
     assert_eq!(
         conn.query_row(
-            "SELECT density, data FROM grass_types JOIN records ON id=form_id WHERE id=2049",
-            [],
+            "SELECT density, data FROM grass_types JOIN records ON id=form_id WHERE id=?1",
+            [common::stored_key(&conn, 0x801)],
             |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
         )
         .unwrap(),
@@ -438,15 +467,15 @@ fn movement_annotation_does_not_erase_grass() {
     movement_annotation_preserves_grass(shared::WORLD_DATABASE_SCHEMA_VERSION);
 }
 
-/// Annotating a schema-4 database still works and keeps its schema-4 stamp.
+/// Old schema4 is refused without changing its grass bytes or old schema stamp.
 #[test]
-fn movement_annotation_still_accepts_schema_four() {
+fn movement_annotation_refuses_schema_four_without_mutating_grass() {
     movement_annotation_preserves_grass(4);
 }
 
-/// A subset export keeps unrelated grass and replaces only the lists of the textures it includes.
+/// Unbound disk subset exports refuse without mutation; complete source reconversion retains neighbors.
 #[test]
-fn partial_grass_updates_preserve_unrelated_definitions_and_replace_only_their_texture_list() {
+fn disk_subset_refuses_and_source_reconversion_preserves_unrelated_grass() {
     let dir = tempfile::tempdir().unwrap();
     let source = plugin(
         dir.path(),
@@ -462,23 +491,45 @@ fn partial_grass_updates_preserve_unrelated_definitions_and_replace_only_their_t
         .concat(),
     );
     let database = dir.path().join("world.db");
-    EsmParser::convert_plugins(&[source], &database).unwrap();
-    let conn = Connection::open(database).unwrap();
+    EsmParser::convert_plugins(std::slice::from_ref(&source), &database).unwrap();
+    let conn = Connection::open(&database).unwrap();
+    let densities = |connection: &Connection| -> Vec<(u32, u32)> {
+        connection
+            .prepare("SELECT id,density FROM grass_types ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?)))
+            .unwrap()
+            .map(|row| {
+                let (key, density) = row.unwrap();
+                (common::runtime_id(connection, key), density)
+            })
+            .collect()
+    };
+    let before_densities = densities(&conn);
+    let before_links = associations(&conn);
+    let before_bytes = fs::read(&database).unwrap();
     let update = plugin(
         dir.path(),
-        "Subset.esm",
-        &[],
+        "Patch.esp",
+        &["Base.esm"],
         0,
         [grass(0x801, 91), landscape(0x901, &[])].concat(),
     );
-    export_to_db(&conn, &EsmParser::merge_plugins(&[update]).unwrap()).unwrap();
-    let densities: Vec<(u32, u32)> = conn
-        .prepare("SELECT id,density FROM grass_types ORDER BY id")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(densities, [(0x801, 91), (0x802, 33)]);
+    let mut subset = EsmParser::merge_plugins(&[source.clone(), update.clone()]).unwrap();
+    subset.retain(|id, _| [0x801, 0x901].contains(id));
+    assert_eq!(subset.len(), 2);
+    let error = export_to_db(&conn, &subset).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("authenticated native source context"),
+        "{error}"
+    );
+    assert_eq!(densities(&conn), before_densities);
+    assert_eq!(associations(&conn), before_links);
+    assert_eq!(fs::read(&database).unwrap(), before_bytes);
+    EsmParser::convert_plugins(&[source, update], &database).unwrap();
+    assert_eq!(densities(&conn), [(0x801, 91), (0x802, 33)]);
     assert_eq!(associations(&conn), [(0x902, 0x802)]);
+    validate_database(&conn).unwrap();
 }

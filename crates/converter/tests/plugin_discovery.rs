@@ -454,8 +454,8 @@ async fn explicit_regular_override_beats_a_master_listed_after_it() {
     ).unwrap();
     assert_eq!(setting, (222.0, "A.esp".to_string()));
     let object: (String, String, String) = conn.query_row(
-        "SELECT s.editor_id, p.name, f.plugin_name FROM statics s JOIN records r ON r.form_id=s.id
-         JOIN plugins p ON p.priority=r.load_order JOIN formid_map f ON f.form_id=s.id WHERE f.plugin_name='skyrim.esm' AND f.internal_id=3",
+        "SELECT s.editor_id, p.name, owner.normalized_name FROM statics s JOIN records r ON r.form_id=s.id
+         JOIN plugins p ON p.priority=r.load_order JOIN formid_map f ON f.form_id=s.id JOIN pack_plugins owner ON owner.id=(f.form_id >> 24) WHERE owner.normalized_name='skyrim.esm' AND f.internal_id=3",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).unwrap();
     assert_eq!(
@@ -667,9 +667,9 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
         );
         let setting: (f64, String, String) = conn
             .query_row(
-                "SELECT g.value, p.name, f.plugin_name FROM movement_game_settings g
+                "SELECT g.value, p.name, owner.normalized_name FROM movement_game_settings g
              JOIN plugins p ON p.priority=g.load_order
-             JOIN formid_map f ON f.form_id=g.id WHERE g.editor_id='fJumpHeightMin'",
+             JOIN formid_map f ON f.form_id=g.id JOIN pack_plugins owner ON owner.id=(f.form_id >> 24) WHERE g.editor_id='fJumpHeightMin'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -686,9 +686,9 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
         ] {
             let actual: (String, u32, String, String) = conn
                 .query_row(
-                    "SELECT f.plugin_name, f.internal_id, s.editor_id, p.name FROM formid_map f
+                    "SELECT owner.normalized_name, f.internal_id, s.editor_id, p.name FROM formid_map f
                  JOIN statics s ON s.id=f.form_id JOIN records r ON r.form_id=f.form_id
-                 JOIN plugins p ON p.priority=r.load_order WHERE f.form_id=?1",
+                 JOIN plugins p ON p.priority=r.load_order JOIN pack_plugins owner ON owner.id=(f.form_id >> 24) WHERE f.form_id=?1",
                     [stored_key(&conn, owner, local).to_sql_i64()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )

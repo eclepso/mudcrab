@@ -382,7 +382,7 @@ async fn scene_action_end_keeps_root_quest_and_index_through_publication() {
         let count: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -641,7 +641,7 @@ async fn scene_without_actions_keeps_root_and_legacy_roles_through_publication()
             let count: i64 = database
                 .query_row(
                     "SELECT COUNT(*) FROM records WHERE form_id=?",
-                    [neighbor],
+                    [common::stored_key(&database, neighbor)],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -679,14 +679,9 @@ async fn convert(data: &Path, output: &Path, plugins: PathBuf) -> converter::Pip
     report
 }
 
-/// Decode the actual published canonical record bytes using the shared rkyv contract.
+/// Authenticate original canonical bytes, then interpret certified sites for runtime assertions.
 fn published(database: &Connection, id: u32) -> ArchivedRecordData {
-    let bytes: Vec<u8> = database
-        .query_row("SELECT data FROM records WHERE form_id=?", [id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap()
+    common::runtime_record(database, id)
 }
 
 /// Every family keeps its prior winner and good neighbors after bad compression and fields.
@@ -752,7 +747,7 @@ async fn broken_dialogue_mod_publishes_all_family_neighbors_and_omits_unsafe_fie
         let (load_order, payload): (i64, Vec<u8>) = database
             .query_row(
                 "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -763,7 +758,7 @@ async fn broken_dialogue_mod_publishes_all_family_neighbors_and_omits_unsafe_fie
         let count: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -894,6 +889,11 @@ async fn localized_dialogue_fields_publish_from_three_distinct_string_banks() {
         (0x0100_3a02, b"DESC", "Quest log and message description"),
         (0x0100_3a02, b"ITXT", "Ordinary display text"),
     ] {
+        assert_eq!(
+            common::native_fields(&database, id, tag),
+            vec![key.to_vec()],
+            "stored localized {id:08X} {tag:?} must retain its original string ID"
+        );
         let record = published(&database, id);
         assert_eq!(
             record

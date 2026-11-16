@@ -1,4 +1,6 @@
 //! Override history is tested through the public conversion and pack publication path.
+mod common;
+
 use converter::{AssetPipeline, PipelineConfig, config::RecordReader};
 use rusqlite::Connection;
 use std::path::Path;
@@ -210,10 +212,40 @@ async fn history_keeps_duplicate_unmappable_and_truncated_headers() {
     let output = temp.path().join("pack");
     publish(&data, &output).await;
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let duplicates: (u32,u32) = db.query_row("SELECT count(*),sum(status='skipped') FROM record_overrides WHERE form_id=6144 AND plugin_id=2", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let duplicates: (u32,u32) = db.query_row("SELECT count(*),sum(status='skipped') FROM record_overrides WHERE form_id=?1 AND plugin_id=2", [common::stored_key(&db, 6144)], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert_eq!(duplicates, (2, 1));
-    let unmappable: (Option<u32>,String) = db.query_row("SELECT form_id,status FROM record_overrides WHERE plugin_id=3 AND source_form_id=33560704", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-    assert_eq!(unmappable, (None, "skipped".into()));
+    let (stored_wide, status, source_offset): (Option<i64>, String, u64) = db.query_row("SELECT form_id,status,source_record_offset FROM record_overrides WHERE plugin_id=3 AND source_form_id=33560704", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let wide_key =
+        shared::form_key::FormKey::new(identity.table().id("Light.esp").unwrap(), 0x1880).unwrap();
+    assert_eq!(stored_wide, Some(wide_key.to_sql_i64()));
+    assert_eq!(status, "accepted");
+    assert!(
+        identity
+            .runtime_id_if_available(wide_key)
+            .unwrap()
+            .is_none()
+    );
+    converter::records::history_source::visit_native_source_history(
+        &output,
+        None,
+        converter::records::history_source::SourceQuery::Physical {
+            plugin_id: 3,
+            source_record_offset: source_offset,
+        },
+        |version| {
+            assert_eq!(
+                version.identity.state,
+                converter::records::source_identity::SourceIdentityState::MasterIndexOutOfRange
+            );
+            assert_eq!(version.identity.original_owner, None);
+            assert_eq!(version.identity.full_local, Some(0x1880));
+            assert_eq!(version.runtime_form_id, None);
+            assert!(version.runtime_record_present);
+            Ok(())
+        },
+    )
+    .unwrap();
     let truncated: String = db
         .query_row(
             "SELECT reason FROM record_overrides WHERE plugin_id=4 AND source_form_id=50338128",
@@ -224,8 +256,8 @@ async fn history_keeps_duplicate_unmappable_and_truncated_headers() {
     assert!(truncated.contains("truncated"));
     let winner: u32 = db
         .query_row(
-            "SELECT load_order FROM inhouse_source_records WHERE form_id=6144",
-            [],
+            "SELECT load_order FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 6144)],
             |r| r.get(0),
         )
         .unwrap();
@@ -284,7 +316,7 @@ async fn history_publication_keeps_every_version_and_usable_neighbors() {
         let got: u32 = db
             .query_row(
                 "SELECT count(*) FROM record_overrides WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |r| r.get(0),
             )
             .unwrap();
@@ -294,7 +326,7 @@ async fn history_publication_keeps_every_version_and_usable_neighbors() {
         let state: String = db
             .query_row(
                 "SELECT status FROM record_overrides WHERE form_id=?1 AND plugin_id=2",
-                [id],
+                [common::stored_key(&db, id)],
                 |r| r.get(0),
             )
             .unwrap();
@@ -302,7 +334,7 @@ async fn history_publication_keeps_every_version_and_usable_neighbors() {
         let winner: u32 = db
             .query_row(
                 "SELECT load_order FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |r| r.get(0),
             )
             .unwrap();
@@ -311,17 +343,17 @@ async fn history_publication_keeps_every_version_and_usable_neighbors() {
     let raw_alias: String = db
         .query_row(
             "SELECT status FROM record_overrides WHERE form_id=?1 AND source_form_id=?2",
-            [0x0200_1811u32, 0x0100_1811],
+            rusqlite::params![common::stored_key(&db, 0x0200_1811), 0x0100_1811u32],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(raw_alias, "skipped");
-    let deletes: Vec<(u32, bool)> = db.prepare("SELECT plugin_id,deleted FROM record_overrides WHERE form_id=6145 ORDER BY chain_position").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
+    let deletes: Vec<(u32, bool)> = db.prepare("SELECT plugin_id,deleted FROM record_overrides WHERE form_id=?1 ORDER BY chain_position").unwrap().query_map([common::stored_key(&db, 6145)], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
     assert_eq!(deletes, [(0, false), (2, true), (3, false)]);
     let absent: u32 = db
         .query_row(
-            "SELECT count(*) FROM inhouse_source_records WHERE form_id=6146",
-            [],
+            "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 6146)],
             |r| r.get(0),
         )
         .unwrap();
@@ -330,8 +362,8 @@ async fn history_publication_keeps_every_version_and_usable_neighbors() {
     assert_eq!(inconsistencies, 0);
     let neighbor: u32 = db
         .query_row(
-            "SELECT count(*) FROM inhouse_source_records WHERE form_id=33560688",
-            [],
+            "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 33560688)],
             |r| r.get(0),
         )
         .unwrap();

@@ -657,7 +657,7 @@ async fn damaged_perks_publish_neighbors_and_prior_winners_with_bounded_diagnost
     for id in [perks::FIRST_ID, perks::FIRST_ID + 1] {
         let (load_order,payload):(i64,Vec<u8>) = database.query_row(
             "SELECT source.load_order,source.payload FROM inhouse_source_records source JOIN records ON records.form_id=source.form_id WHERE source.form_id=?",
-            [id],|row| Ok((row.get(0)?,row.get(1)?)),
+            [common::stored_key(&database, id)],|row| Ok((row.get(0)?,row.get(1)?)),
         ).unwrap();
         assert_eq!(load_order, 0);
         assert_eq!(payload, earlier.records[&id].raw_payload);
@@ -666,7 +666,7 @@ async fn damaged_perks_publish_neighbors_and_prior_winners_with_bounded_diagnost
         let count: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -674,22 +674,18 @@ async fn damaged_perks_publish_neighbors_and_prior_winners_with_bounded_diagnost
     }
     let missing: i64 = database
         .query_row(
-            "SELECT COUNT(*) FROM records WHERE form_id=0x01002701",
-            [],
+            "SELECT COUNT(*) FROM records WHERE form_id=?1",
+            [common::stored_key(&database, 0x0100_2701)],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(missing, 0);
-    let published: Vec<u8> = database
-        .query_row(
-            "SELECT data FROM records WHERE form_id=0x01002702",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let published = common::runtime_record(&database, 0x0100_2702);
     let canonical = recovered.records[&0x0100_2702].to_raw_record();
     assert_eq!(
-        published,
+        rkyv::to_bytes::<rkyv::rancor::Error>(&published)
+            .unwrap()
+            .as_slice(),
         converter::esm::extractors::serialize_subrecords(&canonical.subrecords)
     );
     let diagnostics: serde_json::Value =

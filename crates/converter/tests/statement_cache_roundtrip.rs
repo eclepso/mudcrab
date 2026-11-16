@@ -1,11 +1,8 @@
 //! File-backed statement reuse retains NULLs, raw provenance and local recovery.
-use converter::esm::{
-    exporter::{create_tables, export_to_db},
-    extractors::serialize_subrecords,
-    records::RawRecord,
-};
+mod common;
+use converter::esm::{exporter::create_tables, extractors::serialize_subrecords};
 use rusqlite::{Connection, Result, Transaction, params};
-use std::{collections::HashMap, path::Path};
+use std::{fs, path::Path};
 
 const RECORDS: &str = "INSERT OR REPLACE INTO records(form_id, record_type, cell_id, worldspace_id, load_order, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 const SOURCE: &str = "INSERT INTO inhouse_source_records(form_id,source_form_id,load_order,record_type,flags,payload) VALUES (?1,?2,?3,?4,?5,?6)";
@@ -201,40 +198,34 @@ fn cached_constraint_failure_rolls_back_and_same_connection_can_reuse_statement(
     Ok(())
 }
 
-/// Construct records independently of the exporter projections.
-fn raw(id: u32, kind: [u8; 4], subrecords: Vec<(Vec<u8>, Vec<u8>)>) -> RawRecord {
-    RawRecord {
-        form_id: id,
-        record_type: kind,
-        flags: 0,
-        subrecords,
-        cell_form_id: None,
-        worldspace_form_id: None,
-        load_order: 0,
-    }
-}
-
 #[test]
 /// An unusable light projection preserves its raw record and valid neighboring light.
 fn actual_subset_export_keeps_malformed_light_warning_and_valid_neighbor_projection() -> Result<()>
 {
     let root = tempfile::tempdir().unwrap();
-    let conn = connection(&root.path().join("neighbors.sqlite"))?;
-    let bad = raw(1, *b"LIGH", vec![(b"EDID".to_vec(), b"bad\0".to_vec())]);
+    let bad = dummy_content::inhouse_items::record(b"LIGH", 1, &[(b"EDID", b"bad\0".to_vec())]);
     let mut data = vec![0; 20];
     data[4..8].copy_from_slice(&25u32.to_le_bytes());
     data[8..11].copy_from_slice(&[9, 10, 11]);
     data[12..16].copy_from_slice(&7u32.to_le_bytes());
     data[16..20].copy_from_slice(&0.5f32.to_le_bytes());
-    let good = raw(
+    let good = dummy_content::inhouse_items::record(
+        b"LIGH",
         2,
-        *b"LIGH",
-        vec![
-            (b"EDID".to_vec(), b"good\0".to_vec()),
-            (b"DATA".to_vec(), data),
-        ],
+        &[(b"EDID", b"good\0".to_vec()), (b"DATA", data)],
     );
-    export_to_db(&conn, &HashMap::from([(1, bad), (2, good)]))?;
+    let plugin = root.path().join("Skyrim.esm");
+    fs::write(
+        &plugin,
+        [
+            dummy_content::inhouse_items::record(b"TES4", 0, &[]),
+            bad,
+            good,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let conn = common::native_database(&[plugin]);
     assert_eq!(
         conn.query_row("SELECT count(*) FROM records", [], |r| r.get::<_, u32>(0))?,
         2
@@ -244,14 +235,18 @@ fn actual_subset_export_keeps_malformed_light_warning_and_valid_neighbor_project
         1
     );
     assert_eq!(
-        conn.query_row("SELECT radius FROM lights WHERE id=2", [], |r| r
-            .get::<_, f64>(0))?,
+        conn.query_row(
+            "SELECT radius FROM lights WHERE id=?1",
+            [common::stored_key(&conn, 2)],
+            |r| r.get::<_, f64>(0)
+        )?,
         25.0
     );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM formid_map", [], |r| r
             .get::<_, u32>(0))?,
-        0
+        2,
+        "a complete native export authenticates both owning identities"
     );
     // Root retained stderr should contain the existing missing-DATA warning for only id1.
     Ok(())

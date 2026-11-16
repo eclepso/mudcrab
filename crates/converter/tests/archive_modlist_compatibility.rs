@@ -1,4 +1,5 @@
 //! Synthetic archive compatibility and recovery through real pack publication.
+mod common;
 use converter::{AssetPipeline, PipelineConfig, cache::ConversionManifest, config::RecordReader};
 use dummy_content::{Entry, bsa, layout};
 use rusqlite::Connection;
@@ -175,7 +176,7 @@ async fn malformed_archive_keeps_valid_archive_and_native_plugin_neighbors() {
         let retained: (String, String) = db
             .query_row(
                 "SELECT editor_id, model_path FROM statics WHERE id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -186,7 +187,7 @@ async fn malformed_archive_keeps_valid_archive_and_native_plugin_neighbors() {
         let count: u32 = db
             .query_row(
                 "SELECT count(*) FROM records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();

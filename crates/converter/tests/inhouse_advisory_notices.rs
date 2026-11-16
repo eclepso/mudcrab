@@ -1,4 +1,6 @@
 //! Public publication and replay preserve the severity of independent in-house recoveries.
+mod common;
+
 use converter::{AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader};
 use rusqlite::Connection;
 use std::{fs, path::Path, process::Command};
@@ -178,12 +180,19 @@ fn cli(
 /// Read exact published identities without relying on diagnostic wording.
 fn ids(output: &Path) -> Vec<u32> {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    db.prepare("SELECT form_id FROM records ORDER BY form_id")
+    let stored = db
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
         .unwrap()
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| row.get::<_, i64>(0))
         .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let mut runtime = stored
+        .into_iter()
+        .map(|key| common::runtime_id(&db, key))
+        .collect::<Vec<_>>();
+    runtime.sort_unstable();
+    runtime
 }
 
 /// Require one bounded notice for the specified plugin and recovery kind.
@@ -226,7 +235,7 @@ fn dangling_link_only_is_complete_notice_and_cli_zero() {
         "patch.esp",
         "in-house reader cleared",
         "1 links",
-        "02000900",
+        "01000900",
     );
     assert_eq!(ids(&output), [0x810, 0x0100_0820, 0x0200_0801, 0x0200_0802]);
     completeness(&report, &output, true);
@@ -304,7 +313,7 @@ fn malformed_entry_warns_cli_one_and_preserves_healthy_neighbor_and_provenance()
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     assert!(report.warnings[0].contains("malformed strings entry for localized ID 6515"));
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    type TextProvenance = (u32, u32, Option<String>, String);
+    type TextProvenance = (i64, u32, Option<String>, String);
     let provenance: Vec<TextProvenance> = db
         .prepare("SELECT form_id,string_id,resolved_text,status FROM inhouse_localized_fields ORDER BY form_id")
         .unwrap()
@@ -315,14 +324,19 @@ fn malformed_entry_warns_cli_one_and_preserves_healthy_neighbor_and_provenance()
     assert_eq!(
         provenance,
         [
-            (0x802, 6515, None, "missing".into()),
-            (0x803, 7, Some("Existing".into()), "resolved".into()),
+            (common::stored_key(&db, 0x802), 6515, None, "missing".into()),
+            (
+                common::stored_key(&db, 0x803),
+                7,
+                Some("Existing".into()),
+                "resolved".into()
+            ),
         ]
     );
-    let source_records: Vec<(u32, u64)> = db
+    let source_records: Vec<(i64, u64)> = db
         .prepare("SELECT form_id,length(payload) FROM inhouse_source_records WHERE form_id IN (?1,?2) ORDER BY form_id")
         .unwrap()
-        .query_map([0x802u32, 0x803], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([common::stored_key(&db, 0x802), common::stored_key(&db, 0x803)], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
@@ -368,7 +382,7 @@ fn null_only_missing_bank_is_complete_but_later_reference_warns() {
         let null_status: String = db
             .query_row(
                 "SELECT status FROM inhouse_localized_fields WHERE form_id=?1",
-                [0x802u32],
+                [common::stored_key(&db, 0x802)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -414,7 +428,7 @@ fn skipped_target_keeps_warning_and_notice_and_healthy_neighbor_with_cli_one() {
         "patch.esp",
         "in-house reader cleared",
         "1 links",
-        "02000900",
+        "01000900",
     );
 }
 
@@ -475,7 +489,7 @@ async fn metadata_rebuild_and_reuse_replay_link_notice_and_complete_proof() {
         "patch.esp",
         "in-house reader cleared",
         "1 links",
-        "02000900",
+        "01000900",
     );
     completeness(&report, &output, true);
     let output = directory.path().join("cli");
@@ -491,7 +505,7 @@ async fn metadata_rebuild_and_reuse_replay_link_notice_and_complete_proof() {
         "patch.esp",
         "in-house reader cleared",
         "1 links",
-        "02000900",
+        "01000900",
     );
     completeness(&report, &output, true);
     assert_eq!(status, 0);

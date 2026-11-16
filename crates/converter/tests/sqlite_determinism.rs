@@ -1,7 +1,6 @@
 //! SQL determinism checks include every table, including SQLite shadow tables.
-use converter::esm::{exporter, records::RawRecord};
+use converter::esm::EsmParser;
 use rusqlite::Connection;
-use std::collections::HashMap;
 
 /// Quote an SQLite identifier without assuming application-owned names.
 fn identifier(name: &str) -> String {
@@ -49,53 +48,62 @@ fn logical_dump(conn: &Connection) -> Vec<String> {
     dump
 }
 
-/// Exercise fresh randomized maps, opposite insertion orders, high unsigned owner IDs,
-/// and supplier priorities that deliberately disagree with identity order.
+/// Repeated independent native merges keep exact bytes and all tables deterministic.
+/// Genuine full/light source priorities deliberately differ from pack allocation order.
 #[test]
 fn cell_exports_have_identical_bytes_and_all_table_rows() {
     let temp = tempfile::tempdir().unwrap();
-    let order = converter::esm::load_order::LoadOrder::from_metadata(
-        vec![
-            "Z.esm".into(),
-            "First.esl".into(),
-            "A.esm".into(),
-            "Last.esl".into(),
-        ],
-        vec![converter::esm::binary::PluginMetadata::default(); 4],
-    )
-    .unwrap();
+    let names = ["Z.esm", "First.esl", "A.esm", "Last.esl"];
+    let paths = names.map(|name| temp.path().join(name));
+    for (supplier, path) in paths.iter().enumerate() {
+        let mut bytes = dummy_content::inhouse_items::record(b"TES4", 0, &[]);
+        if names[supplier].ends_with(".esl") {
+            bytes[8..12].copy_from_slice(&0x200u32.to_le_bytes());
+        }
+        for index in (supplier as u32..256).step_by(4) {
+            bytes.extend(dummy_content::inhouse_items::record(
+                b"CELL",
+                0x800 + index,
+                &[(b"FULL", format!("Cell {index}\0").into_bytes())],
+            ));
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
     let mut baseline = None;
     for pass in 0..12 {
         let path = temp.path().join(format!("{pass}.db"));
+        // Each public conversion constructs independent native winner/projection maps;
+        // source bytes and physical provenance remain identical on all twelve runs.
+        EsmParser::convert_plugins(&paths, &path).unwrap();
         let conn = Connection::open(&path).unwrap();
-        exporter::create_tables(&conn).unwrap();
-        let mut records = HashMap::new();
-        for index in 0..256u32 {
-            let index = if pass % 2 == 0 { index } else { 255 - index };
-            let id = if index % 2 == 0 {
-                0xfe001000 + index
-            } else {
-                index
-            };
-            records.insert(
-                id,
-                RawRecord {
-                    form_id: id,
-                    record_type: *b"CELL",
-                    flags: 0,
-                    subrecords: vec![(b"FULL".to_vec(), format!("Cell {index}\0").into_bytes())],
-                    cell_form_id: None,
-                    worldspace_form_id: None,
-                    load_order: 255 - index,
-                },
-            );
-        }
-        exporter::export_to_db_with_load_order(&conn, &records, &order).unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+        shared::records::RecordContextReader::new(&conn).unwrap();
+        let priorities = identity
+            .order()
+            .iter()
+            .map(|id| identity.table().entry(*id).unwrap().display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(priorities, names);
+        assert_ne!(identity.order()[0], identity.table().entries()[0].id);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM records", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            256
+        );
+        let light =
+            shared::form_key::FormKey::new(identity.table().id("First.esl").unwrap(), 0x801)
+                .unwrap();
+        assert_eq!(
+            identity.runtime_id(light).unwrap(),
+            0xfe00_0801,
+            "unsigned gameplay handles remain checked views, never stored SQL identities"
+        );
         let logical = logical_dump(&conn);
         drop(conn);
         let current = (std::fs::read(path).unwrap(), logical);
         if let Some(expected) = &baseline {
-            assert_eq!(&current, expected, "randomized export {pass}");
+            assert_eq!(&current, expected, "independent native export {pass}");
         } else {
             baseline = Some(current);
         }

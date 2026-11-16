@@ -161,8 +161,8 @@ async fn metadata_rebuild_skips_unproven_derived_outputs_and_strays_locally() {
     let connection = Connection::open(output.join("skyrim_world.db")).unwrap();
     let count: u64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM \"references\" WHERE id=4660",
-            [],
+            "SELECT COUNT(*) FROM \"references\" WHERE id=?1",
+            [common::stored_key(&connection, 0x1234)],
             |row| row.get(0),
         )
         .unwrap();
@@ -747,7 +747,10 @@ async fn native_pre_producer_28_configuration_is_rejected_not_relabeled() {
     fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
     let error = rebuild(&data, &source, &output).await.unwrap_err();
     assert!(
-        format!("{error:?}").contains("predate the current texture layout"),
+        format!("{error:?}").contains(&format!(
+            "converted assets use converter schema 16; convert again with converter schema {}",
+            converter::cache::CONVERTER_SCHEMA_VERSION
+        )),
         "{error:?}"
     );
     assert!(!output.exists());
@@ -799,11 +802,14 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
         manifest.save(&path).unwrap();
         let error = rebuild(&data, &source, &output).await.unwrap_err();
         let expected = if retained {
-            "retained producer configuration does not match rebuild settings"
+            "retained producer configuration does not match rebuild settings".to_owned()
         } else {
-            "predate the current texture layout"
+            format!(
+                "converted assets use converter schema 16; convert again with converter schema {}",
+                converter::cache::CONVERTER_SCHEMA_VERSION
+            )
         };
-        assert!(format!("{error:?}").contains(expected), "{error:?}");
+        assert!(format!("{error:?}").contains(&expected), "{error:?}");
         assert!(!output.exists());
     }
 }
@@ -845,11 +851,11 @@ async fn metadata_rebuild_reuses_bytes_and_recovers_authoritative_flags() {
         }
     }
     let connection = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let flags: (u32, u32, u32) = connection.query_row(
+    let flags: (u32, i64, u32) = connection.query_row(
         "SELECT header_flags, enable_parent_id, enable_parent_flags FROM \"references\" WHERE header_flags=2048", [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).unwrap();
-    assert_eq!(flags, (0x800, 0x1234, 1));
+    assert_eq!(flags, (0x800, common::stored_key(&connection, 0x1234), 1));
     let version: u32 = connection
         .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
         .unwrap();
@@ -1127,8 +1133,8 @@ async fn metadata_rebuild_resolves_current_packed_settings_and_omits_stale_paylo
     let connection = Connection::open(output.join("skyrim_world.db")).unwrap();
     let origin: (i32, i32) = connection
         .query_row(
-            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=1",
-            [],
+            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=?1",
+            [common::stored_key(&connection, 1)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -1212,8 +1218,8 @@ async fn metadata_rebuild_excludes_recovered_longer_archive_owner() {
         assert_eq!(names, ["Skyrim.esm"]);
         let origin: (i32, i32) = connection
             .query_row(
-                "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=1",
-                [],
+                "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=?1",
+                [common::stored_key(&connection, 1)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1241,8 +1247,8 @@ async fn metadata_rebuild_excludes_recovered_longer_archive_owner() {
     assert_eq!(version, shared::WORLD_DATABASE_SCHEMA_VERSION);
     let origin: (i32, i32) = connection
         .query_row(
-            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=1",
-            [],
+            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=?1",
+            [common::stored_key(&connection, 1)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -1596,7 +1602,7 @@ async fn v91_metadata_rebuild_rejects_ambiguous_lod_and_lighting_producers() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("predate the current texture layout"),
+            error.contains(&format!("converted assets use converter schema {schema}; convert again with converter schema {}", converter::cache::CONVERTER_SCHEMA_VERSION)),
             "{error}"
         );
         assert!(!output.exists());

@@ -275,7 +275,9 @@ fn assert_absent(db: &Connection, id: u32) {
         "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
         "SELECT count(*) FROM statics WHERE id=?1",
     ] {
-        let count: u32 = db.query_row(sql, [id], |row| row.get(0)).unwrap();
+        let count: u32 = db
+            .query_row(sql, [common::stored_key(db, id)], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0, "unusable/deleted {id:08X} survived: {sql}");
     }
 }
@@ -285,7 +287,7 @@ fn assert_winner(db: &Connection, id: u32, supplier: u32, payload: &[u8]) {
     let native: (u32, Vec<u8>) = db
         .query_row(
             "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=?1",
-            [id],
+            [common::stored_key(db, id)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -293,7 +295,7 @@ fn assert_winner(db: &Connection, id: u32, supplier: u32, payload: &[u8]) {
     let canonical_supplier: u32 = db
         .query_row(
             "SELECT load_order FROM records WHERE form_id=?1",
-            [id],
+            [common::stored_key(db, id)],
             |row| row.get(0),
         )
         .unwrap();
@@ -305,7 +307,7 @@ fn assert_skipped(db: &Connection, id: u32, supplier: u32, reason_fragment: &str
     let (status, reason): (String, Option<String>) = db
         .query_row(
             "SELECT status,reason FROM record_overrides WHERE form_id=?1 AND plugin_id=?2",
-            [id, supplier],
+            rusqlite::params![common::stored_key(db, id), supplier],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -327,7 +329,7 @@ fn assert_deletions(case: &DeletionCase, output: &Path) {
         let history: Vec<(u32, bool, String, Option<String>)> = db
             .prepare("SELECT plugin_id,deleted,status,reason FROM record_overrides WHERE form_id=?1 ORDER BY chain_position")
             .unwrap()
-            .query_map([deletion.runtime_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .query_map([common::stored_key(&db, deletion.runtime_id)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -656,7 +658,7 @@ fn assert_terrain(case: &TerrainCase, output: &Path) {
     let heightmap: Vec<u8> = db
         .query_row(
             "SELECT heightmap FROM land WHERE cell_id=?1",
-            [0xB00u32],
+            [common::stored_key(&db, 0xB00)],
             |row| row.get(0),
         )
         .unwrap();
@@ -664,12 +666,21 @@ fn assert_terrain(case: &TerrainCase, output: &Path) {
     let (supplier, layer_data): (u32, Vec<u8>) = db
         .query_row(
             "SELECT load_order,layer_data FROM inhouse_terrain_layers WHERE form_id=?1",
-            [0xB01u32],
+            [common::stored_key(&db, 0xB01)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(supplier, 0);
-    let layers = rkyv::from_bytes::<Vec<TerrainLayer>, rkyv::rancor::Error>(&layer_data).unwrap();
+    let mut layers =
+        rkyv::from_bytes::<Vec<TerrainLayer>, rkyv::rancor::Error>(&layer_data).unwrap();
+    for layer in &mut layers {
+        if layer.texture_form_id != 0 {
+            layer.texture_form_id = u64::from(common::runtime_id(
+                &db,
+                i64::try_from(layer.texture_form_id).unwrap(),
+            ));
+        }
+    }
     assert_layers(&layers);
     if case.rejected_signature == "VTXT" {
         assert_winner(&db, 0xB11, 0, &case.baseline);

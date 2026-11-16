@@ -370,7 +370,7 @@ async fn broken_magic_mod_publishes_usable_neighbors_and_bounded_diagnostics() {
         let count: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -378,8 +378,8 @@ async fn broken_magic_mod_publishes_usable_neighbors_and_bounded_diagnostics() {
     }
     let rejected: i64 = database
         .query_row(
-            "SELECT COUNT(*) FROM records WHERE form_id=0x19B0",
-            [],
+            "SELECT COUNT(*) FROM records WHERE form_id=?1",
+            [common::stored_key(&database, 0x19B0)],
             |row| row.get(0),
         )
         .unwrap();
@@ -475,7 +475,7 @@ async fn all_magic_families_publish_prior_winners_and_neighbors_after_bad_compre
         let (load_order, payload): (i64, Vec<u8>) = database
             .query_row(
                 "SELECT source.load_order,source.payload FROM inhouse_source_records source JOIN records ON records.form_id=source.form_id WHERE source.form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -486,7 +486,7 @@ async fn all_magic_families_publish_prior_winners_and_neighbors_after_bad_compre
         let count: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| row.get(0),
             )
             .unwrap();

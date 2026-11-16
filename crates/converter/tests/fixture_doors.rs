@@ -1,5 +1,6 @@
 //! The generated interior cell and its reciprocal load door pair, through the
 //! real ESM parser and the database export.
+mod common;
 
 use converter::esm::{
     binary::{parse_group, parse_plugin_file, parse_record_header},
@@ -34,6 +35,69 @@ fn preset_plugin() -> Vec<u8> {
 fn write_plugin(directory: &Path) -> std::path::PathBuf {
     let path = directory.join("Skyrim.esm");
     fs::write(&path, preset_plugin()).unwrap();
+    path
+}
+
+/// Author one ordinary override with original CELL/WRLD group labels and a real MAST.
+fn write_door_override(directory: &Path, source: &RawRecord) -> std::path::PathBuf {
+    let field = |tag: &[u8; 4], bytes: &[u8]| {
+        [tag.as_slice(), &(bytes.len() as u16).to_le_bytes(), bytes].concat()
+    };
+    let record = |tag: &[u8; 4], id: u32, flags: u32, bytes: &[u8]| {
+        [
+            tag.as_slice(),
+            &(bytes.len() as u32).to_le_bytes(),
+            &flags.to_le_bytes(),
+            &id.to_le_bytes(),
+            &[0; 4],
+            &44u16.to_le_bytes(),
+            &[0; 2],
+            bytes,
+        ]
+        .concat()
+    };
+    let group = |kind: u32, label: u32, bytes: &[u8]| {
+        [
+            b"GRUP".as_slice(),
+            &((bytes.len() + 24) as u32).to_le_bytes(),
+            &label.to_le_bytes(),
+            &kind.to_le_bytes(),
+            &[0; 8],
+            bytes,
+        ]
+        .concat()
+    };
+    let header = [
+        field(
+            b"HEDR",
+            &[
+                1.7f32.to_le_bytes(),
+                1u32.to_le_bytes(),
+                0x800u32.to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        field(b"MAST", b"Skyrim.esm\0"),
+        field(b"DATA", &[0; 8]),
+    ]
+    .concat();
+    let payload = converter::esm::extractors::serialize_subrecords(&source.subrecords);
+    let native = record(&source.record_type, source.form_id, source.flags, &payload);
+    let cell = source
+        .cell_form_id
+        .expect("door belongs to an authored CELL");
+    let children = group(6, cell, &group(9, cell, &native));
+    let body = if let Some(world) = source.worldspace_form_id {
+        group(0, u32::from_le_bytes(*b"WRLD"), &group(1, world, &children))
+    } else {
+        group(
+            0,
+            u32::from_le_bytes(*b"CELL"),
+            &group(2, 0, &group(3, 0, &children)),
+        )
+    };
+    let path = directory.join("DoorOverride.esp");
+    fs::write(&path, [record(b"TES4", 0, 0, &header), body].concat()).unwrap();
     path
 }
 
@@ -226,8 +290,8 @@ fn real_plugin_export_projects_reciprocal_door_arrivals() {
     let plugin = write_plugin(directory.path());
     let database = directory.path().join("world.db");
     converter::esm::EsmParser::convert_plugins(&[plugin], &database).unwrap();
-    let conn = rusqlite::Connection::open(database).unwrap();
-    let links: Vec<(u32, u32, f32, f32, f32, Option<u32>)> = conn
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let links: Vec<(i64, i64, f32, f32, f32, Option<i64>)> = conn
         .prepare("SELECT ref_id,destination_ref_id,pos_x,pos_y,pos_z,destination_worldspace_id FROM door_links ORDER BY ref_id")
         .unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))
         .unwrap().map(Result::unwrap).collect();
@@ -250,24 +314,39 @@ fn real_plugin_export_projects_reciprocal_door_arrivals() {
     assert_eq!(converter::esm::doors::rebuild_door_links(&conn).unwrap(), 2);
 
     // The winning override removes XTEL: an older link must not survive.
+    let interior_runtime = common::runtime_id(&conn, interior.0);
+    let exterior_runtime = common::runtime_id(&conn, exterior.0);
     let mut records =
         converter::esm::binary::parse_plugin_file(&write_plugin(directory.path())).unwrap();
     let source = records
         .iter_mut()
-        .find(|r| r.form_id == interior.0)
+        .find(|r| r.form_id == interior_runtime)
         .unwrap();
     source.subrecords.retain(|(tag, _)| tag != b"XTEL");
-    let blob = converter::esm::extractors::serialize_subrecords(&source.subrecords);
-    conn.execute(
-        "UPDATE records SET data=?1 WHERE form_id=?2",
-        rusqlite::params![blob, source.form_id],
+    // Publish a genuine master-relative override, so payload and context change together.
+    let override_path = write_door_override(directory.path(), source);
+    drop(conn);
+    converter::esm::EsmParser::convert_plugins(
+        &[write_plugin(directory.path()), override_path],
+        &database,
     )
     .unwrap();
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let interior_key = common::stored_key(&conn, interior_runtime);
+    let exterior_key = common::stored_key(&conn, exterior_runtime);
+    let reader = shared::records::RecordContextReader::new(&conn).unwrap();
+    assert!(
+        reader
+            .record(reader.identity().required_key(interior_key).unwrap())
+            .unwrap()
+            .bytes(*b"XTEL")
+            .is_none()
+    );
     assert_eq!(converter::esm::doors::rebuild_door_links(&conn).unwrap(), 1);
     assert_eq!(
         conn.query_row(
             "SELECT count(*) FROM door_links WHERE ref_id=?1",
-            [interior.0],
+            [interior_key],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -277,7 +356,7 @@ fn real_plugin_export_projects_reciprocal_door_arrivals() {
     // A corrupt canonical archive must not erase the previous valid projection.
     conn.execute(
         "UPDATE records SET data=x'00' WHERE form_id=?1",
-        [exterior.0],
+        [exterior_key],
     )
     .unwrap();
     assert!(converter::esm::doors::rebuild_door_links(&conn).is_err());
@@ -291,7 +370,7 @@ fn real_plugin_export_projects_reciprocal_door_arrivals() {
 
 /// One `door_links` row: reference, destination reference, arrival frame bits, destination cell,
 /// destination worldspace and name.
-type DoorLinkRow = (u32, u32, [u32; 6], u32, Option<u32>, Option<String>);
+type DoorLinkRow = (i64, i64, [u32; 6], i64, Option<i64>, Option<String>);
 
 /// Both record readers publish the same `door_links` through the real conversion command.
 #[test]

@@ -1,4 +1,5 @@
 //! MO2 selection through the real converter, including cache and resume boundaries.
+mod common;
 use converter::{
     AssetPipeline, PipelineConfig, cache::configuration_hash, esm::exporter::validate_database,
     pipeline::Cancellation,
@@ -219,20 +220,14 @@ fn assert_publication(config: &PipelineConfig, expected: &[&str], jump_height: f
 fn published_settings(config: &PipelineConfig) -> Vec<(String, f32, u32)> {
     let conn = Connection::open(config.output_dir.join("skyrim_world.db")).unwrap();
     let mut query = conn
-        .prepare("SELECT data, load_order FROM records WHERE record_type='GMST'")
+        .prepare("SELECT form_id, load_order FROM records WHERE record_type='GMST'")
         .unwrap();
     query
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u32>(1)?))
-        })
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?)))
         .unwrap()
         .map(|row| {
-            let (blob, priority) = row.unwrap();
-            let data = rkyv::from_bytes::<
-                converter::esm::types::ArchivedRecordData,
-                rkyv::rancor::Error,
-            >(&blob)
-            .unwrap();
+            let (key, priority) = row.unwrap();
+            let data = common::runtime_record(&conn, common::runtime_id(&conn, key));
             let editor = &data
                 .subrecords
                 .iter()
@@ -707,16 +702,7 @@ async fn inhouse_mo2_localized_banks_follow_loose_winners_and_preserve_neighbors
         ),
         (0x0300_0900, "Winning high name €", ""),
     ] {
-        let bytes: Vec<u8> = conn
-            .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let runtime = rkyv::from_bytes::<
-            converter::esm::types::ArchivedRecordData,
-            rkyv::rancor::Error,
-        >(&bytes)
-        .unwrap();
+        let runtime = common::runtime_record(&conn, id);
         for (tag, text) in [(b"FULL", expected_full), (b"DESC", expected_description)] {
             let value = runtime
                 .subrecords
@@ -730,7 +716,7 @@ async fn inhouse_mo2_localized_banks_follow_loose_winners_and_preserve_neighbors
         let count: u32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&conn, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -747,7 +733,7 @@ async fn inhouse_mo2_localized_banks_follow_loose_winners_and_preserve_neighbors
     let source: Vec<u8> = conn
         .query_row(
             "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
-            [0x0200_0900u32],
+            [common::stored_key(&conn, 0x0200_0900)],
             |row| row.get(0),
         )
         .unwrap();

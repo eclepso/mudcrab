@@ -1,4 +1,5 @@
 //! MO2 archive ownership recovery through synthetic DDS conversion, cache reuse and publication.
+mod common;
 
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport, TextureEncoder,
@@ -365,6 +366,7 @@ async fn resume_drops_rejected_mo2_owner_from_warm_archive_cache() {
     .unwrap();
     plugin(&fixture.broken_plugin, "Missing.esm", false);
     let mut config = fixture.config();
+    common::current_staging_generation(&staging);
     config.resume_staging = Some(staging.clone());
     let report = publish(config).await;
     // Good.bsa restores two DDS entries; only the unchanged neighbor KTX2 can reuse an asset hit.

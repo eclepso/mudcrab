@@ -649,9 +649,11 @@ async fn malformed_script_fields_publish_neighbors_and_preserve_source_bytes() {
     let db = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for id in 0x01004300u32..=0x01004303 {
         let blob: Vec<u8> = db
-            .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT data FROM records WHERE form_id=?1",
+                [common::stored_key(&db, id)],
+                |row| row.get(0),
+            )
             .unwrap();
         let canonical = rkyv::from_bytes::<
             converter::esm::types::ArchivedRecordData,
@@ -687,7 +689,7 @@ async fn malformed_script_fields_publish_neighbors_and_preserve_source_bytes() {
         let properties = db
             .prepare("SELECT property_index,property_type,value_count FROM script_properties WHERE form_id=?1 AND script_name='NoneScript' ORDER BY property_index")
             .unwrap()
-            .query_map([id], |row| Ok((row.get::<_, u32>(0)?,row.get::<_, u8>(1)?,row.get::<_, u32>(2)?)))
+            .query_map([common::stored_key(&db, id)], |row| Ok((row.get::<_, u32>(0)?,row.get::<_, u8>(1)?,row.get::<_, u32>(2)?)))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
@@ -695,7 +697,7 @@ async fn malformed_script_fields_publish_neighbors_and_preserve_source_bytes() {
         let value: i32 = db
             .query_row(
                 "SELECT integer_value FROM script_property_values WHERE form_id=?1 AND script_name='NoneScript' AND property_index=1 AND value_index=0",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -704,7 +706,7 @@ async fn malformed_script_fields_publish_neighbors_and_preserve_source_bytes() {
     let source: Vec<u8> = db
         .query_row(
             "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
-            [0x01004301u32],
+            [common::stored_key(&db, 0x01004301)],
             |row| row.get(0),
         )
         .unwrap();

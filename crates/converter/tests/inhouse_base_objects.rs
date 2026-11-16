@@ -496,9 +496,29 @@ async fn asymmetric_base_overrides_and_malformed_neighbors_publish_exact_bytes()
     for (id, canonical, source, priority) in expected_records {
         let (published,raw,load_order):(Vec<u8>,Vec<u8>,u32) = database.query_row(
             "SELECT records.data,source.payload,source.load_order FROM records JOIN inhouse_source_records source ON source.form_id=records.form_id WHERE records.form_id=?",
-            [id],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            [common::stored_key(&database, id)],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         ).unwrap();
-        assert_eq!(published, canonical, "lost canonical neighbor {id:08X}");
+        let stored = rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(
+            &published,
+        )
+        .unwrap();
+        let reader = shared::records::RecordContextReader::new(&database).unwrap();
+        let key = reader.identity().runtime_key(id).unwrap().unwrap();
+        assert_eq!(
+            stored.subrecords,
+            reader.record(key).unwrap().subrecords,
+            "canonical bytes and context must agree"
+        );
+        let expected =
+            rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(
+                &canonical,
+            )
+            .unwrap();
+        assert_eq!(
+            common::runtime_record(&database, id),
+            expected,
+            "lost runtime neighbor {id:08X}"
+        );
         assert_eq!(raw, source, "source witness changed {id:08X}");
         assert_eq!(load_order, priority);
     }

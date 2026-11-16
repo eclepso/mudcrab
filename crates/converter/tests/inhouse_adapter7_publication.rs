@@ -1,7 +1,8 @@
 //! Master-index compatibility retains source bytes and valid neighboring records
 //! through the established records-only publication API.
+mod common;
 
-use converter::esm::{inhouse, types::ArchivedRecordData};
+use converter::esm::inhouse;
 use rusqlite::Connection;
 use std::fs;
 
@@ -99,7 +100,7 @@ fn required_header_compatibility_publishes_with_optional_link_and_broken_neighbo
         let payload: Vec<u8> = db
             .query_row(
                 "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -108,14 +109,7 @@ fn required_header_compatibility_publishes_with_optional_link_and_broken_neighbo
             "original source bytes changed for {id:08X}"
         );
     }
-    let canonical: Vec<u8> = db
-        .query_row(
-            "SELECT data FROM records WHERE form_id=?1",
-            [0x0100_0711u32],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let archived = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&canonical).unwrap();
+    let archived = common::runtime_record(&db, 0x0100_0711);
     let dnam = archived
         .subrecords
         .iter()
@@ -128,7 +122,7 @@ fn required_header_compatibility_publishes_with_optional_link_and_broken_neighbo
     let rejected: u32 = db
         .query_row(
             "SELECT count(*) FROM records WHERE form_id=?1",
-            [0x0100_0713u32],
+            [common::stored_key(&db, 0x0100_0713)],
             |r| r.get(0),
         )
         .unwrap();

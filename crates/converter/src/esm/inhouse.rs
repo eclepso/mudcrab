@@ -1010,7 +1010,7 @@ pub(crate) fn test_runtime_records(
             let fields = test_runtime_record(connection, runtime)?
                 .subrecords
                 .into_iter()
-                .map(|field| (field.tag, field.data))
+                .map(|field| (field.tag.to_vec(), field.data))
                 .collect();
             Ok((
                 runtime,

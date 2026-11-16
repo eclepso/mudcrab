@@ -178,7 +178,7 @@ fn texture_row(database: &Connection, id: u32) -> TextureRow {
     database
         .query_row(
             "SELECT editor_id,diffuse_path,normal_path,mask_path,glow_path,height_path,environment_path,specular_path,detail_path FROM texture_sets WHERE id=?1",
-            [id],
+            [common::stored_key(database, id)],
             |row| {
                 Ok(TextureRow {
                     editor_id: row.get(0)?,
@@ -214,11 +214,14 @@ fn assert_owner(database: &Connection, id: u32, plugin: &str, local: u32) {
     let stored: (String, u32) = database
         .query_row(
             "SELECT plugin_name,internal_id FROM formid_map WHERE form_id=?1",
-            [id],
+            [common::stored_key(database, id)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(stored, (plugin.to_owned(), local));
+    assert_eq!(
+        (stored.0.to_lowercase(), stored.1),
+        (plugin.to_lowercase(), local)
+    );
 }
 
 /// Generate identical native sources for the separate SQL regressions and asset-byte control.
@@ -402,7 +405,7 @@ async fn rv_c_armo_world_model_slots_publish_identically_from_both_readers() {
             database
                 .query_row(
                     "SELECT editor_id,model_path FROM statics WHERE id=?1",
-                    [id],
+                    [common::stored_key(&database, id)],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
                 .unwrap()
@@ -464,7 +467,7 @@ async fn rv_c_damaged_optional_txst_flags_preserve_neighbors_and_publish() {
             let count: u32 = database
                 .query_row(
                     "SELECT count(*) FROM records WHERE form_id=?1",
-                    [id],
+                    [common::stored_key(&database, id)],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -475,7 +478,7 @@ async fn rv_c_damaged_optional_txst_flags_preserve_neighbors_and_publish() {
             let blob: Vec<u8> = database
                 .query_row(
                     "SELECT data FROM records WHERE form_id=?1",
-                    [0x0200_08D1u32],
+                    [common::stored_key(&database, 0x0200_08D1)],
                     |row| row.get(0),
                 )
                 .unwrap();

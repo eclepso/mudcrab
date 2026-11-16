@@ -246,11 +246,7 @@ fn generated_nif_static_shape_converts_to_glb() {
 
 #[test]
 fn generated_esm_plugin_exports_world_database() {
-    use converter::esm::{
-        EsmParser,
-        cell_cache::{validate_cell_cache, write_cell_cache},
-        exporter::validate_database,
-    };
+    use converter::esm::{EsmParser, cell_cache::validate_cell_cache, exporter::validate_database};
 
     let directory = tempfile::tempdir().unwrap();
     let plugin_path = directory.path().join("Skyrim.esm");
@@ -304,9 +300,16 @@ fn generated_esm_plugin_exports_world_database() {
         assert_eq!(count, expected, "unexpected row count for {table}");
     }
 
-    let merged = EsmParser::merge_plugins(std::slice::from_ref(&plugin_path)).unwrap();
+    let merged = EsmParser::merge_plugins_form_keys(std::slice::from_ref(&plugin_path)).unwrap();
     let cache_path = directory.path().join("cell_cache.rkyv");
-    let cached_cells = write_cell_cache(&merged, &cache_path).unwrap();
+    let cached_cells = converter::esm::cell_cache::write_form_key_cell_cache(
+        &merged,
+        &Default::default(),
+        &cache_path,
+        false,
+    )
+    .unwrap()
+    .0;
     assert_eq!(cached_cells, 4);
     validate_cell_cache(&cache_path).unwrap();
 }

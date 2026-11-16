@@ -2,6 +2,7 @@
 //!
 //! Every fixture is synthesized by `dummy-content`; the retail tests read a local
 //! Skyrim install and are opt-in.
+mod common;
 
 use converter::actor_models::{ActorModelCatalog, UnresolvedReason, resolve_actor_models};
 use converter::esm::{
@@ -560,8 +561,8 @@ fn missing_race_is_recorded_not_dropped() {
     assert_eq!(rows, 2, "both unresolved bases are recorded");
     let resolution: String = connection
         .query_row(
-            "SELECT resolution FROM actor_models WHERE id=0x100",
-            [],
+            "SELECT resolution FROM actor_models WHERE id=?1",
+            [common::stored_key(&connection, 0x100)],
             |row| row.get(0),
         )
         .unwrap();
@@ -731,9 +732,9 @@ type ModelRow = (
 );
 type PartRow = (i64, String, String);
 
-/// Every published `actor_models` and `actor_model_parts` row, in key order.
+/// Every published native row, exposed as checked fixture handles in supplier order.
 fn actor_rows(connection: &Connection) -> (Vec<ModelRow>, Vec<PartRow>) {
-    let models: Vec<ModelRow> = connection
+    let mut models: Vec<ModelRow> = connection
         .prepare(
             "SELECT id, race_id, sex, skin_armo_id, head_model, head_source, resolution FROM actor_models ORDER BY id",
         )
@@ -752,13 +753,27 @@ fn actor_rows(connection: &Connection) -> (Vec<ModelRow>, Vec<PartRow>) {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    let parts: Vec<PartRow> = connection
+    let mut parts: Vec<PartRow> = connection
         .prepare("SELECT npc_id, slot, model_path FROM actor_model_parts ORDER BY npc_id, slot")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
+    for row in &mut models {
+        row.0 = i64::from(common::runtime_id(connection, row.0));
+        if row.1 != 0 {
+            row.1 = i64::from(common::runtime_id(connection, row.1));
+        }
+        row.3 = row
+            .3
+            .map(|key| i64::from(common::runtime_id(connection, key)));
+    }
+    for row in &mut parts {
+        row.0 = i64::from(common::runtime_id(connection, row.0));
+    }
+    models.sort();
+    parts.sort();
     (models, parts)
 }
 
@@ -1169,7 +1184,7 @@ fn stored_skin_tone(connection: &Connection, id: u32) -> [Option<f64>; 3] {
     connection
         .query_row(
             "SELECT skin_tone_r, skin_tone_g, skin_tone_b FROM actor_models WHERE id=?1",
-            [id],
+            [common::stored_key(connection, id)],
             |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]),
         )
         .unwrap()
@@ -1284,9 +1299,11 @@ fn traits_enabled_source_does_not_inherit_qnam_from_child_or_root() {
 /// The `actor_models.weight` of `id`.
 fn stored_weight(connection: &Connection, id: u32) -> Option<f64> {
     connection
-        .query_row("SELECT weight FROM actor_models WHERE id=?1", [id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT weight FROM actor_models WHERE id=?1",
+            [common::stored_key(connection, id)],
+            |row| row.get(0),
+        )
         .unwrap()
 }
 
@@ -1492,7 +1509,7 @@ fn parts_carry_the_armature_race_and_the_sex_skin_texture_set() {
     );
 
     let connection = export(directory.path(), &path);
-    let stored: Vec<(u32, String, u32, Option<u32>)> = connection
+    let mut stored: Vec<(i64, String, i64, Option<i64>)> = connection
         .prepare(
             "SELECT npc_id, slot, armature_race_id, skin_texture_set_id FROM actor_model_parts \
              ORDER BY npc_id, slot",
@@ -1504,9 +1521,23 @@ fn parts_carry_the_armature_race_and_the_sex_skin_texture_set() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    let expected: Vec<(u32, String, u32, Option<u32>)> = parts
+    for row in &mut stored {
+        row.0 = i64::from(common::runtime_id(&connection, row.0));
+        row.2 = i64::from(common::runtime_id(&connection, row.2));
+        row.3 = row
+            .3
+            .map(|key| i64::from(common::runtime_id(&connection, key)));
+    }
+    let expected: Vec<(i64, String, i64, Option<i64>)> = parts
         .iter()
-        .map(|(npc, slot, race, set)| (*npc, (*slot).to_owned(), *race, *set))
+        .map(|(npc, slot, race, set)| {
+            (
+                i64::from(*npc),
+                (*slot).to_owned(),
+                i64::from(*race),
+                set.map(i64::from),
+            )
+        })
         .collect();
     assert_eq!(stored, expected);
 }
@@ -1543,6 +1574,11 @@ fn the_default_body_takes_the_default_race_armature_skin_texture_sets() {
     );
     assert_eq!(male[0].kind, converter::compose::BodyPartKind::Hands);
     assert_eq!(male[0].model_path, MALE_HANDS);
+    let native = Connection::open(&database).unwrap();
+    assert_eq!(
+        male[0].textures.form_id,
+        u64::try_from(common::stored_key(&native, 0x502)).unwrap()
+    );
     let slots: Vec<Option<&str>> = male[0]
         .textures
         .slots
@@ -1839,8 +1875,8 @@ fn creature_whole_skin_in_retail_head_slot_becomes_its_body() {
         let db = export(directory.path(), &path);
         assert_eq!(
             db.query_row(
-                "SELECT model_path FROM actor_model_parts WHERE npc_id=256 AND slot='body'",
-                [],
+                "SELECT model_path FROM actor_model_parts WHERE npc_id=?1 AND slot='body'",
+                [common::stored_key(&db, 0x100)],
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),

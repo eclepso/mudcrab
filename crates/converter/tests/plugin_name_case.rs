@@ -1,4 +1,5 @@
 //! Case-paired Windows-1252 plugin names use one namespace across selection and replay.
+mod common;
 use converter::{
     esm::{EsmParser, load_order::LoadOrder, read_plugins_txt_with_options},
     records::history_source::{SourceQuery, visit_source_history},
@@ -130,9 +131,10 @@ fn player_selection_master_remap_and_stable_owner_agree_on_case_pairs() {
     let linked: u32 = db
         .query_row(
             "SELECT base_form_id FROM \"references\" WHERE id=?1",
-            [0x0200_1801u32],
-            |row| row.get(0),
+            [common::stored_key(&db, 0x0200_1801)],
+            |row| row.get::<_, i64>(0),
         )
+        .map(|key| common::runtime_id(&db, key))
         .unwrap();
     assert_eq!(linked, 0x0100_1800);
     drop(db);

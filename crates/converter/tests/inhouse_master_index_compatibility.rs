@@ -1,4 +1,5 @@
 //! Complete exports separate runtime compatibility from strict original provenance.
+mod common;
 
 use converter::esm::load_order::LoadOrder;
 use converter::records::source_identity::SourceIdentityState;
@@ -77,16 +78,18 @@ fn database(output: &Path) -> Connection {
 fn source_body(db: &Connection, id: u32) -> Vec<u8> {
     db.query_row(
         "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
-        [id],
+        [common::stored_key(db, id)],
         |r| r.get(0),
     )
     .unwrap()
 }
 
 fn runtime_count(db: &Connection, id: u32) -> u32 {
-    db.query_row("SELECT count(*) FROM records WHERE form_id=?1", [id], |r| {
-        r.get(0)
-    })
+    db.query_row(
+        "SELECT count(*) FROM records WHERE form_id=?1",
+        [common::stored_key(db, id)],
+        |r| r.get(0),
+    )
     .unwrap()
 }
 
@@ -115,10 +118,16 @@ fn unknown_source(
     payload: &[u8],
 ) {
     let db = database(output);
-    let (runtime, offset, owner, local, state, actual_status): (Option<u32>, u64, Option<String>, Option<u32>, String, String) = db.query_row(
+    let (stored, offset, owner, local, state, actual_status): (Option<i64>, u64, Option<String>, Option<u32>, String, String) = db.query_row(
         "SELECT form_id,source_record_offset,original_owner,full_local,source_identity_state,status FROM record_overrides WHERE plugin_id=?1 AND source_form_id=?2 AND record_type!='TES4'",
         [supplier, raw], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     ).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let runtime = stored.and_then(|value| {
+        identity
+            .runtime_id_if_available(identity.required_key(value).unwrap())
+            .unwrap()
+    });
     assert_eq!(runtime, expected_runtime);
     assert_eq!(owner, None);
     assert_eq!(local, Some(raw & 0x00ff_ffff));
@@ -410,7 +419,7 @@ fn legal_master_override_deletion_and_restore_share_runtime_not_original_owner_p
             assert_eq!(source_body(&db, 0x0100_0711), *bytes);
         }
         let rows: Vec<(u32, bool, String)> = db.prepare("SELECT plugin_id,deleted,status FROM record_overrides WHERE form_id=?1 ORDER BY chain_position").unwrap()
-            .query_map([0x0100_0711u32], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+            .query_map([common::stored_key(&db, 0x0100_0711)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
         assert_eq!(rows.len(), length - 1);
         for (position, row) in rows.iter().enumerate() {
             assert_eq!(
@@ -524,7 +533,7 @@ fn gmst_editor_identity_deletion_and_zero_restore_keep_existing_convention() {
             let source: u32 = db
                 .query_row(
                     "SELECT source_form_id FROM inhouse_source_records WHERE form_id=?1",
-                    [0x0023_c00eu32],
+                    [common::stored_key(&db, 0x0023_c00e)],
                     |r| r.get(0),
                 )
                 .unwrap();

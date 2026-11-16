@@ -192,6 +192,7 @@ async fn v115_resumed_no_lod_discards_staged_lod_outputs() {
     assert!(convert(&data, &output).await.lod_chunks > 0);
     let staging = directory.path().join("assets.staging-lod-retry");
     fs::rename(&output, &staging).unwrap();
+    common::current_staging_generation(&staging);
     let mut config = cpu_lod_config(&data, &output);
     config.no_lod = true;
     config.resume_staging = Some(staging);
@@ -303,6 +304,7 @@ async fn resumed_lod_with_changed_origin_matches_a_clean_build() {
     convert(&data, &output).await;
     let staging = output.with_extension("staging-lod-retry");
     fs::rename(&output, &staging).unwrap();
+    common::current_staging_generation(&staging);
 
     let mut resumed = cpu_lod_config(&data, &output);
     resumed.resume_staging = Some(staging);
@@ -336,6 +338,7 @@ async fn resumed_lod_drops_removed_sidecars_and_the_previous_manifest() {
     convert(&data, &output).await;
     let staging = output.with_extension("staging-lod-retry");
     fs::rename(&output, &staging).unwrap();
+    common::current_staging_generation(&staging);
     fs::remove_file(data.join("Skyrim - Misc.bsa")).unwrap();
 
     let mut config = cpu_lod_config(&data, &output);
@@ -358,6 +361,7 @@ async fn resumed_conversion_drops_removed_textures_and_stale_provenance() {
     assert!(convert(&data, &output).await.complete);
     let staging = output.with_extension("staging-assets-retry");
     fs::rename(&output, &staging).unwrap();
+    common::current_staging_generation(&staging);
     fs::write(staging.join("scripts/obsolete.luau"), b"-- removed script").unwrap();
     for sidecar in [
         "metadata-rebuild.json",

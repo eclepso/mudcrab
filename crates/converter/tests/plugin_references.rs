@@ -1216,22 +1216,26 @@ fn database_fields(
     tag: &[u8; 4],
 ) -> Vec<Vec<u8>> {
     let key = if table == "records" { "form_id" } else { "id" };
+    let stored = common::stored_key(conn, id);
     let blob: Vec<u8> = conn
         .query_row(
             &format!("SELECT data FROM \"{table}\" WHERE {key}=?1"),
-            [id],
+            [stored],
             |row| row.get(0),
         )
         .unwrap();
-    let decoded =
-        rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&blob)
-            .unwrap();
-    decoded
-        .subrecords
-        .into_iter()
-        .filter(|sub| &sub.tag == tag)
-        .map(|sub| sub.data)
-        .collect()
+    let canonical: Vec<u8> = conn
+        .query_row(
+            "SELECT data FROM records WHERE form_id=?1",
+            [stored],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blob, canonical,
+        "native canonical fields must agree in {table}"
+    );
+    common::runtime_fields(conn, id, tag)
 }
 
 /// Read one required subrecord from a published database projection.
@@ -1241,8 +1245,9 @@ fn database_field(conn: &rusqlite::Connection, table: &str, id: u32, tag: &[u8; 
     fields.into_iter().next().unwrap()
 }
 
-/// The real pipeline publishes resolved IDs in every blob projection, including
-/// non-identity master lists, light masters, overrides and repeated subrecords.
+/// The real pipeline publishes authenticated native fields and resolved semantic sites,
+/// including non-identity master lists, light masters, overrides and repeated subrecords.
+/// Checked transient views below retain the original runtime behavior oracle.
 /// Malformed fields are absent from both record and reference blobs; valid neighbors survive.
 /// Enable-parent flags use one byte even when all three unused bytes are nonzero;
 /// zero flags and the combined inversion/pop-in bits preserve their raw payloads.
@@ -1283,12 +1288,24 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
         "Light.esl",
         &["Skyrim.esm"],
         0x201,
-        record(
-            b"REFR",
-            0x0100_0802,
-            0,
-            sub(b"NAME", &0x0000_0003u32.to_le_bytes()),
-        ),
+        [
+            record(b"CELL", 0x0100_0900, 0, sub(b"DATA", &[1, 0])),
+            group(
+                6,
+                0x0100_0900,
+                group(
+                    9,
+                    0x0100_0900,
+                    record(
+                        b"REFR",
+                        0x0100_0802,
+                        0,
+                        sub(b"NAME", &0x0000_0003u32.to_le_bytes()),
+                    ),
+                ),
+            ),
+        ]
+        .concat(),
     );
     let mut xtel = 0x0200_0801u32.to_le_bytes().to_vec();
     xtel.extend([0xAB; 28]);
@@ -1349,6 +1366,7 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
                             0x0200_0800,
                             0,
                             [
+                                sub(b"NAME", &0x0100_0003u32.to_le_bytes()),
                                 sub(b"XTEL", &xtel),
                                 sub(b"XESP", &xesp),
                                 sub(b"XAPR", &xapr),
@@ -1418,6 +1436,7 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
                     0x0100_0800,
                     0,
                     [
+                        sub(b"NAME", &0x0000_0003u32.to_le_bytes()),
                         sub(b"XTEL", &override_xtel),
                         sub(b"XLRT", &[0xAB; 6]),
                         sub(b"XAPR", &[0xAB; 12]),
@@ -1517,20 +1536,30 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
                 ]
             );
         }
-        // Both readers clear the absent self parent and retain its flags;
-        // malformed subrecords still leave SQL NULL.
+        assert_eq!(
+            common::native_fields(&conn, 0x0300_0806, b"XESP"),
+            vec![[0x0300_0802u32.to_le_bytes(), [2, 0x35, 0x6B, 0xC4]].concat()]
+        );
+        // Cleared optional native SQL targets are NULL while their flags and source bytes survive;
+        // malformed subrecords still leave both columns NULL.
         for (id, expected) in [
             (0x0300_0800u32, (Some(0xFE00_0802i64), Some(3i64))),
-            (0x0300_0806, (Some(0), Some(2))),
+            (0x0300_0806, (None, Some(2))),
             (0x0300_0807, (None, None)),
             (0x0300_0808, (Some(0xFE00_0802), Some(0))),
         ] {
             let columns: (Option<i64>, Option<i64>) = conn
                 .query_row(
                     "SELECT enable_parent_id, enable_parent_flags FROM \"references\" WHERE id=?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    [common::stored_key(&conn, id)],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )
+                .map(|(parent, flags)| {
+                    (
+                        parent.map(|key| i64::from(common::runtime_id(&conn, key))),
+                        flags,
+                    )
+                })
                 .unwrap();
             assert_eq!(columns, expected, "{id:08X}");
         }
@@ -1539,9 +1568,9 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
         }
         let identity: (String, u32, u32) = conn
             .query_row(
-                "SELECT m.plugin_name, m.internal_id, r.load_order FROM formid_map m \
-                 JOIN records r ON r.form_id=m.form_id WHERE m.form_id=?1",
-                [0x0300_0800u32],
+                "SELECT p.normalized_name, m.internal_id, r.load_order FROM formid_map m \
+                 JOIN records r ON r.form_id=m.form_id JOIN pack_plugins p ON p.id=(m.form_id >> 24) WHERE m.form_id=?1",
+                [common::stored_key(&conn, 0x0300_0800)],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -1562,12 +1591,12 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
             )]);
             conn.execute(
                 "UPDATE records SET data=?1 WHERE form_id=?2",
-                rusqlite::params![old, 0x0300_0800u32],
+                rusqlite::params![old, common::stored_key(&conn, 0x0300_0800)],
             )
             .unwrap();
             conn.execute(
                 "UPDATE \"references\" SET data=?1 WHERE id=?2",
-                rusqlite::params![old, 0x0300_0800u32],
+                rusqlite::params![old, common::stored_key(&conn, 0x0300_0800)],
             )
             .unwrap();
             // Producer 24's world projection contains padding in enable-parent
@@ -1599,8 +1628,8 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
 fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
     use rusqlite::Connection;
     let dir = tempfile::tempdir().unwrap();
-    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
-    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let base = plugin(dir.path(), "Skyrim.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Skyrim.esm"], 1, Vec::new());
     let floats =
         |values: [f32; 6]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
@@ -1631,9 +1660,11 @@ fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
     let patch = plugin(
         dir.path(),
         "Patch.esm",
-        &["Base.esm"],
+        &["Skyrim.esm"],
         1,
         [
+            record(b"LGTM", 0x0100_0A00, 0, sub(b"EDID", b"RoomLighting\0")),
+            record(b"IMGS", 0x0100_0A01, 0, sub(b"EDID", b"RoomImageSpace\0")),
             // No XCLC and no worldspace: an interior cell.
             record(b"CELL", cell, 0, sub(b"DATA", &[1, 0])),
             group(
@@ -1683,19 +1714,28 @@ fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
     EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
     let conn = Connection::open(&db).unwrap();
     let ids = |sql: &str| -> Vec<(u32, u32)> {
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
         conn.prepare(sql)
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
             .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
+            .map(|row| {
+                let (left, right) = row.unwrap();
+                (
+                    common::runtime_id(&conn, left),
+                    common::runtime_id(&conn, right),
+                )
+            })
+            .collect()
     };
     assert_eq!(
         ids("SELECT ref_id, cell_id FROM room_bounds ORDER BY ref_id"),
         vec![(0x0200_0801, 0x0200_0900), (0x0200_0802, 0x0200_0900)]
     );
     assert_eq!(
-        ids("SELECT lighting_template_id, image_space_id FROM room_bounds WHERE ref_id=0x02000802"),
+        ids(
+            "SELECT lighting_template_id, image_space_id FROM room_bounds WHERE ref_id=stored_key(0x02000802)"
+        ),
         vec![(0x0200_0A00, 0x0200_0A01)]
     );
     assert_eq!(
@@ -1719,8 +1759,8 @@ fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
 fn placed_projectile_and_hazard_references_join_interior_rooms() {
     use rusqlite::Connection;
     let dir = tempfile::tempdir().unwrap();
-    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
-    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let base = plugin(dir.path(), "Skyrim.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Skyrim.esm"], 1, Vec::new());
     let floats =
         |values: [f32; 6]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
@@ -1752,7 +1792,7 @@ fn placed_projectile_and_hazard_references_join_interior_rooms() {
     let patch = plugin(
         dir.path(),
         "Patch.esm",
-        &["Base.esm"],
+        &["Skyrim.esm"],
         1,
         [
             // No XCLC and no worldspace: an interior cell.
@@ -1794,12 +1834,19 @@ fn placed_projectile_and_hazard_references_join_interior_rooms() {
     EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
     let conn = Connection::open(&db).unwrap();
     let ids = |sql: &str| -> Vec<(u32, u32)> {
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
         conn.prepare(sql)
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
             .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
+            .map(|row| {
+                let (left, right) = row.unwrap();
+                (
+                    common::runtime_id(&conn, left),
+                    common::runtime_id(&conn, right),
+                )
+            })
+            .collect()
     };
     assert_eq!(
         ids(
@@ -1905,8 +1952,8 @@ fn a_two_pair_xpod_is_remapped_in_every_pair() {
 fn load_order_export_ignores_markers_in_exterior_cells() {
     use rusqlite::Connection;
     let dir = tempfile::tempdir().unwrap();
-    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
-    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let base = plugin(dir.path(), "Skyrim.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Skyrim.esm"], 1, Vec::new());
     let word = |value: u32| value.to_le_bytes().to_vec();
     let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
         let mut bytes: Vec<u8> = half.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1956,7 +2003,7 @@ fn load_order_export_ignores_markers_in_exterior_cells() {
     let patch = plugin(
         dir.path(),
         "Patch.esm",
-        &["Base.esm"],
+        &["Skyrim.esm"],
         1,
         [
             // A grid position, with no worldspace group.
@@ -1978,10 +2025,15 @@ fn load_order_export_ignores_markers_in_exterior_cells() {
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
     let conn = Connection::open(&db).unwrap();
-    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    let count = |sql: &str| -> i64 {
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    };
     // The markers were parsed as references of those cells...
     assert_eq!(
-        count("SELECT count(*) FROM \"references\" WHERE base_form_id IN (31, 32)"),
+        count(
+            "SELECT count(*) FROM \"references\" WHERE base_form_id IN (stored_key(31), stored_key(32))"
+        ),
         6
     );
     // ...and none of them became room data.

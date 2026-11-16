@@ -1,5 +1,6 @@
 //! Inaccessible source descendants are isolated; internal staging failures remain fatal.
 #![cfg(unix)]
+mod common;
 
 use converter::{
     AssetPipeline, PipelineConfig, PipelineFailure, PipelineReport, ProgressEvent, ProgressStage,
@@ -229,6 +230,7 @@ async fn unreadable_staged_vfs_subtree_stops_conversion_before_publication() {
     fs::create_dir(data.join("textures")).unwrap();
     fs::write(data.join("textures/hidden.dds"), b"hidden input").unwrap();
     fs::create_dir(&staging).unwrap();
+    common::current_staging_generation(&staging);
     config.resume_staging = Some(staging.clone());
 
     // The Discovering event fills this channel. The Database send then suspends

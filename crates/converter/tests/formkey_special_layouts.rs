@@ -1,4 +1,5 @@
 //! Special field layouts share absent-target recovery through both publication readers.
+mod common;
 use converter::esm::{EsmParser, inhouse};
 use rusqlite::Connection;
 use std::fs;
@@ -180,8 +181,11 @@ fn check_layout(kind: &[u8; 4], tag: &[u8; 4]) {
         let conn = Connection::open(&db).unwrap();
         let count: u32 = conn
             .query_row(
-                "SELECT count(*) FROM records WHERE form_id IN (33556498,33559093)",
-                [],
+                "SELECT count(*) FROM records WHERE form_id IN (?1,?2)",
+                [
+                    common::stored_key(&conn, 0x0200_0812),
+                    common::stored_key(&conn, 0x0200_1235),
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -193,16 +197,16 @@ fn check_layout(kind: &[u8; 4], tag: &[u8; 4]) {
                 1
             },
         ) {
-            let bytes: Vec<u8> = conn
-                .query_row("SELECT data FROM records WHERE form_id=?1", [id], |r| {
-                    r.get(0)
-                })
-                .unwrap();
-            let archived = rkyv::from_bytes::<
-                converter::esm::types::ArchivedRecordData,
-                rkyv::rancor::Error,
-            >(&bytes)
-            .unwrap();
+            let mut native = payload.clone();
+            if id == 0x0200_0813 {
+                native[offsets[0]..offsets[0] + 4].copy_from_slice(&0x0300_1235u32.to_le_bytes());
+            }
+            assert_eq!(
+                common::native_fields(&conn, id, tag),
+                [native],
+                "native words, aliases and padding stay byte-for-byte source-local"
+            );
+            let archived = common::runtime_record(&conn, id);
             let actual = &archived
                 .subrecords
                 .iter()
@@ -225,7 +229,7 @@ fn check_layout(kind: &[u8; 4], tag: &[u8; 4]) {
         }
     }
     let conn = Connection::open(typed.join("skyrim_world.db")).unwrap();
-    let missing: u32 = conn.query_row("SELECT count(*) FROM record_diagnostics WHERE reason='optional FormID 03001234 exceeds master list'", [], |r| r.get(0)).unwrap();
+    let missing: u32 = conn.query_row("SELECT count(*) FROM record_diagnostics WHERE reason='native source 03001234 is absent or has a disallowed target type'", [], |r| r.get(0)).unwrap();
     assert_eq!(missing, 1);
 }
 

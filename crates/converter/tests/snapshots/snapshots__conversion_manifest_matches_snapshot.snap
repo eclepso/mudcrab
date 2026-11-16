@@ -74,12 +74,12 @@ expression: manifest
     }
   },
   "asset_configuration_hashes": {
-    "dds": "1495cf3ec0f02a297c0bf31210e650b2c41df7f8b5e2bdda71f0a65f84b9db65",
-    "nif": "0036af04f5a90345ee89508c199d1ef67ea2d970407648c43dc4de87aaeb76eb",
+    "dds": "5951a91a0eb6f904346ee8e9c55b80651ba676a51630569adf8d1a59cb100aea",
+    "nif": "b41eecb315feff0f1ba6498c8c12be880383925d4ead764282b6739719eedf84",
     "pex": "36a71880028a9c1d6bcd8b3c1cf149805dbe384a48a765bab57df47a3cbea565"
   },
   "complete": true,
-  "configuration_hash": "101deff2afbfbcd4112e9f85a46e67f3c48f40f45740f3d35761c2776b94d180",
+  "configuration_hash": "94fabddc82e33e56385f2e356be8d2984b47f7dd3383954defb41ec978305e96",
   "entries": {
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",
@@ -142,7 +142,8 @@ expression: manifest
     "nif": 1,
     "pex": 2
   },
+  "plugin_table_digest": "0709666288d728897f52a3ca0d5ff68c5d3f410dff02a07f353aeea06d57d587",
   "pruned_texture_references": {},
   "record_data_complete": true,
-  "schema_version": 28
+  "schema_version": 29
 }

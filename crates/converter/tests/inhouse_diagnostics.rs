@@ -1,7 +1,6 @@
 //! R5 regressions exercise damaged records and complete diagnostics through publication.
-use converter::{
-    AssetPipeline, PipelineConfig, config::RecordReader, esm::types::ArchivedRecordData,
-};
+mod common;
+use converter::{AssetPipeline, PipelineConfig, config::RecordReader};
 use rusqlite::Connection;
 use std::{io::Write, path::Path};
 
@@ -113,24 +112,19 @@ async fn complete_diagnostics_publish_every_cleared_link_and_damaged_field() {
         let count: u64 = db
             .query_row(
                 "SELECT count(*) FROM records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(count, 1, "usable neighbor {id:08X} must survive");
     }
     for id in [0x0200_1881u32, 0x0200_1882] {
-        let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE form_id=?1 AND category='link' AND action='cleared' AND source_record_offset IS NOT NULL AND field IS NOT NULL AND link_value IS NOT NULL", [id], |row| row.get(0)).unwrap();
+        let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE form_id=?1 AND category='link' AND action='cleared' AND source_record_offset IS NOT NULL AND field IS NOT NULL AND link_value IS NOT NULL", [common::stored_key(&db, id)], |row| row.get(0)).unwrap();
         assert_eq!(
             count, 3,
             "all three distinct link occurrences must be traceable"
         );
-        let bytes: Vec<u8> = db
-            .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let saved = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap();
+        let saved = common::runtime_record(&db, id);
         let links: Vec<_> = saved
             .subrecords
             .iter()
@@ -141,7 +135,7 @@ async fn complete_diagnostics_publish_every_cleared_link_and_damaged_field() {
         let source: Vec<u8> = db
             .query_row(
                 "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -157,7 +151,7 @@ async fn complete_diagnostics_publish_every_cleared_link_and_damaged_field() {
         );
     }
     for id in [0x0200_1883u32, 0x0200_1884] {
-        let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE form_id=?1 AND category='field' AND action='skipped' AND field LIKE '%OBND%'", [id], |row| row.get(0)).unwrap();
+        let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE form_id=?1 AND category='field' AND action='skipped' AND field LIKE '%OBND%'", [common::stored_key(&db, id)], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
     }
     let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE source_form_id=?1 AND category='record' AND action='skipped'", [0x0100_1885u32], |row| row.get(0)).unwrap();
@@ -167,8 +161,8 @@ async fn complete_diagnostics_publish_every_cleared_link_and_damaged_field() {
     );
     let earlier: u64 = db
         .query_row(
-            "SELECT count(*) FROM records WHERE form_id=6147",
-            [],
+            "SELECT count(*) FROM records WHERE form_id=?1",
+            [common::stored_key(&db, 0x1803)],
             |row| row.get(0),
         )
         .unwrap();
@@ -205,12 +199,12 @@ async fn torn_override_diagnostic_reports_kept_earlier_version() {
         )
         .unwrap();
     assert_eq!(tables, 1, "R5 must publish the complete diagnostics table");
-    let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE form_id=6147 AND action='kept_earlier_version' AND reason LIKE '%incomplete override%'", [], |r| r.get(0)).unwrap();
+    let count: u64 = db.query_row("SELECT count(*) FROM record_diagnostics WHERE form_id=?1 AND action='kept_earlier_version' AND reason LIKE '%incomplete override%'", [common::stored_key(&db, 0x1803)], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
     let supplier: u32 = db
         .query_row(
-            "SELECT load_order FROM inhouse_source_records WHERE form_id=6147",
-            [],
+            "SELECT load_order FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&db, 0x1803)],
             |r| r.get(0),
         )
         .unwrap();
@@ -218,7 +212,7 @@ async fn torn_override_diagnostic_reports_kept_earlier_version() {
     let neighbor: u64 = db
         .query_row(
             "SELECT count(*) FROM records WHERE form_id=?1",
-            [0x0300_1887u32],
+            [common::stored_key(&db, 0x0300_1887)],
             |r| r.get(0),
         )
         .unwrap();

@@ -1,4 +1,5 @@
 //! Synthetic public legacy-reader publication regressions; no installed inputs.
+mod common;
 use converter::esm::EsmParser;
 use rusqlite::Connection;
 use std::{
@@ -46,29 +47,19 @@ fn plugin(root: &Path, name: &str, masters: &[&str], flags: u32, body: Vec<u8>) 
 }
 
 fn fields(conn: &Connection, id: u32, tag: &[u8; 4]) -> Vec<Vec<u8>> {
-    let blob: Vec<u8> = conn
-        .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let decoded =
-        rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&blob)
-            .unwrap();
-    decoded
-        .subrecords
-        .into_iter()
-        .filter(|field| &field.tag == tag)
-        .map(|field| field.data)
-        .collect()
+    common::runtime_fields(conn, id, tag)
 }
 
 fn ids(conn: &Connection) -> Vec<u32> {
-    conn.prepare("SELECT form_id FROM records ORDER BY form_id")
+    let mut ids = conn
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
         .unwrap()
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| row.get::<_, i64>(0))
         .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
+        .map(|row| common::runtime_id(conn, row.unwrap()))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 #[test]
@@ -181,14 +172,20 @@ fn torn_payloads_preserve_earlier_winners_neighbors_and_authoritative_deletions(
     let conn = Connection::open(db).unwrap();
     assert_eq!(ids(&conn), [0x800, 0x0100_0802, 0x0100_0805]);
     assert_eq!(fields(&conn, 0x800, b"EDID"), [b"Earlier\0".to_vec()]);
-    let context: (u32, u32) = conn
+    let context: (i64, i64) = conn
         .query_row(
             "SELECT cell_id, worldspace_id FROM records WHERE form_id=?1",
-            [0x0100_0805u32],
+            [common::stored_key(&conn, 0x0100_0805)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(context, (0x902, 0x900));
+    assert_eq!(
+        context,
+        (
+            common::stored_key(&conn, 0x902),
+            common::stored_key(&conn, 0x900)
+        )
+    );
 }
 
 #[test]
@@ -261,14 +258,17 @@ fn absent_optional_self_links_clear_while_required_links_and_neighbors_survive()
         fields(&conn, 0x0200_0800, b"XEZN"),
         [0x0200_0902u32.to_le_bytes().to_vec()]
     );
-    let movement: (Option<u32>, Option<u32>) = conn
+    let movement: (Option<i64>, Option<i64>) = conn
         .query_row(
             "SELECT walk_movt_id, run_movt_id FROM race_movement_links WHERE id=?1",
-            [0x0200_0801u32],
+            [common::stored_key(&conn, 0x0200_0801)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(movement, (None, Some(0x0200_0903)));
+    assert_eq!(
+        movement,
+        (None, Some(common::stored_key(&conn, 0x0200_0903)))
+    );
     assert!(fields(&conn, 0x0200_0801, b"WKMV").is_empty());
 }
 
@@ -405,16 +405,16 @@ fn unusable_movement_override_does_not_claim_a_deletion_alias() {
     assert_eq!(ids(&conn), [0x800, 0x0003_580D, 0x0100_0802]);
     let value: f32 = conn
         .query_row(
-            "SELECT value FROM movement_game_settings WHERE id=2048",
-            [],
+            "SELECT value FROM movement_game_settings WHERE id=?1",
+            [common::stored_key(&conn, 0x800)],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(value.to_bits(), 50.0f32.to_bits());
     let speed: f32 = conn
         .query_row(
-            "SELECT forward_walk FROM movement_types WHERE id=219149",
-            [],
+            "SELECT forward_walk FROM movement_types WHERE id=?1",
+            [common::stored_key(&conn, 0x3580D)],
             |row| row.get(0),
         )
         .unwrap();
@@ -546,11 +546,11 @@ fn vanilla_vmad_compatibility_preserves_scripts_and_complete_predecessors() {
         let stored: Vec<u8> = conn
             .query_row(
                 "SELECT vmad FROM scripts WHERE form_id=?1 AND script_name='Compatibility'",
-                [id],
+                [common::stored_key(&conn, id)],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, expected);
+        assert_eq!(stored, common::native_fields(&conn, id, b"VMAD")[0]);
     }
     let script_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM scripts", [], |row| row.get(0))

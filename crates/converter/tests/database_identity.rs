@@ -1,4 +1,5 @@
 //! Synthetic ownership fixtures; no game data.
+mod common;
 use converter::esm::{EsmParser, load_order::LoadOrder};
 use std::{
     fs,
@@ -317,15 +318,17 @@ fn database_identities_survive_slot_changes_and_keep_override_provenance() {
         let read = |id: u32| {
             conn.query_row(
             "SELECT plugin_name, internal_id, load_order FROM formid_map JOIN records USING(form_id) WHERE form_id=?1",
-            [id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?))).unwrap()
+            [common::stored_key(&conn, id)], |row| Ok((row.get::<_,String>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?))).unwrap()
         };
         let priority = paths.len() as u32 - 1;
-        assert_eq!(read(full_id), ("base.esm".into(), 0x800, priority));
-        assert_eq!(read(light_id), ("light.esl".into(), 0x810, priority));
-        // An annotation-only export must preserve the established identity.
+        assert_eq!(read(full_id), ("Base.esm".into(), 0x800, priority));
+        assert_eq!(read(light_id), ("Light.esl".into(), 0x810, priority));
+        // An unbound scalar subset may not overwrite an authenticated native generation.
         let mut records = EsmParser::merge_plugins(&paths).unwrap();
-        export_to_db(&conn, &records).unwrap();
-        assert_eq!(read(full_id), ("base.esm".into(), 0x800, priority));
+        let error = export_to_db(&conn, &records).unwrap_err();
+        assert!(error.to_string().contains("convert again"));
+        assert_eq!(read(full_id), ("Base.esm".into(), 0x800, priority));
+        assert_eq!(read(light_id), ("Light.esl".into(), 0x810, priority));
         // Unresolved ownership is an error, and rolls back the whole export.
         let mut invalid = records[&full_id].clone();
         invalid.form_id = 0xff000999;
@@ -343,7 +346,7 @@ fn database_identities_survive_slot_changes_and_keep_override_provenance() {
             .unwrap(),
             0
         );
-        assert_eq!(read(full_id), ("base.esm".into(), 0x800, priority));
+        assert_eq!(read(full_id), ("Base.esm".into(), 0x800, priority));
     }
 }
 
@@ -407,14 +410,14 @@ fn game_settings_override_by_editor_id_with_deletion_restoration_and_null_overri
         let conn = rusqlite::Connection::open(db).unwrap();
         if let Some(expected) = expected {
             assert_eq!(merged[&0x23c00e].load_order, paths.len() as u32 - 1);
-            let (id, value): (u32, f64) = conn
+            let (id, value): (i64, f64) = conn
                 .query_row(
                     "SELECT id,value FROM movement_game_settings WHERE editor_id='fJumpHeightMin'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(id, 0x23c00e);
+            assert_eq!(id, common::stored_key(&conn, 0x23c00e));
             assert_eq!(value, expected);
             assert_eq!(
                 conn.query_row(
@@ -423,7 +426,7 @@ fn game_settings_override_by_editor_id_with_deletion_restoration_and_null_overri
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
-                "base.esm"
+                "Base.esm"
             );
         } else {
             assert_eq!(
@@ -545,7 +548,7 @@ fn header_only_setting_deletions_resolve_original_override_and_light_aliases() {
             let value: (String, u32, f64) = conn.query_row(
                 "SELECT plugin_name,internal_id,value FROM formid_map JOIN movement_game_settings ON formid_map.form_id=movement_game_settings.id", [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
-            assert_eq!(value, ("base.esm".into(), 0x800, 120.0));
+            assert_eq!(value, ("Base.esm".into(), 0x800, 120.0));
         }
     }
 }
@@ -664,10 +667,10 @@ fn setting_alias_collisions_skip_candidates_in_both_orders_and_after_deletion() 
         let published: Vec<u32> = conn
             .prepare("SELECT form_id FROM records ORDER BY form_id")
             .unwrap()
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| row.get::<_, i64>(0))
             .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+            .map(|row| common::runtime_id(&conn, row.unwrap()))
+            .collect();
         assert_eq!(published, expected_ids);
     }
 }

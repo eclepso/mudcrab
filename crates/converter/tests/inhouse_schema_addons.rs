@@ -75,7 +75,7 @@ async fn fidelity_audit_replays_retained_addons_without_configured_files() {
         fs::remove_file(&addon).unwrap();
         let before = pack_hashes(&output);
         let report = audit(&output);
-        assert_eq!(report["format_version"], 3);
+        assert_eq!(report["format_version"], 4);
         assert_eq!(report["coverage"]["canonical_only_records"], 0);
         assert_ne!(report["coverage"]["status"], "empty");
         assert_eq!(
@@ -133,8 +133,11 @@ async fn fidelity_audit_replays_retained_addons_without_configured_files() {
     // Remove one real published source row while leaving its canonical record intact.
     let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
     assert_eq!(
-        conn.execute("DELETE FROM inhouse_source_records WHERE form_id=6144", [])
-            .unwrap(),
+        conn.execute(
+            "DELETE FROM inhouse_source_records WHERE form_id=?1",
+            [common::stored_key(&conn, 0x1800)]
+        )
+        .unwrap(),
         1
     );
     drop(conn);
@@ -225,11 +228,13 @@ async fn publish_with_reader(
 
 /// Read the published canonical record rather than accepting source-only preservation.
 fn canonical_fields(output: &Path, form_id: u32) -> Vec<([u8; 4], Vec<u8>)> {
-    let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let db = &database;
+    shared::records::RecordContextReader::new(db).unwrap();
     let bytes: Vec<u8> = db
         .query_row(
             "SELECT data FROM records WHERE form_id=?1",
-            [form_id],
+            [common::stored_key(&database, form_id)],
             |row| row.get(0),
         )
         .unwrap();
@@ -237,6 +242,16 @@ fn canonical_fields(output: &Path, form_id: u32) -> Vec<([u8; 4], Vec<u8>)> {
         rkyv::from_bytes::<converter::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&bytes)
             .unwrap();
     record
+        .subrecords
+        .into_iter()
+        .map(|field| (field.tag, field.data))
+        .collect()
+}
+
+/// Interpret certified sites only for existing runtime behavior assertions; opaque bytes stay native.
+fn runtime_fields(output: &Path, form_id: u32) -> Vec<([u8; 4], Vec<u8>)> {
+    let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    common::runtime_record(&db, form_id)
         .subrecords
         .into_iter()
         .map(|field| (field.tag, field.data))
@@ -319,9 +334,12 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
         );
         assert!(integration.bounds_updated >= 8);
         assert!(integration.statics_with_models >= 8);
+        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
         let recovered_ids = expected
             .iter()
-            .map(|(_, invalid_id, _, _)| format!("{invalid_id:08X}"))
+            .map(|(_, invalid_id, _, _)| {
+                format!("{:016X}", common::stored_key(&database, *invalid_id))
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             integration
@@ -331,13 +349,12 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
                 .count(),
             4
         );
-        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
         for (valid_before_id, invalid_id, valid_after_id, invalid_model) in &expected {
             for valid_id in [*valid_before_id, *valid_after_id] {
                 let valid_path: Option<String> = database
                     .query_row(
                         "SELECT model_path FROM statics WHERE id=?1",
-                        [valid_id],
+                        [common::stored_key(&database, valid_id)],
                         |row| row.get(0),
                     )
                     .unwrap();
@@ -346,7 +363,7 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
             let unsafe_path: Option<String> = database
                 .query_row(
                     "SELECT model_path FROM statics WHERE id=?1",
-                    [invalid_id],
+                    [common::stored_key(&database, *invalid_id)],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -355,7 +372,10 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
             assert!(archived.contains(&(*b"MODL", invalid_model.clone())));
             assert!(integration.issues.iter().any(|issue| {
                 issue.contains("plugin Skyrim.esm")
-                    && issue.contains(&format!("{invalid_id:08X}"))
+                    && issue.contains(&format!(
+                        "{:016X}",
+                        common::stored_key(&database, *invalid_id)
+                    ))
                     && issue.contains("../bad.nif")
             }));
         }
@@ -406,7 +426,7 @@ async fn unsafe_texture_set_paths_clear_their_slots_and_still_publish() {
             .query_row(
                 "SELECT diffuse_path,normal_path,mask_path,glow_path,height_path \
                  FROM texture_sets WHERE id=?1",
-                [form_id],
+                [common::stored_key(&database, form_id)],
                 |row| {
                     Ok([
                         row.get(0)?,
@@ -513,12 +533,14 @@ async fn localized_union_definitions_publish_selected_banks_and_valid_neighbors(
     publish_config(mod_config(&data, &output, &[&addon]), true).await;
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     for (id, tail) in [(0x0100_1810, 0x5927u16), (0x0100_1812, 0x82A6u16)] {
-        let fields = canonical_fields(&output, id);
+        let native = canonical_fields(&output, id);
+        assert_eq!(native[1], (*b"ZTXT", 73u32.to_le_bytes().to_vec()));
+        let fields = runtime_fields(&output, id);
         assert_eq!(fields[1], (*b"ZTXT", b"SelectedLeafBank\0".to_vec()));
         assert_eq!(fields[2], (*b"ZTAL", tail.to_le_bytes().to_vec()));
         let row: (String, u32, String, String) = db.query_row(
             "SELECT string_table,string_id,resolved_text,status FROM inhouse_localized_fields WHERE form_id=?1",
-            [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+            [common::stored_key(&db, id)], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(
             row,
             (
@@ -694,7 +716,7 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
         let (source_id, source_payload): (u32, Vec<u8>) = db
             .query_row(
                 "SELECT source_form_id,payload FROM inhouse_source_records WHERE form_id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -712,7 +734,7 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
         let runtime_radius: Option<f64> = db
             .query_row(
                 "SELECT radius_override FROM \"references\" WHERE id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -721,7 +743,7 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
             (!opaque).then_some(f64::from(radius)),
             "opaque {signature:?} radius leaked into runtime columns"
         );
-        type ReferenceProjection = (u32, u32, u32, bool, [f64; 6], f64, Vec<u8>);
+        type ReferenceProjection = (i64, i64, i64, bool, [f64; 6], f64, Vec<u8>);
         let (
             saved_cell,
             saved_world,
@@ -732,7 +754,7 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
             mirror,
         ): ReferenceProjection = db.query_row(
             "SELECT cell_id,worldspace_id,base_form_id,is_exterior,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,data FROM \"references\" WHERE id=?1",
-            [id],
+            [common::stored_key(&db, id)],
             |row| Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -747,7 +769,12 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
         ).unwrap();
         assert_eq!(
             (saved_cell, saved_world, saved_base, exterior),
-            (cell_id, 1, base, true)
+            (
+                common::stored_key(&db, cell_id),
+                common::stored_key(&db, 1),
+                common::stored_key(&db, base),
+                true
+            )
         );
         assert_eq!(saved_transform, transform.map(f64::from));
         assert_eq!(saved_scale, f64::from(scale));
@@ -768,7 +795,7 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
         let spatial: [f64; 6] = db
             .query_row(
                 "SELECT minX,maxX,minY,maxY,minZ,maxZ FROM exterior_spatial WHERE id=?1",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| {
                     Ok([
                         row.get(0)?,
@@ -1049,9 +1076,10 @@ async fn addons_type_new_records_and_extend_known_fields_with_asymmetric_remappi
     fs::write(&addon, addon_bytes()).unwrap();
     let typed = temp.path().join("typed");
     publish_config(mod_config(&data, &typed, &[&addon]), true).await;
-    let mut remapped = original;
+    let mut remapped = original.clone();
     remapped[2].1 = 0x0200_1801u32.to_le_bytes().to_vec();
-    assert_eq!(canonical_fields(&typed, 0x0300_1820), remapped);
+    assert_eq!(canonical_fields(&typed, 0x0300_1820), original);
+    assert_eq!(runtime_fields(&typed, 0x0300_1820), remapped);
     for id in [0x0300_1820, 0x0300_1821] {
         let record = history_record(&typed, id);
         assert!(record.supported);
@@ -1118,14 +1146,15 @@ async fn extension_before_builtin_fields_preserves_opaque_condition_tags() {
     fs::write(&addon, addon_bytes()).unwrap();
     let output = temp.path().join("pack");
     publish_config(mod_config(&data, &output, &[&addon]), true).await;
-    let mut expected = fields;
+    let mut expected = fields.clone();
     expected[0].1 = 0x0200_1801u32.to_le_bytes().to_vec();
-    assert_eq!(canonical_fields(&output, 0x0300_1830), expected);
+    assert_eq!(canonical_fields(&output, 0x0300_1830), fields);
+    assert_eq!(runtime_fields(&output, 0x0300_1830), expected);
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM scripts WHERE form_id=?1",
-            [0x0300_1830u32],
+            [common::stored_key(&db, 0x0300_1830u32)],
             |row| row.get::<_, u64>(0)
         )
         .unwrap(),
@@ -1164,7 +1193,15 @@ async fn repeated_extensions_validate_each_occurrence_without_rewinding_builtin_
         } else {
             expected.remove(2);
         }
-        assert_eq!(canonical_fields(&output, 0x0300_1831), expected);
+        assert_eq!(
+            common::native_fields(
+                &Connection::open(output.join("skyrim_world.db")).unwrap(),
+                0x0300_1831,
+                b"XLNK"
+            )[0],
+            fields[0].1
+        );
+        assert_eq!(runtime_fields(&output, 0x0300_1831), expected);
     }
 }
 
@@ -1316,7 +1353,7 @@ async fn mandatory_extension_error_keeps_predecessor_and_publishes_neighbors() {
     let (status, reason): (String, String) = db
         .query_row(
             "SELECT h.status,h.reason FROM record_overrides h JOIN plugins p ON p.id=h.plugin_id WHERE h.form_id=?1 AND lower(p.name)='patch.esp'",
-            [0x0200_1801u32],
+            [common::stored_key(&db, 0x0200_1801u32)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();

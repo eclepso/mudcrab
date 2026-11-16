@@ -44,6 +44,7 @@ impl Fixture {
         let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
         fs::create_dir_all(data.join("scripts")).unwrap();
         fs::create_dir_all(&staging).unwrap();
+        common::current_staging_generation(&staging);
         let config = common::cpu_lod_config(&data, &output);
         Self {
             _temp: temp,
@@ -311,6 +312,7 @@ async fn changed_malformed_nif_does_not_publish_the_previous_staged_glb() {
     let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
     fs::create_dir_all(data.join("meshes")).unwrap();
     fs::create_dir_all(staging.join("meshes")).unwrap();
+    common::current_staging_generation(&staging);
     let source = data.join("meshes/one.nif");
     let valid_nif = dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
         name: "One",
@@ -371,6 +373,7 @@ async fn fails_even_without_fail_fast_when_invalid_staged_output_cannot_be_remov
     let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
     fs::create_dir_all(data.join("meshes")).unwrap();
     fs::create_dir_all(staging.join("meshes/one.glb")).unwrap();
+    common::current_staging_generation(&staging);
     fs::write(data.join("meshes/one.nif"), b"malformed NIF bytes").unwrap();
     let mut config = common::cpu_lod_config(&data, &output);
     config.resume_staging = Some(staging);

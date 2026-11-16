@@ -2,10 +2,11 @@
 //! parser and then through the database export: one `LIGH` base record with the
 //! 48-byte `DATA` layout and an `FNAM` fade, and one `REFR` carrying an `XRDS`
 //! radius override.
+mod common;
 
 use converter::esm::{
     binary::{parse_group, parse_plugin_file, parse_record_header},
-    exporter::{create_tables, export_to_db, validate_database},
+    exporter::validate_database,
     records::RawRecord,
 };
 use converter::shared;
@@ -14,7 +15,7 @@ use dummy_content::{
     layout,
 };
 use rusqlite::Connection;
-use std::{collections::HashMap, fs, path::Path};
+use std::{fs, path::Path};
 
 /// The spec `dummy-content gen --with-lights` assembles: one exterior cell, its
 /// static and the light, built from the same `layout` constants the command
@@ -244,17 +245,9 @@ fn generated_light_plugin_never_panics_under_truncation_or_mutation() {
     }
 }
 
-/// The parsed plugin through the converter's database export: the same
-/// `create_tables` + `export_to_db` pair the pipeline runs on `Skyrim.esm`.
-fn export_to_database(records: Vec<RawRecord>) -> Connection {
-    let connection = Connection::open_in_memory().unwrap();
-    create_tables(&connection).unwrap();
-    let master: HashMap<u32, RawRecord> = records
-        .into_iter()
-        .map(|record| (record.form_id, record))
-        .collect();
-    export_to_db(&connection, &master).unwrap();
-    connection
+/// Original grouped fixture bytes go through the current complete native writer.
+fn export_to_database(plugin: &Path) -> Connection {
+    common::native_database(&[plugin.to_path_buf()])
 }
 
 /// The `LIGH` base record of a parsed plugin.
@@ -296,13 +289,13 @@ fn generated_light_plugin_exports_a_lights_row_and_a_reference_radius_override()
         )
     };
 
-    let connection = export_to_database(records);
+    let connection = export_to_database(&write_plugin(directory.path()));
 
     type LightRow = (String, f64, i64, i64, i64, i64, f64, f64);
     let light: LightRow = connection
         .query_row(
             "SELECT editor_id,radius,color_r,color_g,color_b,flags,falloff,fade FROM lights WHERE id=?1",
-            [base_form_id],
+            [common::stored_key(&connection, base_form_id)],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -335,7 +328,7 @@ fn generated_light_plugin_exports_a_lights_row_and_a_reference_radius_override()
         connection
             .query_row(
                 "SELECT radius_override FROM \"references\" WHERE id=?1",
-                [id],
+                [common::stored_key(&connection, id)],
                 |row| row.get(0),
             )
             .unwrap()
@@ -352,7 +345,7 @@ fn generated_light_plugin_exports_a_lights_row_and_a_reference_radius_override()
     let model_path: Option<String> = connection
         .query_row(
             "SELECT model_path FROM statics WHERE id=?1",
-            [base_form_id],
+            [common::stored_key(&connection, base_form_id)],
             |row| row.get(0),
         )
         .unwrap();
@@ -383,12 +376,12 @@ fn a_light_without_a_model_exports_a_lights_row_and_no_statics_row() {
     let records = parse_plugin_file(&path).unwrap();
     let base_form_id = light_form_id(&records);
 
-    let connection = export_to_database(records);
+    let connection = export_to_database(&path);
 
     let radius: f64 = connection
         .query_row(
             "SELECT radius FROM lights WHERE id=?1",
-            [base_form_id],
+            [common::stored_key(&connection, base_form_id)],
             |row| row.get(0),
         )
         .unwrap();
@@ -396,7 +389,7 @@ fn a_light_without_a_model_exports_a_lights_row_and_no_statics_row() {
     let statics: i64 = connection
         .query_row(
             "SELECT count(*) FROM statics WHERE id=?1",
-            [base_form_id],
+            [common::stored_key(&connection, base_form_id)],
             |row| row.get(0),
         )
         .unwrap();
@@ -421,10 +414,29 @@ fn reference_enable_state_exports_to_normalized_columns() {
         enable_parent: Some((0x1234, 0x1)),
         ..esm::PRESET_LIGHT
     };
-    fs::write(&path, esm::plugin_with_lights(&spec(), &stateful).unwrap()).unwrap();
-    let records = parse_plugin_file(&path).unwrap();
-    let connection = export_to_database(records);
-    let (header_flags, parent, parent_flags): (u32, Option<u32>, Option<u32>) = connection
+    let mut bytes = esm::plugin_with_lights(&spec(), &stateful).unwrap();
+    let target = dummy_content::inhouse_items::record(
+        b"REFR",
+        0x1234,
+        &[
+            (b"NAME", 3u32.to_le_bytes().to_vec()),
+            (b"DATA", vec![0; 24]),
+        ],
+    );
+    // Supply the actual parent; the original fixture's bare 0x1234 was unresolved.
+    let group = [
+        b"GRUP".as_slice(),
+        &((target.len() + 24) as u32).to_le_bytes(),
+        &16u32.to_le_bytes(),
+        &6i32.to_le_bytes(),
+        &[0; 8],
+        &target,
+    ]
+    .concat();
+    bytes.extend(group);
+    fs::write(&path, bytes).unwrap();
+    let connection = export_to_database(&path);
+    let (header_flags, parent, parent_flags): (u32, Option<i64>, Option<u32>) = connection
         .query_row(
             "SELECT header_flags, enable_parent_id, enable_parent_flags FROM \"references\" \
              WHERE id = (SELECT id FROM \"references\" WHERE header_flags = 0x800)",
@@ -433,12 +445,15 @@ fn reference_enable_state_exports_to_normalized_columns() {
         )
         .unwrap();
     assert_eq!(header_flags, 0x800, "the initially-disabled bit survives");
-    assert_eq!(parent, Some(0x1234), "the XESP parent FormID survives");
+    assert_eq!(
+        parent,
+        Some(common::stored_key(&connection, 0x1234)),
+        "the XESP parent identity survives"
+    );
     assert_eq!(parent_flags, Some(0x1), "the XESP inversion flag survives");
 
     // The default preset stays unconditionally enabled: zero flags, no parent.
-    let connection =
-        export_to_database(parse_plugin_file(&write_plugin(directory.path())).unwrap());
+    let connection = export_to_database(&write_plugin(directory.path()));
     let (header_flags, parent, parent_flags): (u32, Option<u32>, Option<u32>) = connection
         .query_row(
             "SELECT header_flags, enable_parent_id, enable_parent_flags FROM \"references\" \

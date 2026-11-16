@@ -246,7 +246,7 @@ async fn malformed_global_value_preserves_neighbors_through_publication() {
         let (load_order, payload): (i64, Vec<u8>) = database
             .query_row(
                 "SELECT source.load_order,source.payload FROM inhouse_source_records source JOIN records ON records.form_id=source.form_id WHERE source.form_id=?",
-                [id],
+                [common::stored_key(&database, id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -257,7 +257,7 @@ async fn malformed_global_value_preserves_neighbors_through_publication() {
         let count: i64 = database
             .query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE form_id=?"),
-                [0x5811],
+                [common::stored_key(&database, 0x5811)],
                 |row| row.get(0),
             )
             .unwrap();

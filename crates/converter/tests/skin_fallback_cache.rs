@@ -782,7 +782,10 @@ async fn assert_repair_rejects_stale_contract(contracts: &[&str]) {
     let mut saved = manifest(&output);
     assert_eq!(saved.failures.len(), 1, "{:?}", saved.failures);
     assert!(saved.failures.contains_key(BODY_KEY));
-    assert_eq!(saved.schema_version, 28);
+    assert_eq!(
+        saved.schema_version,
+        converter::cache::CONVERTER_SCHEMA_VERSION
+    );
     assert_eq!(
         saved.configuration_hash,
         configuration_hash(&config).unwrap()

@@ -1,8 +1,6 @@
 //! Reader recovery must remain local while making published warning packs visibly incomplete.
-use converter::{
-    AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader,
-    esm::types::ArchivedRecordData,
-};
+mod common;
+use converter::{AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader};
 use rusqlite::Connection;
 use std::{fs, path::Path, process::Command};
 
@@ -274,29 +272,21 @@ async fn rebuild(data: &Path, source: &Path, output: &Path) -> PipelineReport {
 /// Query canonical rows by explicit identity so malformed bytes cannot displace usable neighbors.
 fn record_ids(output: &Path) -> Vec<u32> {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    db.prepare("SELECT form_id FROM records ORDER BY form_id")
+    let mut ids = db
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
         .unwrap()
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| row.get::<_, i64>(0))
         .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
+        .map(|row| common::runtime_id(&db, row.unwrap()))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 /// Inspect the published canonical bytes independently of the reader's summary text.
 fn fields(output: &Path, id: u32, signature: &[u8; 4]) -> Vec<Vec<u8>> {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let bytes: Vec<u8> = db
-        .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes)
-        .unwrap()
-        .subrecords
-        .into_iter()
-        .filter(|subrecord| &subrecord.tag == signature)
-        .map(|subrecord| subrecord.data)
-        .collect()
+    common::runtime_fields(&db, id, signature)
 }
 
 /// Require one bounded summary of a kind rather than one warning for every damaged occurrence.
@@ -351,13 +341,8 @@ fn incomplete(report: &PipelineReport, output: &Path, warning_count: usize) {
 }
 
 /// Match a compatibility category without confusing it with a data-loss summary.
-fn compatibility_kind(reader: RecordReader) -> &'static str {
-    match reader {
-        RecordReader::Legacy => {
-            "FormID occurrences name a master index past the plugin's master list and were treated as the plugin's own"
-        }
-        RecordReader::Inhouse => "used supplier-self runtime compatibility",
-    }
+fn compatibility_kind(_reader: RecordReader) -> &'static str {
+    "FormID occurrence(s) past the original master list resolved to self"
 }
 
 /// Require one counted compatibility notice while retaining unrelated metadata advisories.
@@ -375,15 +360,8 @@ fn compatibility_notice(report: &PipelineReport, reader: RecordReader) {
         report.notices
     );
     let message = messages[0];
-    if reader == RecordReader::Legacy {
-        assert!(message.starts_with("notice:"), "{message}");
-        assert!(message.contains("in ACTI)"), "{message}");
-    }
-    let count = match reader {
-        RecordReader::Legacy => "2 FormID occurrences",
-        RecordReader::Inhouse => "for 1 headers",
-    };
-    assert!(message.contains(count), "{message}");
+    assert!(message.starts_with("notice:"), "{message}");
+    assert!(message.contains("2 FormID occurrence(s)"), "{message}");
     assert!(message.contains("first:"), "{message}");
     assert!(message.contains("07000810"), "{message}");
 }
@@ -654,6 +632,13 @@ async fn readable_localized_gaps_are_notices_but_malformed_entries_remain_warnin
             assert_eq!(fields(&output, 0x807, b"FULL"), [b"Resolved\0".to_vec()]);
             assert_eq!(fields(&output, 0x808, b"FULL"), [b"\0".to_vec()]);
             assert_eq!(fields(&output, 0x809, b"FULL"), [b"\0".to_vec()]);
+            let native = Connection::open(output.join("skyrim_world.db")).unwrap();
+            for (id, string_id) in [(0x806, 17u32), (0x807, 33), (0x808, 0), (0x809, 34)] {
+                assert_eq!(
+                    common::native_fields(&native, id, b"FULL"),
+                    [string_id.to_le_bytes().to_vec()]
+                );
+            }
             let manifest: serde_json::Value =
                 serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
                     .unwrap();
@@ -998,9 +983,9 @@ async fn severity_reuse_assets_cli_replays_compatibility_notices_and_exits_zero(
     }
 }
 
-/// Real ESL-width truncation and wide optional clearing remain warnings, without self projection.
+/// Native ESL identities keep full locals; only the absent optional target is cleared.
 #[tokio::test]
-async fn severity_legacy_light_truncation_and_optional_clear_remain_warnings() {
+async fn severity_native_light_full_local_is_preserved_and_optional_clear_remains_warning() {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     let output = directory.path().join("pack");
@@ -1026,10 +1011,38 @@ async fn severity_legacy_light_truncation_and_optional_clear_remain_warnings() {
     .concat();
     plugin(&data, "loss.esl", 0x201, &[], &body);
     let report = publish(&data, &output, RecordReader::Legacy).await;
-    assert_eq!(record_ids(&output), [0xFE00_0821, 0xFE00_0822, 0xFE00_0830]);
+    let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let owner = identity.table().id("loss.esl").unwrap();
+    let expected = [0x822, 0x830, 0x1821].map(|local| {
+        shared::form_key::FormKey::new(owner, local)
+            .unwrap()
+            .to_sql_i64()
+    });
+    let actual = db
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
     assert_eq!(
-        fields(&output, 0xFE00_0830, b"XOWN"),
+        actual, expected,
+        "the wide source identity must never alias local 0x821"
+    );
+    assert_eq!(
+        identity
+            .runtime_id_if_available(identity.required_key(expected[2]).unwrap())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        common::runtime_fields(&db, 0xFE00_0830, b"XOWN"),
         [0u32.to_le_bytes().to_vec()]
+    );
+    assert_eq!(
+        common::native_fields(&db, 0xFE00_0830, b"XOWN"),
+        [0x1900u32.to_le_bytes().to_vec()]
     );
     assert!(
         !report.notices.iter().any(|notice| {
@@ -1039,17 +1052,14 @@ async fn severity_legacy_light_truncation_and_optional_clear_remain_warnings() {
         "unexpected compatibility notice: {:?}",
         report.notices
     );
-    let truncation = warning(&report, "loss.esl", "light-plugin ID occurrences");
     assert!(
-        truncation.contains("1 light-plugin ID occurrences"),
-        "{truncation}"
+        !report
+            .warnings
+            .iter()
+            .any(|line| line.contains("truncated"))
     );
-    assert!(truncation.contains("00001821"), "{truncation}");
-    let optional = warning(&report, "loss.esl", "invalid optional FormID links");
-    assert!(
-        optional.contains("1 invalid optional FormID links"),
-        "{optional}"
-    );
+    let optional = warning(&report, "loss.esl", "invalid native links");
+    assert!(optional.contains("1 invalid native links"), "{optional}");
     assert!(optional.contains("00001900"), "{optional}");
-    incomplete(&report, &output, 2);
+    incomplete(&report, &output, 1);
 }

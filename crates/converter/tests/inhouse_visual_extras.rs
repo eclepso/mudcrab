@@ -316,18 +316,7 @@ async fn broken_visual_mod_publishes_neighbors_prior_winners_and_safe_fields() {
     drain.await.unwrap();
     common::assert_reader_warning_publication(&report, &output);
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let malformed_blob: Vec<u8> = db
-        .query_row(
-            "SELECT data FROM records WHERE form_id=0x01002C00",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let canonical = rkyv::from_bytes::<
-        converter::esm::types::ArchivedRecordData,
-        rkyv::rancor::Error,
-    >(&malformed_blob)
-    .unwrap();
+    let canonical = common::runtime_record(&db, 0x0100_2C00);
     assert!(
         !canonical
             .subrecords
@@ -347,9 +336,11 @@ async fn broken_visual_mod_publishes_neighbors_prior_winners_and_safe_fields() {
     assert_eq!(vision.data, expected.canonical_bytes);
     for id in neighbors.into_iter().chain([0x0100_2C00]) {
         let count: i64 = db
-            .query_row("SELECT COUNT(*) FROM records WHERE form_id=?", [id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE form_id=?",
+                [common::stored_key(&db, id)],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -358,7 +349,7 @@ async fn broken_visual_mod_publishes_neighbors_prior_winners_and_safe_fields() {
         let (load, payload): (i64, Vec<u8>) = db
             .query_row(
                 "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=?",
-                [id],
+                [common::stored_key(&db, id)],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
