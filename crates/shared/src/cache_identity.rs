@@ -39,7 +39,7 @@ pub fn owner_order(identity: &PackIdentity, key: FormKey) -> (u8, usize, u32) {
         .entry(key.plugin())
         .expect("validated owner key");
     (
-        u8::from(entry.facts.flags.light),
+        u8::from(identity.table().is_light(entry.id)),
         identity
             .order()
             .iter()
