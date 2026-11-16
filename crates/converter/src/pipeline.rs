@@ -1194,7 +1194,10 @@ impl AssetPipeline {
                         false,
                     )?;
                 record_notes.warnings.extend(cache_warnings);
-                phases.insert("terrain_runtime_cache".into(), runtime_cache_started.elapsed().as_secs_f64());
+                phases.insert(
+                    "terrain_runtime_cache".into(),
+                    runtime_cache_started.elapsed().as_secs_f64(),
+                );
                 if config.record_reader == crate::config::RecordReader::Inhouse {
                     let preserved_cache_started = Instant::now();
                     let (_, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
@@ -1204,7 +1207,10 @@ impl AssetPipeline {
                         true,
                     )?;
                     record_notes.warnings.extend(cache_warnings);
-                    phases.insert("terrain_preserved_cache".into(), preserved_cache_started.elapsed().as_secs_f64());
+                    phases.insert(
+                        "terrain_preserved_cache".into(),
+                        preserved_cache_started.elapsed().as_secs_f64(),
+                    );
                 }
                 let mut seen_notes = std::collections::HashSet::new();
                 record_notes

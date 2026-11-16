@@ -220,7 +220,10 @@ pub(crate) fn convert_with_dump(
     phases.insert("native_read".into(), read_started.elapsed().as_secs_f64());
     let localization_started = Instant::now();
     localize(&mut conversion, &paths, strings, &facts)?;
-    phases.insert("native_localization".into(), localization_started.elapsed().as_secs_f64());
+    phases.insert(
+        "native_localization".into(),
+        localization_started.elapsed().as_secs_f64(),
+    );
     let dump_started = Instant::now();
     if let Some((path, signatures)) = dump {
         use std::io::Write;
@@ -270,7 +273,14 @@ pub(crate) fn convert_with_dump(
         writer.flush()?;
         read.records.clear();
     }
-    phases.insert("native_typed_dump".into(), if dump.is_some() { dump_started.elapsed().as_secs_f64() } else { 0.0 });
+    phases.insert(
+        "native_typed_dump".into(),
+        if dump.is_some() {
+            dump_started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        },
+    );
     let projection_started = Instant::now();
     let offsets = facts
         .iter()
@@ -291,7 +301,10 @@ pub(crate) fn convert_with_dump(
         .master
         .retain(|handle, record| record.record_type != *b"LAND" || selected_lands.contains(handle));
     let projected = stage.project_with_source_offsets(&offsets)?;
-    phases.insert("native_projection".into(), projection_started.elapsed().as_secs_f64());
+    phases.insert(
+        "native_projection".into(),
+        projection_started.elapsed().as_secs_f64(),
+    );
     let sql_started = Instant::now();
     let mut output = Connection::open(database)?;
     output.pragma_update(None, "foreign_keys", true)?;
@@ -309,7 +322,10 @@ pub(crate) fn convert_with_dump(
             mode,
         },
     )?;
-    phases.insert("native_sql_publication".into(), sql_started.elapsed().as_secs_f64());
+    phases.insert(
+        "native_sql_publication".into(),
+        sql_started.elapsed().as_secs_f64(),
+    );
     let diagnostics_started = Instant::now();
     drop(projected);
     drop(stage);
@@ -326,7 +342,10 @@ pub(crate) fn convert_with_dump(
     }
     let warnings = conversion.warnings.clone();
     let notices = conversion.notices.clone();
-    phases.insert("native_diagnostics".into(), diagnostics_started.elapsed().as_secs_f64());
+    phases.insert(
+        "native_diagnostics".into(),
+        diagnostics_started.elapsed().as_secs_f64(),
+    );
     phases.insert(
         "native_form_key_world".into(),
         started.elapsed().as_secs_f64(),
