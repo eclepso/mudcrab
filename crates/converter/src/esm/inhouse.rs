@@ -548,7 +548,8 @@ pub fn validate_record_bundle_scope(
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => {
-                    return Err(error).wrap_err("cannot read record reader metadata; convert again");
+                    return Err(error)
+                        .wrap_err("cannot read record reader metadata; convert again");
                 }
             };
             ensure!(
