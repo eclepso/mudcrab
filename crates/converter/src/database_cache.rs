@@ -379,8 +379,15 @@ fn validate_bundle(directory: &Path, identity: &Identity) -> Result<()> {
             directory.join("inhouse-reader-diagnostics.json"),
         )?)?;
         ensure!(
-            diagnostics["decoder"].is_object() && diagnostics["adapter"].is_object(),
-            "incomplete reader diagnostics"
+            diagnostics["format_version"] == 2
+                && diagnostics["plugin_table_digest"].as_str() == Some(scope.digest_hex().as_str())
+                && diagnostics["decoder"].is_object()
+                && ["warnings", "notices"].into_iter().all(|name| {
+                    diagnostics[name]
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+                }),
+            "incomplete or foreign native reader diagnostics"
         );
         let profile: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.join(inhouse::DATABASE_PROFILE_FILE))?)?;
@@ -1074,6 +1081,54 @@ mod tests {
     }
 
     #[test]
+    fn database_bundle_rejects_old_foreign_or_incomplete_native_diagnostics_with_matching_hashes() {
+        let fixture = fixture();
+        let cancellation = Cancellation::new();
+        for (field, value) in [
+            ("format_version", serde_json::json!(1)),
+            (
+                "plugin_table_digest",
+                serde_json::json!("foreign allocation"),
+            ),
+            ("decoder", serde_json::Value::Null),
+            ("warnings", serde_json::json!({})),
+            ("notices", serde_json::json!([1])),
+        ] {
+            store(
+                &fixture.cache,
+                &fixture.identity,
+                &fixture.staging,
+                &cancellation,
+            )
+            .unwrap();
+            let bundle = fixture.cache.join(&fixture.identity.key);
+            let path = bundle.join("inhouse-reader-diagnostics.json");
+            let mut diagnostics: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            diagnostics[field] = value;
+            fs::write(&path, serde_json::to_vec(&diagnostics).unwrap()).unwrap();
+            let mut receipt: Receipt =
+                serde_json::from_slice(&fs::read(bundle.join(RECEIPT)).unwrap()).unwrap();
+            receipt.files.insert(
+                "inhouse-reader-diagnostics.json".into(),
+                Payload {
+                    size: fs::metadata(&path).unwrap().len(),
+                    sha256: hash_file(&path).unwrap(),
+                },
+            );
+            fs::write(bundle.join(RECEIPT), serde_json::to_vec(&receipt).unwrap()).unwrap();
+            let target = destination(&fixture, &format!("bad-diagnostics-{field}"));
+            assert!(
+                restore(&fixture.cache, &fixture.identity, &target, &cancellation)
+                    .unwrap()
+                    .is_none(),
+                "invalid native diagnostics {field} must miss even with matching hashes"
+            );
+            assert!(!target.join("skyrim_world.db").exists());
+        }
+    }
+
+    #[test]
     fn database_bundle_rejects_malformed_profile_even_if_receipt_hashes_match() {
         let fixture = fixture();
         let cancellation = Cancellation::new();
@@ -1136,7 +1191,11 @@ mod tests {
             key(&fixture.config, &reversed)
         );
         let original_plugin = fs::read(&fixture.plugins[0]).unwrap();
-        fs::write(&fixture.plugins[0], b"changed plugin bytes").unwrap();
+        // Change a native TES4 revision byte while preserving the plugin's valid framing.
+        // Corrupting the entire header now correctly makes identity unavailable.
+        let mut changed_plugin = original_plugin.clone();
+        changed_plugin[16] ^= 1;
+        fs::write(&fixture.plugins[0], changed_plugin).unwrap();
         assert_ne!(key(&fixture.config, &fixture.plugins), original);
         fs::write(&fixture.plugins[0], original_plugin).unwrap();
         let vfs_strings = fixture.staging.join("vfs/Strings");

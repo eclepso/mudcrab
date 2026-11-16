@@ -344,7 +344,7 @@ mod tests {
         let order = names.iter().map(|name| table.id(name).unwrap()).collect();
         let identity = PackIdentity::new(table, order).unwrap();
         let mut connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB); CREATE TABLE actor_models(id INTEGER PRIMARY KEY,race_id INTEGER,sex TEXT,resolution TEXT); CREATE TABLE inhouse_localized_fields(form_id INTEGER,field_index INTEGER,resolved_text TEXT)").unwrap();
+        connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB,cell_id INTEGER,worldspace_id INTEGER); CREATE TABLE actor_models(id INTEGER PRIMARY KEY,race_id INTEGER,sex TEXT,resolution TEXT); CREATE TABLE inhouse_localized_fields(form_id INTEGER,field_index INTEGER,resolved_text TEXT)").unwrap();
         let transaction = connection.transaction().unwrap();
         shared::records::create_record_context(&transaction, &identity).unwrap();
         transaction.commit().unwrap();
@@ -376,7 +376,7 @@ mod tests {
         let selector = identity.table().entry(owner).unwrap().facts.masters.len() as u32;
         connection
             .execute(
-                "INSERT INTO records VALUES(?1,?2,?3,?4)",
+                "INSERT INTO records(form_id,record_type,load_order,data) VALUES(?1,?2,?3,?4)",
                 params![record.to_sql_i64(), kind, priority, bytes.as_slice()],
             )
             .unwrap();

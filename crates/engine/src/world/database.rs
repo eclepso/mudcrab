@@ -265,6 +265,14 @@ pub struct AssetCatalog {
 }
 
 impl AssetCatalog {
+    /// Deliberately poison the null lookup to test surface code's own null handling.
+    /// Native SQL admission rejects this runtime handle; this is not a database adapter.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_null_diffuse(mut self, path: &str) -> Self {
+        self.landscape_diffuse.insert(0, path.to_owned());
+        self
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         shared::world_assets::install_runtime_identity_functions(&connection)?;
@@ -456,7 +464,7 @@ impl WorldDatabase {
         )
     }
 
-    /// Opens available core doors, including legacy packages with no door table.
+    /// Opens a current authenticated world with any available core door projection.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with(path, WorldDatabaseFeatures::default())
     }
@@ -714,7 +722,7 @@ fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<
         return Ok(Vec::new());
     }
     let has_chunks: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM lod_chunks WHERE worldspace_id=?1)",
+        "SELECT EXISTS(SELECT 1 FROM lod_chunks WHERE worldspace_id=stored_key(?1))",
         [query.worldspace_id],
         |row| row.get(0),
     )?;
@@ -1371,21 +1379,20 @@ mod tests {
     }
 
     fn fixture(connection: &Connection) {
+        crate::world::test_support::install_projection(connection);
         connection
             .execute_batch(
-                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-                INSERT INTO schema_info VALUES(6);
-                CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+                r#"CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL,flags INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
                 CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
-                INSERT INTO cells VALUES(10,60,2,-3);
-                INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1,0);
-                INSERT INTO "references" VALUES(30,10,20,8200,-12200,50,0,0,0,1);
-                INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
-                INSERT INTO "references" VALUES(31,99,20,8250,-12150,55,0,0,0,1);
-                INSERT INTO exterior_spatial VALUES(31,8250,8250,-12150,-12150,55,55,99,60);"#,
+                INSERT INTO cells VALUES(stored_key(10),stored_key(60),2,-3);
+                INSERT INTO statics VALUES(stored_key(20),'architecture/wall.nif',-1,-2,-3,1,2,3,1,0);
+                INSERT INTO "references" VALUES(stored_key(30),stored_key(10),stored_key(20),8200,-12200,50,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(stored_key(30),8200,8200,-12200,-12200,50,50,stored_key(10),stored_key(60));
+                INSERT INTO "references" VALUES(stored_key(31),stored_key(99),stored_key(20),8250,-12150,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(stored_key(31),8250,8250,-12150,-12150,55,55,stored_key(99),stored_key(60));"#,
             )
             .unwrap();
     }
@@ -1418,7 +1425,7 @@ mod tests {
         assert!(!denied.joins.contains("door_links"));
         assert!(denied.columns.contains(ABSENT_DOOR_COLUMNS));
         let sql = format!(
-            "SELECT {} FROM \"references\" r{} WHERE r.id=30",
+            "SELECT {} FROM \"references\" r{} WHERE r.id=stored_key(30)",
             denied.columns, denied.joins
         );
         connection
@@ -1445,13 +1452,13 @@ mod tests {
         enable_columns(&connection);
         connection
             .execute_batch(
-                "UPDATE \"references\" SET header_flags=2048,enable_parent_id=20,enable_parent_flags=1 WHERE id=30;",
+                "UPDATE \"references\" SET header_flags=2048,enable_parent_id=stored_key(20),enable_parent_flags=1 WHERE id=stored_key(30);",
             )
             .unwrap();
         let mut query =
             ReferenceQuery::for_connection(&connection, WorldDatabaseFeatures::default()).unwrap();
         let sql = format!(
-            "SELECT {} FROM \"references\" r{} WHERE r.id=30",
+            "SELECT {} FROM \"references\" r{} WHERE r.id=stored_key(30)",
             query.columns, query.joins
         );
         connection
@@ -1475,7 +1482,7 @@ mod tests {
             ",123,456,NULL,1.25,2.5,3.75,0.1,0.2,0.3,NULL,NULL,NULL,r.header_flags",
         );
         let sql = format!(
-            "SELECT {} FROM \"references\" r{} WHERE r.id=30",
+            "SELECT {} FROM \"references\" r{} WHERE r.id=stored_key(30)",
             query.columns, query.joins
         );
         connection
@@ -1522,8 +1529,8 @@ mod tests {
         // 0x200 Starts Dead with Persistent (0x400); 0x800 alone is Initially Disabled.
         connection
             .execute_batch(
-                "UPDATE \"references\" SET header_flags=1536 WHERE id=30;
-                 UPDATE \"references\" SET header_flags=2048 WHERE id<>30;",
+                "UPDATE \"references\" SET header_flags=1536 WHERE id=stored_key(30);
+                 UPDATE \"references\" SET header_flags=2048 WHERE id<>stored_key(30);",
             )
             .unwrap();
         let mut query =
@@ -1541,11 +1548,11 @@ mod tests {
         fixture(&connection);
         enable_columns(&connection);
         connection.execute_batch(
-            "INSERT INTO \"references\"(id,cell_id,base_form_id,header_flags) VALUES(100,500,9999,2048);
+            "INSERT INTO \"references\"(id,cell_id,base_form_id,header_flags) VALUES(stored_key(100),stored_key(500),stored_key(9999),2048);
              INSERT INTO \"references\"(id,cell_id,base_form_id,header_flags,enable_parent_id,enable_parent_flags)
-                 VALUES(200,600,9998,0,100,1);
-             UPDATE \"references\" SET header_flags=2048,enable_parent_id=200,enable_parent_flags=952044802 WHERE id=30;
-             UPDATE \"references\" SET enable_parent_id=30,enable_parent_flags=1 WHERE id=31;"
+                 VALUES(stored_key(200),stored_key(600),stored_key(9998),0,stored_key(100),1);
+             UPDATE \"references\" SET header_flags=2048,enable_parent_id=stored_key(200),enable_parent_flags=952044802 WHERE id=stored_key(30);
+             UPDATE \"references\" SET enable_parent_id=stored_key(30),enable_parent_flags=1 WHERE id=stored_key(31);"
         ).unwrap();
         let mut query =
             ReferenceQuery::for_connection(&connection, WorldDatabaseFeatures::default()).unwrap();
@@ -1597,11 +1604,11 @@ mod tests {
             fixture(&connection);
             enable_columns(&connection);
             connection.execute(
-                "UPDATE \"references\" SET enable_parent_id=?1,enable_parent_flags=1 WHERE id=30",
+                "UPDATE \"references\" SET enable_parent_id=stored_key(?1),enable_parent_flags=1 WHERE id=stored_key(30)",
                 [parent],
             ).unwrap();
             connection.execute_batch(
-                "UPDATE \"references\" SET enable_parent_id=30,enable_parent_flags=1 WHERE id=31;"
+                "UPDATE \"references\" SET enable_parent_id=stored_key(30),enable_parent_flags=1 WHERE id=stored_key(31);"
             ).unwrap();
             let mut query =
                 ReferenceQuery::for_connection(&connection, WorldDatabaseFeatures::default())
@@ -1626,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reference_columns_default_enabled_but_partial_columns_fail() {
+    fn current_native_reduced_reference_columns_default_enabled_but_partial_columns_fail() {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
         let payload = load_cell(&connection, 1, CellKey::Interior(99)).unwrap();
@@ -1650,8 +1657,8 @@ mod tests {
         fixture(&connection);
         enable_columns(&connection);
         connection.execute_batch(
-            "INSERT INTO \"references\"(id,cell_id,base_form_id,header_flags) VALUES(100,500,9999,-1);
-             UPDATE \"references\" SET enable_parent_id=100,enable_parent_flags=1 WHERE id=31;"
+            "INSERT INTO \"references\"(id,cell_id,base_form_id,header_flags) VALUES(stored_key(100),stored_key(500),stored_key(9999),-1);
+             UPDATE \"references\" SET enable_parent_id=stored_key(100),enable_parent_flags=1 WHERE id=stored_key(31);"
         ).unwrap();
         let error = load_cell(&connection, 1, CellKey::Interior(99)).unwrap_err();
         assert!(
@@ -1667,13 +1674,14 @@ mod tests {
         fixture(&connection);
         enable_columns(&connection);
         connection
-            .execute_batch("UPDATE \"references\" SET enable_parent_id=30 WHERE id=31;")
+            .execute_batch("UPDATE \"references\" SET enable_parent_id=stored_key(30) WHERE id=stored_key(31);")
             .unwrap();
         let error = load_cell(&connection, 1, CellKey::Interior(99)).unwrap_err();
         assert!(format!("{error:#}").contains("enable parent has no XESP flags"));
     }
 
     fn lod_fixture(connection: &Connection) {
+        crate::world::test_support::install_projection(connection);
         connection
             .execute_batch(
                 "CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,lod_origin_x INTEGER,lod_origin_y INTEGER);
@@ -1686,7 +1694,7 @@ mod tests {
                     source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
                  CREATE VIRTUAL TABLE lod_chunks_spatial USING rtree(
                     id,minX,maxX,minY,maxY,+worldspace_id,+tier,+anchor_x,+anchor_y);
-                 INSERT INTO worldspaces VALUES(60,-8,12);",
+                 INSERT INTO worldspaces VALUES(stored_key(60),-8,12);",
             )
             .unwrap();
         connection
@@ -1694,40 +1702,40 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO lod_chunks VALUES(60,4,-1,2,'lod/0000003c/4/cell_-1_2.glb',?1,\
+                "INSERT INTO lod_chunks VALUES(stored_key(60),4,-1,2,'lod/000000000100003c/4/cell_-1_2.glb',?1,\
                  -50000.0,50000.0,0.0,-40000.0,60000.0,100.0,'-12,20;-11,20')",
                 ["b".repeat(64)],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO lod_chunks_spatial VALUES(1,-50000.0,-40000.0,50000.0,60000.0,60,4,-1,2)",
+                "INSERT INTO lod_chunks_spatial VALUES(1,-50000.0,-40000.0,50000.0,60000.0,stored_key(60),4,-1,2)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO lod_chunks VALUES(60,8,-1,2,'lod/0000003c/8/cell_-1_2.glb',?1,\
+                "INSERT INTO lod_chunks VALUES(stored_key(60),8,-1,2,'lod/000000000100003c/8/cell_-1_2.glb',?1,\
                  -50000.0,50000.0,0.0,-40000.0,60000.0,100.0,'-12,20')",
                 ["c".repeat(64)],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO lod_chunks_spatial VALUES(2,-50000.0,-40000.0,50000.0,60000.0,60,8,-1,2)",
+                "INSERT INTO lod_chunks_spatial VALUES(2,-50000.0,-40000.0,50000.0,60000.0,stored_key(60),8,-1,2)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO lod_chunks VALUES(61,4,-1,2,'lod/0000003d/4/cell_-1_2.glb',?1,\
+                "INSERT INTO lod_chunks VALUES(stored_key(61),4,-1,2,'lod/000000000100003d/4/cell_-1_2.glb',?1,\
                  -50000.0,50000.0,0.0,-40000.0,60000.0,100.0,'-12,20')",
                 ["d".repeat(64)],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO lod_chunks_spatial VALUES(3,-50000.0,-40000.0,50000.0,60000.0,61,4,-1,2)",
+                "INSERT INTO lod_chunks_spatial VALUES(3,-50000.0,-40000.0,50000.0,60000.0,stored_key(61),4,-1,2)",
                 [],
             )
             .unwrap();
@@ -1740,6 +1748,13 @@ mod tests {
             bounds_min: min,
             bounds_max: max,
         }
+    }
+
+    fn fixture_digest(path: &Path) -> String {
+        let connection = Connection::open(path).unwrap();
+        shared::pack_identity::PackIdentity::read_sql(&connection)
+            .unwrap()
+            .digest_hex()
     }
 
     /// Builds a database and conversion manifest with the current combined LOD identities.
@@ -1766,6 +1781,7 @@ mod tests {
                 [shared::WORLD_DATABASE_SCHEMA_VERSION],
             )
             .unwrap();
+        crate::world::test_support::install_projection(&connection);
         for id in 0..chunks {
             connection
                 .execute("INSERT INTO lod_chunks(id) VALUES(?1)", [id])
@@ -1780,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_databases_render_without_lod_but_cannot_advertise_lod() {
+    fn legacy_databases_require_reconversion_with_or_without_lod() {
         for version in [3, 4, 5] {
             let directory = tempfile::tempdir().unwrap();
             let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
@@ -1795,7 +1811,12 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
-            validate_lod_build_contract(directory.path(), 20).unwrap();
+            assert!(
+                validate_lod_build_contract(directory.path(), 20)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("convert again")
+            );
             std::fs::write(directory.path().join("lod-manifest.json"), b"{}").unwrap();
             assert!(validate_lod_build_contract(directory.path(), 20).is_err());
         }
@@ -1858,6 +1879,7 @@ mod tests {
                 directory.path().join("lod-manifest.json"),
                 serde_json::to_vec(&serde_json::json!({
                     "build_identity": identity, "converter_schema": producer,
+                    "plugin_table_digest": fixture_digest(&database),
                     "world_database_schema": world, "chunks": 1,
                     "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
                 }))
@@ -1881,6 +1903,7 @@ mod tests {
             directory.path().join("lod-manifest.json"),
             serde_json::to_vec(&serde_json::json!({
                 "build_identity": identity, "converter_schema": 24,
+                "plugin_table_digest": fixture_digest(&database),
                 "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
                 "chunks": 1, "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
             }))
@@ -1939,6 +1962,7 @@ mod tests {
             &manifest_path,
             serde_json::to_vec(&serde_json::json!({
                 "build_identity": identity,
+                "plugin_table_digest": fixture_digest(&database),
                 "converter_schema": shared::LOD_CONVERTER_SCHEMA_VERSION,
                 "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
                 "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
@@ -2026,9 +2050,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_world6_lod_metadata_remains_queryable() {
+    fn current_native_lod_metadata_remains_queryable() {
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(6);").unwrap();
         lod_fixture(&connection);
         let chunks = load_lod_chunks(
             &connection,
@@ -2054,9 +2077,9 @@ mod tests {
         let chunk = &chunks[0];
         assert_eq!(
             chunk.key,
-            ChunkKey::new(60, LodTier::Tier4, ChunkAnchor::new(-1, 2))
+            ChunkKey::new(0x0100_003c, LodTier::Tier4, ChunkAnchor::new(-1, 2))
         );
-        assert_eq!(chunk.payload_path, "lod/0000003c/4/cell_-1_2.glb");
+        assert_eq!(chunk.payload_path, "lod/000000000100003c/4/cell_-1_2.glb");
         assert_eq!(chunk.content_hash, "b".repeat(64));
         assert_eq!(chunk.build_identity, "a".repeat(64));
         assert_eq!(chunk.origin, LodOrigin::new(-8, 12));
@@ -2076,7 +2099,7 @@ mod tests {
         lod_fixture(&connection);
         connection
             .execute(
-                "UPDATE lod_chunks SET payload_path='../outside.glb' WHERE worldspace_id=60",
+                "UPDATE lod_chunks SET payload_path='../outside.glb' WHERE worldspace_id=stored_key(60)",
                 [],
             )
             .unwrap();
@@ -2093,8 +2116,8 @@ mod tests {
 
         connection
             .execute(
-                "UPDATE lod_chunks SET payload_path='lod/0000003c/4/cell_-1_2.glb',bounds_max_x=-60000.0 \
-                 WHERE worldspace_id=60",
+                "UPDATE lod_chunks SET payload_path='lod/000000000100003c/4/cell_-1_2.glb',bounds_max_x=-60000.0 \
+                 WHERE worldspace_id=stored_key(60)",
                 [],
             )
             .unwrap();
@@ -2120,7 +2143,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         lod_fixture(&connection);
         connection
-            .execute("UPDATE worldspaces SET lod_origin_x=NULL WHERE id=60", [])
+            .execute(
+                "UPDATE worldspaces SET lod_origin_x=NULL WHERE id=stored_key(60)",
+                [],
+            )
             .unwrap();
         let error = load_lod_chunks(
             &connection,
@@ -2131,11 +2157,14 @@ mod tests {
         assert!(error.contains("no valid X origin"), "{error}");
 
         connection
-            .execute("UPDATE worldspaces SET lod_origin_x=-8 WHERE id=60", [])
+            .execute(
+                "UPDATE worldspaces SET lod_origin_x=-8 WHERE id=stored_key(60)",
+                [],
+            )
             .unwrap();
         connection
             .execute(
-                "UPDATE lod_chunks SET source_cells='not-a-cell' WHERE worldspace_id=60",
+                "UPDATE lod_chunks SET source_cells='not-a-cell' WHERE worldspace_id=stored_key(60)",
                 [],
             )
             .unwrap();
@@ -2185,11 +2214,11 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL);
-                 INSERT INTO records VALUES(20,'STAT');
-                 INSERT INTO statics VALUES(22,'clutter/barrel.nif',-1,-1,-1,1,1,1,1,0);
-                 INSERT INTO records VALUES(22,'MISC');
-                 INSERT INTO \"references\" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
-                 INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);",
+                 INSERT INTO records VALUES(stored_key(20),'STAT');
+                 INSERT INTO statics VALUES(stored_key(22),'clutter/barrel.nif',-1,-1,-1,1,1,1,1,0);
+                 INSERT INTO records VALUES(stored_key(22),'MISC');
+                 INSERT INTO \"references\" VALUES(stored_key(40),stored_key(10),stored_key(22),8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(stored_key(40),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));",
             )
             .unwrap();
         let payload = load_cell(
@@ -2221,17 +2250,17 @@ mod tests {
         // but no flag. A marker flag on a model without "marker" in its path is still authoritative.
         connection
             .execute_batch(
-                "INSERT INTO statics VALUES(23,'marker_map.nif',-1,-1,-1,1,1,1,1,8388608);
-                 INSERT INTO statics VALUES(24,'clutter/civilwar/cwmapmarkers01.nif',-1,-1,-1,1,1,1,1,0);
-                 INSERT INTO \"references\" VALUES(41,10,23,8250,-12150,55,0,0,0,1);
-                 INSERT INTO exterior_spatial VALUES(41,8250,8250,-12150,-12150,55,55,10,60);
-                 INSERT INTO \"references\" VALUES(42,10,24,8250,-12150,55,0,0,0,1);
-                 INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);
-                 INSERT INTO statics VALUES(25,'architecture/wall.nif',-1,-1,-1,1,1,1,1,8388608);
-                 INSERT INTO \"references\" VALUES(43,10,25,8250,-12150,55,0,0,0,1);
-                 INSERT INTO exterior_spatial VALUES(43,8250,8250,-12150,-12150,55,55,10,60);
-                 INSERT INTO \"references\" VALUES(44,10,999,8250,-12150,55,0,0,0,1);
-                 INSERT INTO exterior_spatial VALUES(44,8250,8250,-12150,-12150,55,55,10,60);",
+                "INSERT INTO statics VALUES(stored_key(23),'marker_map.nif',-1,-1,-1,1,1,1,1,8388608);
+                 INSERT INTO statics VALUES(stored_key(24),'clutter/civilwar/cwmapmarkers01.nif',-1,-1,-1,1,1,1,1,0);
+                 INSERT INTO \"references\" VALUES(stored_key(41),stored_key(10),stored_key(23),8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(stored_key(41),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));
+                 INSERT INTO \"references\" VALUES(stored_key(42),stored_key(10),stored_key(24),8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(stored_key(42),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));
+                 INSERT INTO statics VALUES(stored_key(25),'architecture/wall.nif',-1,-1,-1,1,1,1,1,8388608);
+                 INSERT INTO \"references\" VALUES(stored_key(43),stored_key(10),stored_key(25),8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(stored_key(43),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));
+                 INSERT INTO \"references\" VALUES(stored_key(44),stored_key(10),stored_key(999),8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(stored_key(44),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));",
             )
             .unwrap();
         let payload = load_cell(&connection, 1, exterior).unwrap();
@@ -2255,9 +2284,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         let connection = Connection::open(&path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'Textures\\Landscape\\Tundra02.DDS'); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO waters VALUES(9,'textures/water/flow.dds');",
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(stored_key(2),'Textures\\Landscape\\Tundra02.DDS'); INSERT INTO landscape_textures VALUES(stored_key(1),stored_key(2)); INSERT INTO waters VALUES(stored_key(9),'textures/water/flow.dds');",
             )
             .unwrap();
         drop(connection);
@@ -2267,9 +2297,8 @@ mod tests {
             Some("textures/landscape/tundra02.ktx2")
         );
         assert_eq!(catalog.water_flow(9), Some("textures/water/flow.ktx2"));
-        // This fixture's `waters` table predates the fresnel/reflectivity columns entirely, the
-        // same shape a database converted before this change has; the catalog must tolerate it
-        // rather than fail to open.
+        // This fresh native fixture deliberately omits the optional water-color columns;
+        // catalog capability fallback must not require an old-world format adapter.
         assert_eq!(catalog.water_colors(9), None);
     }
 
@@ -2278,6 +2307,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         let connection = Connection::open(&path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); \
@@ -2290,7 +2320,7 @@ mod tests {
         let reflection = u32::from_le_bytes([119, 140, 157, 0]);
         connection
             .execute(
-                "INSERT INTO waters(id,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path) VALUES (?1,?2,?3,?4,?5,?6,NULL)",
+                "INSERT INTO waters(id,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path) VALUES (stored_key(?1),?2,?3,?4,?5,?6,NULL)",
                 params![18u32, shallow, deep, reflection, 0.10f32, 0.8f32],
             )
             .unwrap();
@@ -2341,9 +2371,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         let connection = Connection::open(&path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'textures/land/snow.dds','textures/land/snow_n.dds'); INSERT INTO texture_sets VALUES(3,'textures/land/dirt.dds',''); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO landscape_textures VALUES(4,3);",
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(stored_key(2),'textures/land/snow.dds','textures/land/snow_n.dds'); INSERT INTO texture_sets VALUES(stored_key(3),'textures/land/dirt.dds',''); INSERT INTO landscape_textures VALUES(stored_key(1),stored_key(2)); INSERT INTO landscape_textures VALUES(stored_key(4),stored_key(3));",
             )
             .unwrap();
         drop(connection);
@@ -2358,13 +2389,14 @@ mod tests {
             "an empty normal path is no normal map"
         );
 
-        // A database whose texture sets have no normal_path column at all still opens; the
+        // A current native fixture may omit the optional normal-path projection; the
         // terrain then draws with its geometric normal.
         let older = directory.path().join("older.db");
         let connection = Connection::open(&older).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'textures/land/grass.dds'); INSERT INTO landscape_textures VALUES(1,2);",
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(stored_key(2),'textures/land/grass.dds'); INSERT INTO landscape_textures VALUES(stored_key(1),stored_key(2));",
             )
             .unwrap();
         drop(connection);
@@ -2390,43 +2422,38 @@ mod tests {
         assert!(validate(&path).is_err());
     }
 
-    /// Schema-4 and schema-5 databases validate and load; a schema newer than the current one does not.
+    /// Old scalar worlds are refused; a fresh native world retains reduced-column query support.
     #[test]
-    fn accepts_schema_four_and_five_databases_with_legacy_query_columns() {
+    fn old_worlds_require_reconversion_and_current_native_reduced_columns_load() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         let connection = Connection::open(&path).unwrap();
         fixture(&connection);
-        drop(connection);
-        for version in [4, 5] {
-            let connection = Connection::open(&path).unwrap();
+        for version in [4, 5, shared::WORLD_DATABASE_SCHEMA_VERSION + 1] {
             connection
                 .execute("UPDATE schema_info SET version=?1", [version])
                 .unwrap();
-            drop(connection);
-            validate(&path).unwrap();
-            let connection = Connection::open(&path).unwrap();
-            let payload = load_cell(
-                &connection,
-                1,
-                CellKey::Exterior {
-                    worldspace_id: 60,
-                    grid_x: 2,
-                    grid_y: -3,
-                },
-            )
-            .unwrap();
-            assert_eq!(payload.references.len(), 2);
+            let error = validate(&path).unwrap_err().to_string();
+            assert!(error.contains("convert again"), "{version}: {error}");
         }
-        let connection = Connection::open(&path).unwrap();
         connection
             .execute(
                 "UPDATE schema_info SET version=?1",
-                [shared::WORLD_DATABASE_SCHEMA_VERSION + 1],
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
             )
             .unwrap();
-        drop(connection);
-        assert!(validate(&path).is_err());
+        validate(&path).unwrap();
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload.references.len(), 2);
     }
 
     #[test]
@@ -2434,7 +2461,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
         connection
-            .execute_batch("INSERT INTO cells VALUES(9,60,2,-3); INSERT INTO land VALUES(10);")
+            .execute_batch("INSERT INTO cells VALUES(stored_key(9),stored_key(60),2,-3); INSERT INTO land VALUES(stored_key(10));")
             .unwrap();
 
         let payload = load_cell(
@@ -2578,12 +2605,12 @@ mod tests {
                 r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,
                     radius REAL NOT NULL,color_r INTEGER NOT NULL,color_g INTEGER NOT NULL,
                     color_b INTEGER NOT NULL,flags INTEGER NOT NULL);
-                INSERT INTO lights VALUES(20,256.0,255,150,80,8);
-                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(22,'clutter/barrel.nif',-2,-3,-4,2,3,4,1);
-                INSERT INTO "references" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
-                INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);
+                INSERT INTO lights VALUES(stored_key(20),256.0,255,150,80,8);
+                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(stored_key(22),'clutter/barrel.nif',-2,-3,-4,2,3,4,1);
+                INSERT INTO "references" VALUES(stored_key(40),stored_key(10),stored_key(22),8250,-12150,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(stored_key(40),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));
                 ALTER TABLE "references" ADD COLUMN radius_override REAL;
-                UPDATE "references" SET radius_override=850.8 WHERE id=30;"#,
+                UPDATE "references" SET radius_override=850.8 WHERE id=stored_key(30);"#,
             )
             .unwrap();
     }
@@ -2654,7 +2681,7 @@ mod tests {
                 r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,
                     radius REAL NOT NULL,color_r INTEGER NOT NULL,color_g INTEGER NOT NULL,
                     color_b INTEGER NOT NULL,flags INTEGER NOT NULL);
-                INSERT INTO lights VALUES(20,512.0,255,200,120,0);"#,
+                INSERT INTO lights VALUES(stored_key(20),512.0,255,200,120,0);"#,
             )
             .unwrap();
         assert!(!has_radius_override(&connection).unwrap());
@@ -2687,18 +2714,18 @@ mod tests {
     fn emittance_fixture(connection: &Connection) {
         connection
             .execute_batch(
-                r#"INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(22,'clutter/barrel.nif',-2,-3,-4,2,3,4,1);
-                INSERT INTO "references" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
-                INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);
+                r#"INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(stored_key(22),'clutter/barrel.nif',-2,-3,-4,2,3,4,1);
+                INSERT INTO "references" VALUES(stored_key(40),stored_key(10),stored_key(22),8250,-12150,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(stored_key(40),8250,8250,-12150,-12150,55,55,stored_key(10),stored_key(60));
                 ALTER TABLE "references" ADD COLUMN emittance_id INTEGER;
-                UPDATE "references" SET emittance_id=535419 WHERE id=30;
-                UPDATE "references" SET emittance_id=535420 WHERE id=40;
+                UPDATE "references" SET emittance_id=stored_key(535419) WHERE id=stored_key(30);
+                UPDATE "references" SET emittance_id=stored_key(535420) WHERE id=stored_key(40);
                 CREATE TABLE emittance(id INTEGER PRIMARY KEY,source_type TEXT NOT NULL,weather_id INTEGER,
                     sunrise_r INTEGER NOT NULL,sunrise_g INTEGER NOT NULL,sunrise_b INTEGER NOT NULL,
                     day_r INTEGER NOT NULL,day_g INTEGER NOT NULL,day_b INTEGER NOT NULL,
                     sunset_r INTEGER NOT NULL,sunset_g INTEGER NOT NULL,sunset_b INTEGER NOT NULL,
                     night_r INTEGER NOT NULL,night_g INTEGER NOT NULL,night_b INTEGER NOT NULL);
-                INSERT INTO emittance VALUES(535419,'REGN',535418,124,70,16,12,34,56,243,118,54,242,176,55);"#,
+                INSERT INTO emittance VALUES(stored_key(535419),'REGN',stored_key(535418),124,70,16,12,34,56,243,118,54,242,176,55);"#,
             )
             .unwrap();
     }
@@ -2795,11 +2822,11 @@ mod tests {
                     pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,
                     rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,
                     destination_cell_id INTEGER,destination_worldspace_id INTEGER);
-                INSERT INTO "references" VALUES(32,10,20,8260,-12100,50,0,0,0,1);
-                INSERT INTO exterior_spatial VALUES(32,8260,8260,-12100,-12100,50,50,10,60);
-                INSERT INTO door_links VALUES(30,700,10.5,-20.25,30,0,0,1.5,500,NULL);
-                INSERT INTO door_links VALUES(31,701,8200,-12200,50,0,0,3.0,10,60);
-                INSERT INTO door_links VALUES(32,702,1,2,3,0,0,0,NULL,NULL);"#,
+                INSERT INTO "references" VALUES(stored_key(32),stored_key(10),stored_key(20),8260,-12100,50,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(stored_key(32),8260,8260,-12100,-12100,50,50,stored_key(10),stored_key(60));
+                INSERT INTO door_links VALUES(stored_key(30),stored_key(700),10.5,-20.25,30,0,0,1.5,stored_key(500),NULL);
+                INSERT INTO door_links VALUES(stored_key(31),stored_key(701),8200,-12200,50,0,0,3.0,stored_key(10),stored_key(60));
+                INSERT INTO door_links VALUES(stored_key(32),stored_key(702),1,2,3,0,0,0,NULL,NULL);"#,
             )
             .unwrap();
     }
@@ -2896,8 +2923,8 @@ mod tests {
                 r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
                     pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,
                     destination_cell_id INTEGER,destination_worldspace_id INTEGER);
-                INSERT INTO door_links VALUES(30,700,NULL,NULL,NULL,NULL,NULL,NULL,500,NULL);
-                INSERT INTO door_links VALUES(31,701,8200,-12200,50,0,0,NULL,10,60);"#,
+                INSERT INTO door_links VALUES(stored_key(30),stored_key(700),NULL,NULL,NULL,NULL,NULL,NULL,stored_key(500),NULL);
+                INSERT INTO door_links VALUES(stored_key(31),stored_key(701),8200,-12200,50,0,0,NULL,stored_key(10),stored_key(60));"#,
             )
             .unwrap();
 
@@ -2919,7 +2946,7 @@ mod tests {
             .execute_batch(
                 r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
                     pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL);
-                INSERT INTO door_links VALUES(30,700,1,2,3,0,0,0);"#,
+                INSERT INTO door_links VALUES(stored_key(30),stored_key(700),1,2,3,0,0,0);"#,
             )
             .unwrap();
 

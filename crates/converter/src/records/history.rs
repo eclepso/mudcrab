@@ -790,7 +790,14 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
     } else {
         pack.join("skyrim_world.db")
     };
-    let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = crate::esm::inhouse::validate_record_bundle_scope(&database, &conn)?;
+    let context = shared::records::RecordContextReader::new(&conn)?;
+    let identity = context.identity();
+    let runtime = identity.legacy_view()?;
+    let requested_key = runtime
+        .from_legacy_u32(form_id)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("null has no override chain"))?;
     let (order, sources) = stored_order(&conn)?;
     // Schema/provenance failures leave the requested history visible, but forbid decoding
     // with a different schema or an add-on set that only partly passed validation.
@@ -798,11 +805,20 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
     let prepared = schemas.as_ref().ok().map(decoder::prepare_runtime_schema);
     let mut kind_statement =
         conn.prepare("SELECT form_id,record_type FROM inhouse_source_records")?;
-    let kinds = kind_statement
-        .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
-        .filter_map(|row| row.ok())
-        .filter_map(|(id, tag)| tag.as_bytes().try_into().ok().map(|tag| (id, tag)))
-        .collect();
+    let mut kinds = HashMap::new();
+    for row in
+        kind_statement.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+    {
+        let (stored, tag) = row?;
+        let key = identity.required_key(stored)?;
+        // This API exposes checked u32 runtime handles, while persisted rows stay native.
+        // Owners without a legacy slot remain available through read_native_chain.
+        if let Ok(id) = runtime.to_legacy_u32(key)
+            && let Ok(tag) = tag.as_bytes().try_into()
+        {
+            kinds.insert(id, tag);
+        }
+    }
     // The retained 18-column layout predates authenticated group bounds and raw signatures.
     // Keep its available chain facts visible, but never infer missing replay authority.
     let mut layout = conn.prepare("PRAGMA table_info(record_overrides)")?;
@@ -838,7 +854,7 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
         retained_column("frame_complete"),
         retained_column("record_signature")
     ))?;
-    let rows = statement.query_map([form_id], |r| {
+    let rows = statement.query_map([requested_key.to_sql_i64()], |r| {
         Ok((
             r.get::<_, u32>(0)?,
             r.get::<_, u32>(1)?,

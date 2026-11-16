@@ -144,10 +144,15 @@ fn override_plugin() -> Vec<u8> {
     .concat()
 }
 
-type Names = Vec<(String, u32, Option<String>)>;
+type Names = Vec<(String, i64, Option<String>)>;
+
+/// Rename.esp allocates owner1 and Skyrim.esm owner2, despite Skyrim supplying first.
+fn stored(local: u32) -> i64 {
+    0x0000_0002_0000_0000 | i64::from(local)
+}
 
 /// Every display-name column, and the `FULL` bytes each reader stored in `records.data`.
-fn publish(reader: RecordReader, data: &Path, root: &Path) -> (Names, Vec<(u32, Vec<u8>)>) {
+fn publish(reader: RecordReader, data: &Path, root: &Path) -> (Names, Vec<(i64, Vec<u8>)>) {
     let database = root.join(format!("{reader:?}.db"));
     let paths = vec![data.join("Skyrim.esm"), data.join("Rename.esp")];
     EsmParser::convert_plugins_with_reader(&paths, &database, reader, data).unwrap();
@@ -168,7 +173,7 @@ fn publish(reader: RecordReader, data: &Path, root: &Path) -> (Names, Vec<(u32, 
         .prepare("SELECT form_id, data FROM records ORDER BY form_id")
         .unwrap()
         .query_map([], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
         .unwrap()
         .map(Result::unwrap)
@@ -185,8 +190,8 @@ fn publish(reader: RecordReader, data: &Path, root: &Path) -> (Names, Vec<(u32, 
 }
 
 /// Localized names resolve through the plugin's string table and plain names decode from
-/// Windows-1252, the same way for both frontends, in the projections and in `records.data`. A
-/// name without a string stays NULL in both.
+/// Windows-1252 in both frontends' projections. Canonical FULL bytes retain original localized
+/// IDs or native Windows-1252 authoring; a missing localized ID stays NULL in the projection.
 #[test]
 fn both_record_readers_publish_the_same_display_names() {
     let root = tempfile::tempdir().unwrap();
@@ -216,7 +221,7 @@ fn both_record_readers_publish_the_same_display_names() {
         inhouse
             .0
             .iter()
-            .find(|(owner, row, _)| owner == table && *row == id)
+            .find(|(owner, row, _)| owner == table && *row == stored(id))
             .unwrap_or_else(|| panic!("{table} {id:08X} has a row"))
             .2
             .clone()
@@ -234,12 +239,22 @@ fn both_record_readers_publish_the_same_display_names() {
     );
     assert_eq!(name("statics", UNNAMED), None, "ID 99 has no string");
     assert!(
-        !legacy.0.iter().any(|(_, id, _)| *id == DELETED),
+        !legacy.0.iter().any(|(_, id, _)| *id == stored(DELETED)),
         "the winning tombstone removes its earlier projection"
     );
     assert!(
-        !legacy.1.iter().any(|(id, _)| *id == DELETED),
+        !legacy.1.iter().any(|(id, _)| *id == stored(DELETED)),
         "the winning tombstone removes its earlier canonical row"
     );
     assert_eq!(name("npcs", PERSON).as_deref(), Some("Sven"));
+    let full = |local| {
+        &inhouse
+            .1
+            .iter()
+            .find(|(id, _)| *id == stored(local))
+            .unwrap()
+            .1
+    };
+    assert_eq!(full(CHEST).as_slice(), 4u32.to_le_bytes());
+    assert_eq!(full(DOOR).as_slice(), b"T\xFCr\0");
 }

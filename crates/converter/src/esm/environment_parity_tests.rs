@@ -33,6 +33,17 @@ const MOD_IMAGE_SPACE: u32 = 0x0200_0801;
 const MOD_WEATHER_AUTHORED: u32 = 0x0100_0802;
 const MOD_WEATHER: u32 = 0x0200_0802;
 
+/// Fresh allocation follows names (Mod=1, Other=2, Skyrim=3), not supplying priority.
+fn stored(runtime: u32) -> i64 {
+    let owner = match runtime >> 24 {
+        0 => 3,
+        1 => 2,
+        2 => 1,
+        _ => panic!("unexpected fixture owner"),
+    };
+    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
+}
+
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
     let mut framed = tag.to_vec();
     framed.extend(u16::try_from(bytes.len()).unwrap().to_le_bytes());
@@ -431,7 +442,9 @@ fn publish(reader: RecordReader, root: &Path) -> Connection {
     let paths = ["Skyrim.esm", "Other.esm", "Mod.esp"].map(|name| root.join(name));
     let database = root.join(format!("{reader:?}.db"));
     EsmParser::convert_plugins_with_reader(&paths, &database, reader, root).unwrap();
-    Connection::open(database).unwrap()
+    let connection = Connection::open(database).unwrap();
+    shared::world_assets::install_runtime_identity_functions(&connection).unwrap();
+    connection
 }
 
 fn get<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
@@ -453,29 +466,29 @@ fn both_record_readers_publish_the_same_environment() {
     let cell = |column: &str| -> Option<i64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM cell_environment WHERE cell_id={LIT_CELL}"),
+            &format!("SELECT {column} FROM cell_environment WHERE cell_id=stored_key({LIT_CELL})"),
         )
     };
     assert_eq!(cell("data_flags"), Some(0x81));
-    assert_eq!(cell("image_space_id"), Some(IMAGE_SPACE.into()));
-    assert_eq!(cell("acoustic_space_id"), Some(ACOUSTICS.into()));
-    assert_eq!(cell("music_id"), Some(MUSIC.into()));
-    assert_eq!(cell("sky_region_id"), Some(REGION.into()));
-    assert_eq!(cell("location_id"), Some(LOCATION.into()));
-    assert_eq!(cell("encounter_zone_id"), Some(ZONE.into()));
-    assert_eq!(cell("owner_id"), Some(FACTION.into()));
+    assert_eq!(cell("image_space_id"), Some(stored(IMAGE_SPACE)));
+    assert_eq!(cell("acoustic_space_id"), Some(stored(ACOUSTICS)));
+    assert_eq!(cell("music_id"), Some(stored(MUSIC)));
+    assert_eq!(cell("sky_region_id"), Some(stored(REGION)));
+    assert_eq!(cell("location_id"), Some(stored(LOCATION)));
+    assert_eq!(cell("encounter_zone_id"), Some(stored(ZONE)));
+    assert_eq!(cell("owner_id"), Some(stored(FACTION)));
     assert_eq!(cell("owner_rank"), Some(2));
-    assert_eq!(cell("water_id"), Some(WATER.into()));
+    assert_eq!(cell("water_id"), Some(stored(WATER)));
     let regions: i64 = get(&conn, "SELECT count(*) FROM cell_regions");
     assert_eq!(regions, 1, "the region that does not exist is dropped");
 
     let lit = |column: &str| -> Option<f64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM cell_lighting WHERE cell_id={LIT_CELL}"),
+            &format!("SELECT {column} FROM cell_lighting WHERE cell_id=stored_key({LIT_CELL})"),
         )
     };
-    assert_eq!(lit("lighting_template_id"), Some(TEMPLATE.into()));
+    assert_eq!(lit("lighting_template_id"), Some(stored(TEMPLATE) as f64));
     assert_eq!(lit("xcll_size"), Some(92.0));
     assert_eq!(lit("ambient_g"), Some(11.0));
     assert_eq!(lit("fog_near_b"), Some(32.0));
@@ -493,7 +506,7 @@ fn both_record_readers_publish_the_same_environment() {
     let short = |column: &str| -> Option<f64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM cell_lighting WHERE cell_id={SHORT_CELL}"),
+            &format!("SELECT {column} FROM cell_lighting WHERE cell_id=stored_key({SHORT_CELL})"),
         )
     };
     assert_eq!(
@@ -508,13 +521,15 @@ fn both_record_readers_publish_the_same_environment() {
     let world = |column: &str| -> Option<f64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM worldspace_environment WHERE worldspace_id={WORLD}"),
+            &format!(
+                "SELECT {column} FROM worldspace_environment WHERE worldspace_id=stored_key({WORLD})"
+            ),
         )
     };
-    assert_eq!(world("climate_id"), Some(CLIMATE.into()));
+    assert_eq!(world("climate_id"), Some(stored(CLIMATE) as f64));
     assert_eq!(
         world("music_id"),
-        Some(MOD_MUSIC.into()),
+        Some(stored(MOD_MUSIC) as f64),
         "ZNAM is remapped through the mod's master list"
     );
     assert_eq!(
@@ -526,7 +541,7 @@ fn both_record_readers_publish_the_same_environment() {
     let template = |column: &str| -> Option<f64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM lighting_templates WHERE id={TEMPLATE}"),
+            &format!("SELECT {column} FROM lighting_templates WHERE id=stored_key({TEMPLATE})"),
         )
     };
     assert_eq!(template("data_size"), Some(92.0));
@@ -542,7 +557,7 @@ fn both_record_readers_publish_the_same_environment() {
     let weather = |id: u32, column: &str| -> Option<f64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM weathers WHERE id={id}"),
+            &format!("SELECT {column} FROM weathers WHERE id=stored_key({id})"),
         )
     };
     assert_eq!(weather(WEATHER, "fog_day_far"), Some(200_000.0));
@@ -553,12 +568,15 @@ fn both_record_readers_publish_the_same_environment() {
     assert_eq!(weather(WEATHER, "disabled_cloud_layers"), Some(5.0));
     assert_eq!(
         weather(WEATHER, "precipitation_id"),
-        Some(PRECIPITATION.into())
+        Some(stored(PRECIPITATION) as f64)
     );
-    assert_eq!(weather(WEATHER, "sky_static_id"), Some(SKY_STATIC.into()));
+    assert_eq!(
+        weather(WEATHER, "sky_static_id"),
+        Some(stored(SKY_STATIC) as f64)
+    );
     assert_eq!(
         weather(WEATHER, "image_space_day_id"),
-        Some(IMAGE_SPACE.into())
+        Some(stored(IMAGE_SPACE) as f64)
     );
     assert_eq!(
         weather(WEATHER, "image_space_night_id"),
@@ -567,13 +585,13 @@ fn both_record_readers_publish_the_same_environment() {
     );
     assert_eq!(
         weather(MOD_WEATHER, "image_space_sunrise_id"),
-        Some(MOD_IMAGE_SPACE.into()),
+        Some(stored(MOD_IMAGE_SPACE) as f64),
         "IMSP is remapped through the mod's master list"
     );
     let colour: (i64, i64, i64) = conn
         .query_row(
             &format!(
-                "SELECT r, g, b FROM weather_colors WHERE weather_id={WEATHER} AND color_type='unknown' AND time_of_day='sunset'"
+                "SELECT r, g, b FROM weather_colors WHERE weather_id=stored_key({WEATHER}) AND color_type='unknown' AND time_of_day='sunset'"
             ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -582,20 +600,20 @@ fn both_record_readers_publish_the_same_environment() {
     assert_eq!(colour, (22, 102, 198), "the third colour type, at sunset");
     let colours: i64 = get(
         &conn,
-        &format!("SELECT count(*) FROM weather_colors WHERE weather_id={WEATHER}"),
+        &format!("SELECT count(*) FROM weather_colors WHERE weather_id=stored_key({WEATHER})"),
     );
     assert_eq!(colours, 56, "14 colour types at four times");
     let night_scale: Option<f64> = get(
         &conn,
         &format!(
-            "SELECT scale FROM weather_directional_ambient WHERE weather_id={WEATHER} AND time_of_day='night'"
+            "SELECT scale FROM weather_directional_ambient WHERE weather_id=stored_key({WEATHER}) AND time_of_day='night'"
         ),
     );
     assert_eq!(night_scale, Some(131.0), "the fourth DALC is night");
 
     let climate: Vec<(Option<i64>, i64, Option<i64>)> = conn
         .prepare(&format!(
-            "SELECT weather_id, chance, chance_global_id FROM climate_weathers WHERE climate_id={CLIMATE} ORDER BY position"
+            "SELECT weather_id, chance, chance_global_id FROM climate_weathers WHERE climate_id=stored_key({CLIMATE}) ORDER BY position"
         ))
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -605,13 +623,13 @@ fn both_record_readers_publish_the_same_environment() {
     assert_eq!(
         climate,
         vec![
-            (Some(MOD_WEATHER.into()), -1, Some(GLOBAL.into())),
+            (Some(stored(MOD_WEATHER)), -1, Some(stored(GLOBAL))),
             (
-                Some(WEATHER.into()),
+                Some(stored(WEATHER)),
                 i64::from(i32::MIN),
-                Some(GLOBAL.into())
+                Some(stored(GLOBAL))
             ),
-            (Some(RAIN.into()), 100, Some(GLOBAL.into())),
+            (Some(stored(RAIN)), 100, Some(stored(GLOBAL))),
         ],
         "the mod's override wins, its WLST links are remapped and signed chances retained"
     );
@@ -620,28 +638,28 @@ fn both_record_readers_publish_the_same_environment() {
             "SELECT weather_id, chance, chance_global_id FROM region_weathers WHERE region_id=?1 ORDER BY position",
         )
         .unwrap()
-        .query_map([REGION], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_map([stored(REGION)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
     assert_eq!(
         region,
         vec![
-            (Some(RAIN.into()), 100, None),
-            (Some(WEATHER.into()), 0x8000_0000, Some(GLOBAL.into())),
-            (Some(RAIN.into()), i64::from(u32::MAX), None),
+            (Some(stored(RAIN)), 100, None),
+            (Some(stored(WEATHER)), 0x8000_0000, Some(stored(GLOBAL))),
+            (Some(stored(RAIN)), i64::from(u32::MAX), None),
         ],
         "REGN keeps unsigned high-bit chances nonnegative; 0xBEEF is no global"
     );
 
     let saturation: Option<f64> = get(
         &conn,
-        &format!("SELECT saturation FROM image_spaces WHERE id={MOD_IMAGE_SPACE}"),
+        &format!("SELECT saturation FROM image_spaces WHERE id=stored_key({MOD_IMAGE_SPACE})"),
     );
     assert_eq!(saturation, Some(0.5));
     let blur: Option<i64> = get(
         &conn,
-        &format!("SELECT dof_sky_blur_radius FROM image_spaces WHERE id={IMAGE_SPACE}"),
+        &format!("SELECT dof_sky_blur_radius FROM image_spaces WHERE id=stored_key({IMAGE_SPACE})"),
     );
     assert_eq!(blur, Some(16672));
 }

@@ -661,11 +661,13 @@ mod tests {
         let output = temp.path().join("pack");
         export_record_bundle_typed(&data, &order, &output, &[*b"LAND", *b"STAT"]).unwrap();
         let db = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+        // This single-plugin native pack allocates ArrayNeighbors.esp as owner1.
+        let stored = |local: u32| 0x0000_0001_0000_0000i64 | i64::from(local);
         for id in ids {
             assert_eq!(
                 db.query_row(
                     "SELECT COUNT(*) FROM records WHERE form_id=?1",
-                    [id],
+                    [stored(id)],
                     |row| row.get::<_, u32>(0)
                 )
                 .unwrap(),
@@ -676,7 +678,7 @@ mod tests {
         let source_count: u32 = db
             .query_row(
                 "SELECT COUNT(*) FROM inhouse_source_records WHERE form_id=?1",
-                [land.form_id],
+                [stored(land.form_id)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -684,7 +686,7 @@ mod tests {
         assert_eq!(
             db.query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?1 AND record_type='LAND'",
-                [land.form_id],
+                [stored(land.form_id)],
                 |row| row.get::<_, u32>(0),
             )
             .unwrap(),
@@ -693,7 +695,7 @@ mod tests {
         let (status, reason): (String, String) = db
             .query_row(
                 "SELECT status,reason FROM record_overrides WHERE form_id=?1",
-                [land.form_id],
+                [stored(land.form_id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -704,7 +706,7 @@ mod tests {
             [land.source_form_id], |row| row.get::<_, u32>(0),
         ).unwrap(), 1);
         let mut raw_versions = Vec::new();
-        let summary = super::super::history_source::visit_source_history(
+        let summary = super::super::history_source::visit_native_source_history(
             &output,
             None,
             super::super::history_source::SourceQuery::Source {

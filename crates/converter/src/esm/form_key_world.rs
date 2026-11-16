@@ -62,6 +62,8 @@ pub(crate) fn convert_with_dump(
     mode: super::inhouse::RecordBundleMode,
 ) -> Result<super::RecordConversion> {
     let started = Instant::now();
+    let mut phases = BTreeMap::new();
+    let read_started = Instant::now();
     let (paths, name_warnings) = super::form_keys::recover_plugin_paths(paths)?;
     let default_schemas;
     let schemas = match schemas {
@@ -105,7 +107,10 @@ pub(crate) fn convert_with_dump(
                     }
                 }
                 if scalar.record_type == *b"LAND" {
-                    super::cell_cache::validate_inhouse_land(scalar)
+                    // Recovery can already have dropped an unusable texture anchor or
+                    // weight. Validate authored LAND as a unit before it replaces a
+                    // usable predecessor with a deceptively valid partial heightmap.
+                    super::cell_cache::validate_inhouse_land(&native.source)
                         .map_err(|error| error.to_string())?;
                 }
                 Ok(())
@@ -212,7 +217,11 @@ pub(crate) fn convert_with_dump(
         conversion
     };
     conversion.warnings.extend(name_warnings);
+    phases.insert("native_read".into(), read_started.elapsed().as_secs_f64());
+    let localization_started = Instant::now();
     localize(&mut conversion, &paths, strings, &facts)?;
+    phases.insert("native_localization".into(), localization_started.elapsed().as_secs_f64());
+    let dump_started = Instant::now();
     if let Some((path, signatures)) = dump {
         use std::io::Write;
         let read = typed
@@ -261,10 +270,15 @@ pub(crate) fn convert_with_dump(
         writer.flush()?;
         read.records.clear();
     }
+    phases.insert("native_typed_dump".into(), if dump.is_some() { dump_started.elapsed().as_secs_f64() } else { 0.0 });
+    let projection_started = Instant::now();
     let offsets = facts
         .iter()
         .map(|(key, fact)| (*key, fact.offset))
         .collect::<HashMap<_, _>>();
+    let texture_warnings =
+        super::cell_cache::recover_runtime_land_links(&mut conversion, &offsets)?;
+    conversion.warnings.extend(texture_warnings);
     let (land_winners, land_warnings) =
         super::cell_cache::native_land_winners(&conversion, &offsets)?;
     conversion.warnings.extend(land_warnings);
@@ -277,6 +291,8 @@ pub(crate) fn convert_with_dump(
         .master
         .retain(|handle, record| record.record_type != *b"LAND" || selected_lands.contains(handle));
     let projected = stage.project_with_source_offsets(&offsets)?;
+    phases.insert("native_projection".into(), projection_started.elapsed().as_secs_f64());
+    let sql_started = Instant::now();
     let mut output = Connection::open(database)?;
     output.pragma_update(None, "foreign_keys", true)?;
     output.pragma_update(None, "cache_size", -65_536)?;
@@ -293,22 +309,24 @@ pub(crate) fn convert_with_dump(
             mode,
         },
     )?;
+    phases.insert("native_sql_publication".into(), sql_started.elapsed().as_secs_f64());
+    let diagnostics_started = Instant::now();
     drop(projected);
     drop(stage);
     conversion.warnings.extend(projection_warnings);
-    if let Some(read) = typed.as_ref() {
-        if let Some(parent) = database.parent() {
-            std::fs::write(
-                parent.join("inhouse-reader-diagnostics.json"),
-                serde_json::to_vec_pretty(
-                    &serde_json::json!({"format_version":2,"plugin_table_digest":conversion.order.pack_identity()?.digest_hex(),"decoder":read.diagnostics,"warnings":conversion.warnings,"notices":conversion.notices}),
-                )?,
-            )?;
-        }
+    if let Some(read) = typed.as_ref()
+        && let Some(parent) = database.parent()
+    {
+        std::fs::write(
+            parent.join("inhouse-reader-diagnostics.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"format_version":2,"plugin_table_digest":conversion.order.pack_identity()?.digest_hex(),"decoder":read.diagnostics,"warnings":conversion.warnings,"notices":conversion.notices}),
+            )?,
+        )?;
     }
     let warnings = conversion.warnings.clone();
     let notices = conversion.notices.clone();
-    let mut phases = BTreeMap::new();
+    phases.insert("native_diagnostics".into(), diagnostics_started.elapsed().as_secs_f64());
     phases.insert(
         "native_form_key_world".into(),
         started.elapsed().as_secs_f64(),
@@ -391,11 +409,27 @@ fn localize(
     let mut tables = HashMap::new();
     let mut losses: BTreeMap<usize, (usize, String)> = BTreeMap::new();
     let mut gaps: BTreeMap<usize, (usize, String)> = BTreeMap::new();
-    for (key, record) in &mut conversion.records {
+    let mut failed_banks = BTreeSet::new();
+    let mut ordered = conversion.records.keys().copied().collect::<Vec<_>>();
+    ordered.sort_by_key(|key| {
+        (
+            conversion.records[key].source.load_order,
+            facts.get(key).map_or(0, |fact| fact.offset),
+            conversion
+                .order
+                .identity_sort_tuple(*key)
+                .expect("allocated native text owner"),
+        )
+    });
+    for key in ordered {
+        let record = conversion
+            .records
+            .get_mut(&key)
+            .expect("selected native text record");
         let priority = record.source.load_order as usize;
         for (ordinal, (tag, bytes)) in record.source.subrecords.iter().enumerate() {
             let bank = facts
-                .get(key)
+                .get(&key)
                 .and_then(|fact| fact.text_fields.get(&ordinal))
                 .and_then(|(_, bank, _)| bank.as_deref())
                 .or_else(|| records::localized_field_bank(&record.source.record_type, tag));
@@ -429,6 +463,11 @@ fn localize(
                 let malformed = id.is_some_and(|id| {
                     readable.is_some_and(|table| table.malformed_ids.contains(&id))
                 });
+                // Keep the missing/unreadable bank observation as well as each
+                // non-null lookup failure. Null-only references do not report a bank loss.
+                let bank_loss = usize::from(
+                    readable.is_none() && failed_banks.insert((priority, bank.to_owned())),
+                );
                 let summaries = if id.is_some() && readable.is_some() && !malformed {
                     &mut gaps
                 } else {
@@ -438,34 +477,39 @@ fn localize(
                     (
                         0,
                         format!(
-                            "{} source {:08X} {} localized ID {:?}",
+                            "{} source {:08X} {} {}localized ID {}",
                             String::from_utf8_lossy(&record.source.record_type),
                             record.source.form_id,
                             String::from_utf8_lossy(tag),
-                            id
+                            if malformed {
+                                format!("malformed {bank} entry for ")
+                            } else {
+                                "missing ".to_owned()
+                            },
+                            id.map_or_else(|| "<malformed>".to_owned(), |id| id.to_string())
                         ),
                     )
                 });
-                entry.0 += 1;
+                entry.0 += 1 + bank_loss;
             }
         }
     }
     for (priority, (count, first)) in losses {
         conversion.warnings.push(format!(
-            "warning: {}: omitted {count} unusable localized fields (first: {first})",
+            "warning: {}: inhouse adapter reported {count} local decode/lookup issues (first: {first})",
             paths[priority]
                 .file_name()
                 .unwrap_or_default()
-                .to_string_lossy()
+                .to_string_lossy().to_ascii_lowercase()
         ));
     }
     for (priority, (count, first)) in gaps {
         conversion.notices.push(format!(
-            "notice: {}: {count} localized IDs missing from readable tables (first: {first})",
+            "notice: {}: {count} localized IDs missing from readable string tables (first: {first})",
             paths[priority]
                 .file_name()
                 .unwrap_or_default()
-                .to_string_lossy()
+                .to_string_lossy().to_ascii_lowercase()
         ));
     }
     Ok(())
@@ -858,41 +902,44 @@ fn copy_projection(
             if matches!(
                 (table, column.as_str()),
                 ("cells", "data") | ("references", "data") | ("waters", "data")
-            ) {
-                if let Some(handle) = owner {
-                    values[index] = SqlValue::Blob(super::extractors::serialize_subrecords(
-                        &stage.original(handle)?.canonical_record().subrecords,
-                    ));
-                }
+            ) && let Some(handle) = owner
+            {
+                values[index] = SqlValue::Blob(super::extractors::serialize_subrecords(
+                    &stage.original(handle)?.canonical_record().subrecords,
+                ));
             }
-            if table == "scripts" && column == "vmad" {
-                if let Some(handle) = owner {
-                    values[index] = SqlValue::Blob(
-                        stage
-                            .original(handle)?
-                            .canonical_record()
-                            .subrecords
-                            .iter()
-                            .find(|(tag, _)| tag == b"VMAD")
-                            .map(|(_, bytes)| bytes.clone())
-                            .unwrap_or_default(),
-                    );
-                }
+            if table == "scripts"
+                && column == "vmad"
+                && let Some(handle) = owner
+            {
+                values[index] = SqlValue::Blob(
+                    stage
+                        .original(handle)?
+                        .canonical_record()
+                        .subrecords
+                        .iter()
+                        .find(|(tag, _)| tag == b"VMAD")
+                        .map(|(_, bytes)| bytes.clone())
+                        .unwrap_or_default(),
+                );
             }
-            if table == "land" && column == "vtex" {
-                if let Some(handle) = owner {
-                    let record = stage.master.values().find(|record| {
-                        record.record_type == *b"LAND" && record.cell_form_id == Some(handle)
-                    });
-                    if let Some(record) = record {
-                        values[index] = stage
-                            .original(record.form_id)?
-                            .canonical_record()
-                            .subrecords
-                            .iter()
-                            .find(|(tag, _)| tag == b"VTEX")
-                            .map_or(SqlValue::Null, |(_, bytes)| SqlValue::Blob(bytes.clone()));
-                    }
+            if table == "land"
+                && column == "vtex"
+                && let Some(handle) = owner
+            {
+                let record = stage.master.values().find(|record| {
+                    record.record_type == *b"LAND" && record.cell_form_id == Some(handle)
+                });
+                if let Some(record) = record {
+                    values[index] = stage
+                        .original(record.form_id)?
+                        .canonical_record()
+                        .subrecords
+                        .iter()
+                        .find(|(tag, _)| tag == b"VTEX")
+                        .map_or(SqlValue::Blob(Vec::new()), |(_, bytes)| {
+                            SqlValue::Blob(bytes.clone())
+                        });
                 }
             }
         }
@@ -902,10 +949,10 @@ fn copy_projection(
         }
         if table == "projection_omission_samples" {
             for (index, (name, _)) in columns.iter().enumerate() {
-                if name == "form_id" {
-                    if let SqlValue::Integer(value) = values[index] {
-                        identity.required_key(value)?;
-                    }
+                if name == "form_id"
+                    && let SqlValue::Integer(value) = values[index]
+                {
+                    identity.required_key(value)?;
                 }
             }
         }

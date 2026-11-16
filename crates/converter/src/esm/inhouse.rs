@@ -902,12 +902,161 @@ pub(crate) fn write_terrain_cache_profile(
 }
 
 /// Share source-order and layer preservation across conversion, diagnostics and metadata rebuild.
+/// Test-only runtime view retains the genuine native conversion beside inherited CPU assertions.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeTestSnapshot {
+    runtime: HashMap<u32, RawRecord>,
+    native: Option<super::form_key_merge::FormKeyConversion>,
+    offsets: HashMap<shared::form_key::FormKey, u64>,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for NativeTestSnapshot {
+    type Target = HashMap<u32, RawRecord>;
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+/// Interpret only authenticated occurrence sites/text, leaving all persisted native bytes intact.
+#[cfg(test)]
+pub(crate) fn test_runtime_record(
+    connection: &Connection,
+    runtime: u32,
+) -> Result<shared::records::ArchivedRecordData> {
+    use rusqlite::OptionalExtension;
+    let reader = shared::records::RecordContextReader::new(connection)?;
+    let key = reader
+        .identity()
+        .runtime_key(runtime)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("null test record"))?;
+    let record = reader.record(key)?;
+    let stored: Vec<u8> = connection.query_row(
+        "SELECT data FROM records WHERE form_id=?1",
+        [key.to_sql_i64()],
+        |row| row.get(0),
+    )?;
+    let mut aligned = rkyv::util::AlignedVec::<16>::new();
+    aligned.extend_from_slice(&stored);
+    let canonical =
+        rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(&aligned)?;
+    assert_eq!(canonical.subrecords, record.subrecords);
+    let mut fields = Vec::new();
+    for (ordinal, field) in record.subrecords.iter().enumerate() {
+        if !record.is_runtime_usable(ordinal) {
+            continue;
+        }
+        let source = record.source_ordinals[ordinal];
+        let text: Option<Option<String>> = connection
+            .query_row(
+                "SELECT text FROM record_text WHERE record_key=?1 AND source_ordinal=?2",
+                params![key.to_sql_i64(), source],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if text == Some(None) {
+            continue;
+        }
+        let offsets = connection.prepare("SELECT byte_offset FROM resolved_links WHERE record_key=?1 AND source_ordinal=?2 ORDER BY byte_offset")?.query_map(params![key.to_sql_i64(),source],|row|row.get::<_,usize>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut bytes = field.data.clone();
+        if let Some(Some(text)) = text {
+            assert!(
+                offsets.is_empty(),
+                "native text cannot overlap a semantic link"
+            );
+            bytes = text.into_bytes();
+            bytes.push(0);
+        }
+        for offset in offsets {
+            let value = record
+                .resolve_at(ordinal, offset)?
+                .map(|key| reader.identity().runtime_id(key))
+                .transpose()?
+                .unwrap_or(0);
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fields.push(shared::records::ArchivedSubRecord {
+            tag: field.tag,
+            data: bytes,
+        });
+    }
+    Ok(shared::records::ArchivedRecordData { subrecords: fields })
+}
+
+#[cfg(test)]
+fn test_named_key(connection: &Connection, runtime: u32) -> String {
+    let identity = shared::pack_identity::PackIdentity::read_sql(connection).unwrap();
+    identity
+        .table()
+        .named(identity.runtime_key(runtime).unwrap().unwrap())
+        .unwrap()
+        .to_string()
+}
+
+#[cfg(test)]
+pub(crate) fn test_runtime_records(
+    connection: &Connection,
+    native: &super::form_key_merge::FormKeyConversion,
+) -> Result<HashMap<u32, RawRecord>> {
+    let identity = shared::records::RecordContextReader::new(connection)?
+        .identity()
+        .clone();
+    native
+        .records
+        .iter()
+        .map(|(&key, record)| {
+            let runtime = identity.runtime_id(key)?;
+            let fields = test_runtime_record(connection, runtime)?
+                .subrecords
+                .into_iter()
+                .map(|field| (field.tag, field.data))
+                .collect();
+            Ok((
+                runtime,
+                RawRecord {
+                    form_id: runtime,
+                    record_type: record.source.record_type,
+                    flags: record.source.flags,
+                    subrecords: fields,
+                    load_order: record.source.load_order,
+                    cell_form_id: record
+                        .cell
+                        .map(|key| identity.runtime_id(key))
+                        .transpose()?,
+                    worldspace_form_id: record
+                        .worldspace
+                        .map(|key| identity.runtime_id(key))
+                        .transpose()?,
+                },
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn write_terrain_caches(
-    records: &HashMap<u32, RawRecord>,
+    records: &NativeTestSnapshot,
     db_path: &Path,
     output: &Path,
 ) -> Result<usize> {
+    if let Some(native) = &records.native {
+        let started = Instant::now();
+        let (count, _) = crate::esm::cell_cache::write_form_key_cell_cache(
+            native,
+            &records.offsets,
+            &output.join("cell_cache.rkyv"),
+            false,
+        )?;
+        crate::esm::cell_cache::write_form_key_cell_cache(
+            native,
+            &records.offsets,
+            &output.join("cell_cache_preserved.rkyv"),
+            true,
+        )?;
+        write_terrain_cache_profile(output, count, started.elapsed().as_secs_f64())?;
+        return Ok(count);
+    }
     let started = Instant::now();
     let profile_path = output.join(DATABASE_PROFILE_FILE);
     let mut profile = if profile_path.is_file() {
@@ -950,7 +1099,7 @@ pub(crate) fn convert_plugins(
     plugin_paths: &[PathBuf],
     db_path: &Path,
     strings_root: &Path,
-) -> Result<HashMap<u32, RawRecord>> {
+) -> Result<NativeTestSnapshot> {
     convert_plugins_with_dump(
         plugin_paths,
         db_path,
@@ -986,7 +1135,7 @@ fn convert_plugins_with_dump(
     strings_root: &Path,
     dump: Option<(&Path, &[[u8; 4]])>,
     mode: RecordBundleMode,
-) -> Result<HashMap<u32, RawRecord>> {
+) -> Result<NativeTestSnapshot> {
     convert_plugins_with_dump_and_schemas(plugin_paths, db_path, strings_root, dump, mode, None)
 }
 
@@ -999,7 +1148,7 @@ fn convert_plugins_with_dump_and_schemas(
     dump: Option<(&Path, &[[u8; 4]])>,
     mode: RecordBundleMode,
     schemas: Option<&records::addons::RuntimeSchemas>,
-) -> Result<HashMap<u32, RawRecord>> {
+) -> Result<NativeTestSnapshot> {
     convert_plugins_with_dump_impl(
         plugin_paths,
         db_path,
@@ -1022,7 +1171,7 @@ fn convert_plugins_with_dump_impl(
     mode: RecordBundleMode,
     schemas: Option<&records::addons::RuntimeSchemas>,
     #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
-) -> Result<HashMap<u32, RawRecord>> {
+) -> Result<NativeTestSnapshot> {
     convert_plugins_with_text_sources_impl(
         plugin_paths,
         db_path,
@@ -1045,7 +1194,7 @@ fn convert_plugins_with_text_sources_impl(
     mode: RecordBundleMode,
     schemas: Option<&records::addons::RuntimeSchemas>,
     #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
-) -> Result<HashMap<u32, RawRecord>> {
+) -> Result<NativeTestSnapshot> {
     convert_plugins_with_text_sources_report_impl(
         plugin_paths,
         db_path,
@@ -1056,7 +1205,11 @@ fn convert_plugins_with_text_sources_impl(
         #[cfg(test)]
         test_schema,
     )
-    .map(|conversion| conversion.records)
+    .map(|conversion| NativeTestSnapshot {
+        runtime: conversion.records,
+        native: conversion.native,
+        offsets: conversion.source_offsets,
+    })
 }
 
 /// Return published records and summaries by severity without changing recovery semantics.
@@ -1072,6 +1225,63 @@ fn convert_plugins_with_text_sources_report_impl(
     schemas: Option<&records::addons::RuntimeSchemas>,
     #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
 ) -> Result<RecordConversion> {
+    if !db_path.as_os_str().is_empty() {
+        let private_schemas;
+        let schemas = if let Some(schema) = test_schema {
+            private_schemas = records::addons::RuntimeSchemas::from_base_and_addon_bytes(
+                &serde_json::to_vec(schema)?,
+                &[],
+            )
+            .map_err(color_eyre::eyre::Error::msg)?;
+            &private_schemas
+        } else if let Some(schemas) = schemas {
+            schemas
+        } else {
+            private_schemas = records::addons::RuntimeSchemas::from_addon_bytes(&[])
+                .map_err(color_eyre::eyre::Error::msg)?;
+            &private_schemas
+        };
+        if let Some((output, signatures)) = dump {
+            fs::create_dir_all(output)?;
+            write_record_bundle_scope(output, mode, false, signatures)?;
+        }
+        let mut converted = super::form_key_world::convert_with_dump(
+            plugin_paths,
+            db_path,
+            RecordReader::Inhouse,
+            string_sources,
+            Some(schemas),
+            dump,
+            mode,
+        )?;
+        let connection =
+            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        converted.records = test_runtime_records(
+            &connection,
+            converted
+                .native
+                .as_ref()
+                .ok_or_else(|| color_eyre::eyre::eyre!("native test conversion lost context"))?,
+        )?;
+        drop(connection);
+        if let Some(output) = db_path.parent() {
+            write_database_profile(output, db_path, &converted.phases)?;
+        }
+        if let Some((output, signatures)) = dump {
+            let mut reader = reader_identity_with_schemas_in_language(
+                RecordReader::Inhouse,
+                schemas,
+                string_sources.language,
+            );
+            reader["schema_sha256"] = serde_json::json!(schemas.schema_sha256());
+            write_reader_identity_value(output, &reader)?;
+            fs::write(output.join("records-schema.json"), schemas.schema_bytes())?;
+            write_record_bundle_scope(output, mode, true, signatures)?;
+        }
+        return Ok(converted);
+    }
+    // Retain the old scalar path solely as an unbound in-memory oracle. It cannot publish
+    // a named disk database; all publication fixtures above use the genuine native writer.
     let builtin;
     let schemas = match schemas {
         Some(schemas) => schemas,
@@ -2469,9 +2679,10 @@ mod runtime_move_tests {
         assert_eq!(master.len(), if deletion_barrier { 1 } else { 2 });
         assert_eq!(master.contains_key(&runtime_id), !deletion_barrier);
         let conn = Connection::open(&database).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
         let source_rows: u32 = conn
             .query_row(
-                "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
+                "SELECT count(*) FROM inhouse_source_records WHERE form_id=stored_key(?1)",
                 [runtime_id],
                 |row| row.get(0),
             )
@@ -2489,7 +2700,7 @@ mod runtime_move_tests {
             );
             let source: (u32, u32, Vec<u8>) = conn
                 .query_row(
-                    "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=?1",
+                    "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=stored_key(?1)",
                     [runtime_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -2497,7 +2708,7 @@ mod runtime_move_tests {
             assert_eq!(source, (source_id, 1, prior_payload.clone()));
             let localized: (u32, u32, String) = conn
                 .query_row(
-                    "SELECT string_id,load_order,resolved_text FROM inhouse_localized_fields WHERE form_id=?1",
+                    "SELECT string_id,load_order,resolved_text FROM inhouse_localized_fields WHERE form_id=stored_key(?1)",
                     [runtime_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -2505,7 +2716,7 @@ mod runtime_move_tests {
             assert_eq!(localized, (8, 1, "Q7z".into()));
         }
         let versions = conn
-            .prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=?1 ORDER BY plugin_id")
+            .prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=stored_key(?1) ORDER BY plugin_id")
             .unwrap()
             .query_map([runtime_id], |row| {
                 Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
@@ -2543,7 +2754,7 @@ mod runtime_move_tests {
         if !deletion_barrier {
             let row = typed
                 .iter()
-                .find(|row| row["form_id"] == runtime_id)
+                .find(|row| row["form_id"] == test_named_key(&conn, runtime_id))
                 .unwrap();
             assert_eq!(row["load_order"], 1);
             assert_eq!(
@@ -2557,7 +2768,7 @@ mod runtime_move_tests {
         }
         let pin = crate::cache::hash_file(&database).unwrap();
         let mut visited = 0;
-        let summary = records::history_source::visit_source_history(
+        let summary = records::history_source::visit_native_source_history(
             &output,
             None,
             records::history_source::SourceQuery::Source {
@@ -2694,9 +2905,10 @@ mod runtime_move_tests {
         assert!(master.contains_key(&neighbor_id));
         assert!(!master.contains_key(&race_id));
         let conn = Connection::open(&database).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
         let source_rows: u32 = conn
             .query_row(
-                "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
+                "SELECT count(*) FROM inhouse_source_records WHERE form_id=stored_key(?1)",
                 [race_id],
                 |row| row.get(0),
             )
@@ -2704,7 +2916,7 @@ mod runtime_move_tests {
         assert_eq!(source_rows, 0);
         let present: u32 = conn
             .query_row(
-                "SELECT count(*) FROM records WHERE form_id=?1",
+                "SELECT count(*) FROM records WHERE form_id=stored_key(?1)",
                 [race_id],
                 |row| row.get(0),
             )
@@ -2718,7 +2930,7 @@ mod runtime_move_tests {
         assert_eq!(rows, 1);
         let accepted: (String, u64) = conn
             .query_row(
-                "SELECT status,source_record_offset FROM record_overrides WHERE form_id=?1",
+                "SELECT status,source_record_offset FROM record_overrides WHERE form_id=stored_key(?1)",
                 [race_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2738,7 +2950,7 @@ mod runtime_move_tests {
         );
         let database_pin = crate::cache::hash_file(&database).unwrap();
         let mut seen = 0;
-        let summary = records::history_source::visit_source_history(
+        let summary = records::history_source::visit_native_source_history(
             &output,
             None,
             records::history_source::SourceQuery::Physical {
@@ -2940,7 +3152,7 @@ mod runtime_move_tests {
 #[cfg(test)]
 mod history_reuse_private_controls {
     use super::convert_plugins;
-    use crate::records::history_source::{SourceQuery, visit_source_history};
+    use crate::records::history_source::SourceQuery;
     use rusqlite::{Connection, OpenFlags};
     use std::{
         fs,
@@ -3012,6 +3224,7 @@ mod history_reuse_private_controls {
 
         let conn =
             Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&conn).unwrap();
         let source_count: u32 = conn
             .query_row("SELECT count(*) FROM inhouse_source_records", [], |row| {
                 row.get(0)
@@ -3023,12 +3236,12 @@ mod history_reuse_private_controls {
             (0x0100_1800, 0x1800, 1, "a.esm", a_payload.as_slice()),
         ] {
             let (raw,priority,tag,bytes):(u32,u32,String,Vec<u8>)=conn.query_row(
-                "SELECT source_form_id,load_order,record_type,payload FROM inhouse_source_records WHERE form_id=?1",
+                "SELECT source_form_id,load_order,record_type,payload FROM inhouse_source_records WHERE form_id=stored_key(?1)",
                 [runtime],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
             assert_eq!((raw, priority, tag), (local, supplier, "STAT".into()));
             assert_eq!(bytes, payload);
             let (stored_runtime,stored_owner,stored_local):(Option<u32>,String,u32)=conn.query_row(
-                "SELECT form_id,original_owner,full_local FROM record_overrides WHERE plugin_id=?1 AND source_form_id=?2 AND status='accepted'",
+                "SELECT runtime_id(form_id),original_owner,full_local FROM record_overrides WHERE plugin_id=?1 AND source_form_id=?2 AND status='accepted'",
                 rusqlite::params![supplier,local],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
             assert_eq!(
                 (stored_runtime, stored_owner, stored_local),
@@ -3036,7 +3249,7 @@ mod history_reuse_private_controls {
             );
             let (runtime_tag, runtime_supplier): (String, u32) = conn
                 .query_row(
-                    "SELECT record_type,load_order FROM records WHERE form_id=?1",
+                    "SELECT record_type,load_order FROM records WHERE form_id=stored_key(?1)",
                     [runtime],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -3071,7 +3284,7 @@ mod history_reuse_private_controls {
             ),
         ] {
             let mut seen = 0;
-            let summary = visit_source_history(
+            let summary = crate::records::history_source::visit_native_source_history(
                 &output,
                 None,
                 SourceQuery::Source {

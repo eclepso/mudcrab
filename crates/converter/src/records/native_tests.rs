@@ -436,8 +436,17 @@ fn native_provenance_sql_round_trips_physical_metadata_and_named_diagnostic_sour
     let identity = order.pack_identity().unwrap();
     let database = root.path().join("native.db");
     let mut connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL)")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )
+        .unwrap();
     let tx = connection.transaction().unwrap();
-    identity.write_sql(&tx).unwrap();
+    shared::records::create_record_context(&tx, &identity).unwrap();
     super::super::history::write_native_tables(&tx, &result, &identity, &paths, &schemas).unwrap();
     super::super::diagnostics::write_native_tables(&tx, &result, &identity).unwrap();
     tx.commit().unwrap();

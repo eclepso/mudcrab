@@ -680,15 +680,17 @@ pub(crate) fn project_native_rows_with_offsets(
             by_id: master,
             ordered,
         },
-        None,
-        None,
-        None,
-        Some(source_offsets),
-        ExportOptions {
-            runtime_views: true,
-            scalar_scripts: true,
+        ScalarProjectionInputs {
+            order: None,
+            plugin_paths: None,
+            unresolved_fields: None,
+            terrain_offsets: Some(source_offsets),
+            options: ExportOptions {
+                runtime_views: true,
+                scalar_scripts: true,
+            },
+            native_ids: Some(identities),
         },
-        Some(identities),
     )
 }
 
@@ -721,12 +723,14 @@ fn export_record_adapter(
                 by_id: master,
                 ordered,
             },
-            None,
-            plugin_paths,
-            unresolved_fields,
-            terrain_offsets,
-            options,
-            None,
+            ScalarProjectionInputs {
+                order: None,
+                plugin_paths,
+                unresolved_fields,
+                terrain_offsets,
+                options,
+                native_ids: None,
+            },
         );
     };
     let identities = order.form_key_context().map_err(sql_identity_error)?;
@@ -794,12 +798,14 @@ fn export_records(
             by_id: export.lookup,
             ordered,
         },
-        Some(export.order),
-        export.plugin_paths,
-        export.unresolved_fields,
-        export.terrain_offsets,
-        export.options,
-        None,
+        ScalarProjectionInputs {
+            order: Some(export.order),
+            plugin_paths: export.plugin_paths,
+            unresolved_fields: export.unresolved_fields,
+            terrain_offsets: export.terrain_offsets,
+            options: export.options,
+            native_ids: None,
+        },
     )
 }
 
@@ -808,19 +814,32 @@ fn sql_identity_error(error: impl std::fmt::Display) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
 }
 
+/// Inputs that bind one scalar projection to its source and identity metadata.
+struct ScalarProjectionInputs<'a> {
+    order: Option<&'a LoadOrder>,
+    plugin_paths: Option<&'a [PathBuf]>,
+    unresolved_fields: Option<&'a HashMap<u32, BTreeSet<usize>>>,
+    terrain_offsets: Option<&'a HashMap<u32, u64>>,
+    options: ExportOptions,
+    native_ids: Option<&'a HashMap<u32, StableId>>,
+}
+
 /// Writes every merged record; with a load order, also records each record's
 /// owning plugin and plugin-local ID in `formid_map`. SQL insertion follows unsigned
 /// legacy owner identity order, independently of the winning supplier's load order.
 fn project_scalar_records(
     conn: &Connection,
     records: LegacyRecords<'_>,
-    order: Option<&LoadOrder>,
-    plugin_paths: Option<&[PathBuf]>,
-    unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
-    terrain_offsets: Option<&HashMap<u32, u64>>,
-    options: ExportOptions,
-    native_ids: Option<&HashMap<u32, StableId>>,
+    inputs: ScalarProjectionInputs<'_>,
 ) -> Result<()> {
+    let ScalarProjectionInputs {
+        order,
+        plugin_paths,
+        unresolved_fields,
+        terrain_offsets,
+        options,
+        native_ids,
+    } = inputs;
     let LegacyRecords {
         by_id: master,
         ordered,
@@ -949,10 +968,10 @@ fn project_scalar_records(
             )?;
         }
 
-        if let Some(native_ids) = native_ids {
-            if let Some(identity) = native_ids.get(&form_id) {
-                tx.prepare_cached("INSERT OR REPLACE INTO formid_map(form_id,plugin_name,internal_id,record_type) VALUES(?1,?2,?3,?4)")?.execute(params![form_id,identity.plugin,identity.local_id,type_str])?;
-            }
+        if let Some(native_ids) = native_ids
+            && let Some(identity) = native_ids.get(&form_id)
+        {
+            tx.prepare_cached("INSERT OR REPLACE INTO formid_map(form_id,plugin_name,internal_id,record_type) VALUES(?1,?2,?3,?4)")?.execute(params![form_id,identity.plugin,identity.local_id,type_str])?;
         }
         if !runtime_views {
             // Canonical records/formid_map are complete; only materialized runtime views defer.
@@ -1867,8 +1886,10 @@ mod tests {
     /// The schema has the interior index, the exterior spatial table and every projection table.
     #[test]
     fn creates_hybrid_spatial_schema() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        crate::esm::EsmParser::convert_plugins(&[], &path).unwrap();
+        let conn = Connection::open(path).unwrap();
         let interior_index: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_references_cell'",

@@ -2200,13 +2200,14 @@ mod tests {
         std::fs::write(directory.path().join("textures/diffuse.ktx2"), bc1_ktx2()).unwrap();
         let database = directory.path().join("catalogue.db");
         let connection = rusqlite::Connection::open(&database).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
                  CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
-                 INSERT INTO texture_sets VALUES(1,'textures/diffuse.ktx2');
-                 INSERT INTO landscape_textures VALUES(1,1);",
+                 INSERT INTO texture_sets VALUES(stored_key(1),'textures/diffuse.ktx2');
+                 INSERT INTO landscape_textures VALUES(stored_key(1),stored_key(1));",
             )
             .unwrap();
         drop(connection);
@@ -2281,18 +2282,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("placeholder-catalogue.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);
                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
                  CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
-                 INSERT INTO texture_sets VALUES(1,'textures/zero-must-not-load.dds',NULL);
-                 INSERT INTO texture_sets VALUES(2,NULL,'textures/orphan-normal-must-not-load.dds');
-                 INSERT INTO landscape_textures VALUES(0,1),(2116,2);",
+                 INSERT INTO texture_sets VALUES(stored_key(1),'textures/zero-must-not-load.dds',NULL);
+                 INSERT INTO texture_sets VALUES(stored_key(2),NULL,'textures/orphan-normal-must-not-load.dds');
+                 INSERT INTO landscape_textures VALUES((SELECT id << 24 FROM pack_plugins WHERE normalized_name='base.esm'),stored_key(1)),(stored_key(2116),stored_key(2));",
             )
             .unwrap();
         drop(connection);
         let catalog = AssetCatalog::open(&path).unwrap();
+        assert!(
+            catalog.landscape_diffuse(0).is_none(),
+            "native null-collision owner has no runtime handle"
+        );
+        let catalog = catalog.with_fixture_null_diffuse("textures/zero-must-not-load.ktx2");
         assert!(
             catalog.landscape_diffuse(0).is_some(),
             "poison null lookup is observable"

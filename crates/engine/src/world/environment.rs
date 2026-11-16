@@ -543,6 +543,7 @@ mod tests {
     #[test]
     fn a_database_without_the_tables_gives_an_empty_catalog() {
         let connection = Connection::open_in_memory().unwrap();
+        crate::world::test_support::install_projection(&connection);
         let catalog = EnvironmentCatalog::from_connection(&connection);
         assert!(catalog.cell_lighting(1).is_none());
         assert!(catalog.worldspace(1).is_none());
@@ -553,14 +554,15 @@ mod tests {
     #[test]
     fn a_table_of_another_shape_gives_an_empty_catalog() {
         let connection = Connection::open_in_memory().unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE cell_lighting(cell_id INTEGER PRIMARY KEY, ambient_r INTEGER);
-                 INSERT INTO cell_lighting VALUES(1, 2);
+                 INSERT INTO cell_lighting VALUES(stored_key(1), 2);
                  CREATE TABLE worldspace_environment(worldspace_id INTEGER PRIMARY KEY);
-                 INSERT INTO worldspace_environment VALUES(60);
+                 INSERT INTO worldspace_environment VALUES(stored_key(60));
                  CREATE TABLE weathers(id INTEGER PRIMARY KEY);
-                 INSERT INTO weathers VALUES(7);",
+                 INSERT INTO weathers VALUES(stored_key(7));",
             )
             .unwrap();
         let catalog = EnvironmentCatalog::from_connection(&connection);
@@ -573,6 +575,7 @@ mod tests {
     fn optional_dalc_fields_survive_weather_template_and_cell_reads() {
         let connection = Connection::open_in_memory().unwrap();
         converter::esm::exporter::create_tables(&connection).unwrap();
+        crate::world::test_support::install_projection(&connection);
 
         let cases = [
             ("24-byte", 18, true),
@@ -585,20 +588,26 @@ mod tests {
             let template_id = 200 + index as u32;
             let weather_id = 300 + index as u32;
             connection
-                .execute("INSERT INTO cell_lighting(cell_id) VALUES (?1)", [cell_id])
+                .execute(
+                    "INSERT INTO cell_lighting(cell_id) VALUES (stored_key(?1))",
+                    [cell_id],
+                )
                 .unwrap();
             connection
                 .execute(
-                    "INSERT INTO lighting_templates(id) VALUES (?1)",
+                    "INSERT INTO lighting_templates(id) VALUES (stored_key(?1))",
                     [template_id],
                 )
                 .unwrap();
             connection
-                .execute("INSERT INTO weathers(id) VALUES (?1)", [weather_id])
+                .execute(
+                    "INSERT INTO weathers(id) VALUES (stored_key(?1))",
+                    [weather_id],
+                )
                 .unwrap();
             connection
                 .execute(
-                    "INSERT INTO weather_directional_ambient(weather_id, time_of_day) VALUES (?1, 'day')",
+                    "INSERT INTO weather_directional_ambient(weather_id, time_of_day) VALUES (stored_key(?1), 'day')",
                     [weather_id],
                 )
                 .unwrap();
@@ -634,7 +643,7 @@ mod tests {
                 };
                 connection
                     .execute(
-                        &format!("UPDATE {table} SET {updates} WHERE {key_column}=?1"),
+                        &format!("UPDATE {table} SET {updates} WHERE {key_column}=stored_key(?1)"),
                         [key],
                     )
                     .unwrap_or_else(|error| panic!("{name} {table}: {error}"));
@@ -690,6 +699,7 @@ mod tests {
     fn reads_the_converter_tables() {
         let connection = Connection::open_in_memory().unwrap();
         converter::esm::exporter::create_tables(&connection).unwrap();
+        crate::world::test_support::install_projection(&connection);
         let dalc = |prefix: &str| {
             dalc_columns(prefix)
                 .split(',')
@@ -702,20 +712,20 @@ mod tests {
             .execute_batch(&format!(
                 "INSERT INTO cell_lighting(cell_id, lighting_template_id, ambient_r, ambient_g, ambient_b,
                      fog_near, inherit_flags, dalc_x_pos_r, dalc_x_pos_g, dalc_x_pos_b)
-                 VALUES(0x1000, 0x2000, 10, 20, 30, 64.5, 1024, 1, 2, 3);
+                 VALUES(stored_key(0x1000), stored_key(0x2000), 10, 20, 30, 64.5, 1024, 1, 2, 3);
                  INSERT INTO worldspace_environment(worldspace_id, data_flags, climate_id, music_id)
-                 VALUES(60, 32, 0x3000, 0x4000);
-                 INSERT INTO lighting_templates(id, editor_id, fog_far) VALUES(0x2000, 'Template', 9000);
-                 UPDATE lighting_templates SET {} WHERE id=0x2000;
+                 VALUES(stored_key(60), 32, stored_key(0x3000), stored_key(0x4000));
+                 INSERT INTO lighting_templates(id, editor_id, fog_far) VALUES(stored_key(0x2000), 'Template', 9000);
+                 UPDATE lighting_templates SET {} WHERE id=stored_key(0x2000);
                  INSERT INTO weathers(id, editor_id, fog_day_near, fog_day_far, image_space_day_id)
-                 VALUES(0x81A, 'SkyrimClear', 1024, 200000, 0x5000);
-                 INSERT INTO weather_colors VALUES(0x81A, 'sunlight', 'day', 255, 240, 200);
-                 INSERT INTO weather_directional_ambient(weather_id, time_of_day) VALUES(0x81A, 'day');
-                 UPDATE weather_directional_ambient SET {} WHERE weather_id=0x81A;
+                 VALUES(stored_key(0x81A), 'SkyrimClear', 1024, 200000, stored_key(0x5000));
+                 INSERT INTO weather_colors VALUES(stored_key(0x81A), 'sunlight', 'day', 255, 240, 200);
+                 INSERT INTO weather_directional_ambient(weather_id, time_of_day) VALUES(stored_key(0x81A), 'day');
+                 UPDATE weather_directional_ambient SET {} WHERE weather_id=stored_key(0x81A);
                  INSERT INTO image_spaces(id, saturation, tint_amount, tint_r, tint_g, tint_b)
-                 VALUES(0x5000, 1.5, 0.25, 0.5, 0.75, 1.0);
-                 INSERT INTO climate_weathers VALUES(0x3000, 1, 0x81B, 20, NULL);
-                 INSERT INTO climate_weathers VALUES(0x3000, 0, 0x81A, 80, 0x6000);",
+                 VALUES(stored_key(0x5000), 1.5, 0.25, 0.5, 0.75, 1.0);
+                 INSERT INTO climate_weathers VALUES(stored_key(0x3000), 1, stored_key(0x81B), 20, NULL);
+                 INSERT INTO climate_weathers VALUES(stored_key(0x3000), 0, stored_key(0x81A), 80, stored_key(0x6000));",
                 dalc("subrecord_dalc_"),
                 dalc("")
             ))

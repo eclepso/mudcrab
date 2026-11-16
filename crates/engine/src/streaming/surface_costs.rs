@@ -152,14 +152,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.sqlite");
         let connection = Connection::open(&path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);\
              CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);\
              CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);\
-             INSERT INTO texture_sets VALUES(1,'Textures\\Shared.dds','Textures\\Shared_n.dds');\
-             INSERT INTO landscape_textures VALUES(10,1);\
-             INSERT INTO waters VALUES(20,'Textures\\Water_n.dds');",
+             INSERT INTO texture_sets VALUES(stored_key(1),'Textures\\Shared.dds','Textures\\Shared_n.dds');\
+             INSERT INTO landscape_textures VALUES(stored_key(10),stored_key(1));\
+             INSERT INTO waters VALUES(stored_key(20),'Textures\\Water_n.dds');",
             )
             .unwrap();
         (directory, AssetCatalog::open(&path).unwrap())
@@ -211,20 +212,26 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.sqlite");
         let connection = Connection::open(&path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);\
              CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);\
              CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);\
-             INSERT INTO texture_sets VALUES(1,'Textures\\Zero_must_not_load.dds',NULL);\
-             INSERT INTO texture_sets VALUES(2,'Textures\\Shared.dds','Textures\\Shared_n.dds');\
-             INSERT INTO landscape_textures VALUES(0,1);\
-             INSERT INTO landscape_textures VALUES(10,2);",
+             INSERT INTO texture_sets VALUES(stored_key(1),'Textures\\Zero_must_not_load.dds',NULL);\
+             INSERT INTO texture_sets VALUES(stored_key(2),'Textures\\Shared.dds','Textures\\Shared_n.dds');\
+             INSERT INTO landscape_textures VALUES((SELECT id << 24 FROM pack_plugins WHERE normalized_name='base.esm'),stored_key(1));\
+             INSERT INTO landscape_textures VALUES(stored_key(10),stored_key(2));",
             )
             .unwrap();
         drop(connection);
         let catalog = AssetCatalog::open(&path).unwrap();
-        // Row zero is a real catalog entry, so skipping it is the only thing that keeps it out.
+        assert!(
+            catalog.landscape_diffuse(0).is_none(),
+            "native null-collision owner has no runtime handle"
+        );
+        let catalog = catalog.with_fixture_null_diffuse("textures/zero_must_not_load.ktx2");
+        // Poison the in-memory map independently of SQL admission; the surface must still skip zero.
         assert!(catalog.landscape_diffuse(0).is_some());
         let mut terrain = terrain();
         for quadrant in 0..4 {

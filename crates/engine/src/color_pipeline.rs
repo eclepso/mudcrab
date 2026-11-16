@@ -1196,13 +1196,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut connection =
             rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        connection.execute_batch("CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(9); CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB); CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT,priority INTEGER); INSERT INTO plugins VALUES(1,'Winner.esm',7); CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);").unwrap();
-        connection
-            .execute(
-                "UPDATE schema_info SET version=?1",
-                [shared::WORLD_DATABASE_SCHEMA_VERSION],
-            )
-            .unwrap();
+        connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB); CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT,priority INTEGER); INSERT INTO plugins VALUES(1,'Winner.esm',7); CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);").unwrap();
+
         let identity = crate::world::test_support::install(&mut connection);
         let write_record = |brightness: f32| {
             let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect();

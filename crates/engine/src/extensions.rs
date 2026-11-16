@@ -219,12 +219,12 @@ pub(crate) mod fixtures {
             pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
             rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
             destination_cell_id INTEGER, destination_worldspace_id INTEGER);
-        INSERT INTO cells VALUES(5, 60);
-        INSERT INTO cells VALUES(100, NULL);
-        INSERT INTO \"references\" VALUES(1, 5, 10, 20, 30);
-        INSERT INTO \"references\" VALUES(2, 100, 1, 2, 3);
-        INSERT INTO door_links VALUES(1, 2, 1, 2, 3, 0, 0, 1.5, 100, NULL);
-        INSERT INTO door_links VALUES(2, 1, 10, 20, 30, 0, 0, 0.5, 5, 60);
+        INSERT INTO cells VALUES(stored_key(5), stored_key(60));
+        INSERT INTO cells VALUES(stored_key(100), NULL);
+        INSERT INTO \"references\" VALUES(stored_key(1), stored_key(5), 10, 20, 30);
+        INSERT INTO \"references\" VALUES(stored_key(2), stored_key(100), 1, 2, 3);
+        INSERT INTO door_links VALUES(stored_key(1), stored_key(2), 1, 2, 3, 0, 0, 1.5, stored_key(100), NULL);
+        INSERT INTO door_links VALUES(stored_key(2), stored_key(1), 10, 20, 30, 0, 0, 0.5, stored_key(5), stored_key(60));
     ";
 
     /// The manifest of a `main` data set: no `extensions` key.
@@ -261,6 +261,7 @@ pub(crate) mod fixtures {
         )
         .unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection.execute_batch(TABLES).unwrap();
         for table in without {
             connection
@@ -345,6 +346,7 @@ mod tests {
         let connection =
             rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
         converter::esm::exporter::create_tables(&connection).unwrap();
+        crate::world::test_support::install_projection(&connection);
         drop(connection);
         std::fs::write(directory.path().join("conversion-manifest.json"),
             serde_json::json!({"schema_version": shared::LOD_CONVERTER_SCHEMA_VERSION, "complete": true}).to_string()).unwrap();
@@ -510,6 +512,7 @@ mod tests {
             let connection =
                 rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
             converter::esm::exporter::create_tables(&connection).unwrap();
+            crate::world::test_support::install_projection(&connection);
             // Keep the current-schema no-LOD path: complete doors, zero chunks, no LOD manifest.
             connection.execute_batch("DROP TABLE lod_build;").unwrap();
             connection.execute_batch(sql).unwrap();
@@ -575,6 +578,7 @@ mod tests {
         let path = directory.path().join("skyrim_world.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
         converter::esm::exporter::create_tables(&connection).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "ALTER TABLE door_links RENAME TO renamed_door_links;
@@ -603,6 +607,7 @@ mod tests {
             let path = directory.path().join("skyrim_world.db");
             let connection = rusqlite::Connection::open(&path).unwrap();
             converter::esm::exporter::create_tables(&connection).unwrap();
+            crate::world::test_support::install_projection(&connection);
             connection
                 .execute_batch(if drop_column {
                     "ALTER TABLE door_links DROP COLUMN rot_z;"

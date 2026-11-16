@@ -6769,13 +6769,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch(&format!(
-                "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES({});",
-                shared::WORLD_DATABASE_SCHEMA_VERSION
-            ))
-            .unwrap();
+        crate::world::test_support::install_projection(&connection);
         drop(connection);
         let mut app = App::new();
         app.insert_resource(config)
@@ -7762,8 +7756,9 @@ mod tests {
         let path = directory.path().join("placeholder-catalogue.db");
         write_empty_catalogue(&path);
         let connection = rusqlite::Connection::open(&path).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&connection).unwrap();
         connection
-            .execute_batch("INSERT INTO landscape_textures VALUES(2116,NULL);")
+            .execute_batch("INSERT INTO landscape_textures VALUES(stored_key(2116),NULL);")
             .unwrap();
         drop(connection);
         let catalog = AssetCatalog::open(&path).unwrap();
@@ -9710,6 +9705,7 @@ mod tests {
     /// An empty catalogue database: the three tables [`AssetCatalog::open`] reads, with no rows.
     fn write_empty_catalogue(path: &std::path::Path) {
         let connection = rusqlite::Connection::open(path).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
@@ -9770,10 +9766,11 @@ mod tests {
         let path = directory.path().join("catalogue.db");
         write_empty_catalogue(&path);
         let connection = rusqlite::Connection::open(&path).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&connection).unwrap();
         connection.execute_batch(
             "CREATE TABLE base_texture_swaps(base_id INTEGER,position INTEGER,shape_name TEXT,shape_index INTEGER,texture_set_id INTEGER,disposition TEXT);
-             INSERT INTO base_texture_swaps VALUES(513,0,'Rock:0',0,100,'texture_set');
-             INSERT INTO base_texture_swaps VALUES(514,0,'Rock:0',0,101,'texture_set');"
+             INSERT INTO base_texture_swaps VALUES(stored_key(513),0,'Rock:0',0,stored_key(100),'texture_set');
+             INSERT INTO base_texture_swaps VALUES(stored_key(514),0,'Rock:0',0,stored_key(101),'texture_set');"
         ).unwrap();
         let mut app = spawn_reference_cell_app(
             vec![
@@ -9810,6 +9807,7 @@ mod tests {
     /// The documented actor catalog DDL (db-schema.md §18), as an in-memory fixture.
     fn actor_catalog_connection() -> rusqlite::Connection {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE actor_models (
@@ -9837,7 +9835,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO actor_models(id, race_id, sex, skin_armo_id, head_model, head_source, resolution)
-                 VALUES (0x13475, 79686, 'male', NULL,
+                 VALUES (stored_key(0x13475), stored_key(79686), 'male', NULL,
                          'meshes/actors/character/facegendata/facegeom/skyrim.esm/00013475.nif',
                          'facegen', 'body_head')",
                 [],
@@ -9859,7 +9857,7 @@ mod tests {
         ] {
             connection
                 .execute(
-                    "INSERT INTO actor_model_parts(npc_id, slot, model_path) VALUES (0x13475, ?1, ?2)",
+                    "INSERT INTO actor_model_parts(npc_id, slot, model_path) VALUES (stored_key(0x13475), ?1, ?2)",
                     rusqlite::params![slot, path],
                 )
                 .unwrap();
@@ -10811,6 +10809,8 @@ mod tests {
             .join("meshes/actors/character/composed/default/male/body.glb");
         std::fs::create_dir_all(composed.parent().unwrap()).unwrap();
         std::fs::write(&composed, b"glTF").unwrap();
+        let connection = actor_catalog_connection();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
         let outfit = shared::actor_outfits::ActorOutfitCatalog {
             version: shared::actor_outfits::VERSION,
             outfits: vec![shared::actor_outfits::ActorOutfit {
@@ -10828,10 +10828,9 @@ mod tests {
         };
         std::fs::write(
             directory.path().join(shared::actor_outfits::PATH),
-            serde_json::to_vec(&outfit).unwrap(),
+            serde_json::to_vec(&outfit.to_file(&identity).unwrap()).unwrap(),
         )
         .unwrap();
-        let connection = actor_catalog_connection();
         insert_alvor(&connection);
         let catalog = ActorCatalog::from_connection_with_assets_root(&connection, directory.path());
         let mut reference = lit_reference(0x13475, None, None);
@@ -10934,13 +10933,13 @@ mod tests {
         let connection = actor_catalog_connection();
         connection
             .execute(
-                "INSERT INTO actor_models(id,race_id,sex,resolution) VALUES(0x2000,0x1000,'male','body')",
+                "INSERT INTO actor_models(id,race_id,sex,resolution) VALUES(stored_key(0x2000),stored_key(0x1000),'male','body')",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO actor_model_parts(npc_id,slot,model_path) VALUES(0x2000,'body',?1)",
+                "INSERT INTO actor_model_parts(npc_id,slot,model_path) VALUES(stored_key(0x2000),'body',?1)",
                 [body],
             )
             .unwrap();
@@ -11030,17 +11029,18 @@ mod tests {
             }],
             ..Default::default()
         };
-        std::fs::write(
-            directory.path().join(PATH),
-            serde_json::to_vec(&catalog).unwrap(),
-        )
-        .unwrap();
         for starts_dead in [false, true] {
             let connection = creature_catalog_connection("Actors\\Custom\\Body.nif");
+            let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
+            std::fs::write(
+                directory.path().join(PATH),
+                serde_json::to_vec(&catalog.to_file(&identity).unwrap()).unwrap(),
+            )
+            .unwrap();
             connection
                 .execute_batch(
                     "CREATE TABLE race_animation_sources(race_id INTEGER,sex TEXT,skeleton_nif TEXT,project_hkx TEXT);
-                     INSERT INTO race_animation_sources VALUES (4096,'male','meshes/actors/custom/character assets/skeleton.nif','meshes/actors/custom/project.hkx');",
+                     INSERT INTO race_animation_sources VALUES (stored_key(4096),'male','meshes/actors/custom/character assets/skeleton.nif','meshes/actors/custom/project.hkx');",
                 )
                 .unwrap();
             let actor_catalog =
@@ -11101,14 +11101,14 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO actor_models(id, race_id, sex, resolution)
-                 VALUES (0x2000, 0x1000, 'male', 'body')",
+                 VALUES (stored_key(0x2000), stored_key(0x1000), 'male', 'body')",
                 [],
             )
             .unwrap();
         connection
             .execute(
                 "INSERT INTO actor_model_parts(npc_id, slot, model_path)
-                 VALUES (0x2000, 'body',
+                 VALUES (stored_key(0x2000), 'body',
                          'Meshes\\Actors\\CustomRace\\Character Assets\\CustomBody.NIF')",
                 [],
             )
@@ -11142,7 +11142,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO actor_models(id, race_id, sex, resolution)
-                 VALUES (0x13475, 79686, 'male', 'unresolved')",
+                 VALUES (stored_key(0x13475), stored_key(79686), 'male', 'unresolved')",
                 [],
             )
             .unwrap();

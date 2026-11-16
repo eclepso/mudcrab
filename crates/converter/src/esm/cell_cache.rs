@@ -138,15 +138,15 @@ fn form_key_texture_layers_with_context(
             } else {
                 u16::from_le_bytes(data[6..8].try_into()?)
             };
-            if let Some(previous) = origins.insert((data[4], base, layer), source_index) {
-                if !base {
-                    dropped.push(DroppedLayer {
-                        quadrant: data[4],
-                        layer,
-                        texture_form_id: retained_texture_key(record, previous, source_order)?
-                            .map_or(0, shared::form_key::FormKey::to_packed),
-                    });
-                }
+            if let Some(previous) = origins.insert((data[4], base, layer), source_index)
+                && !base
+            {
+                dropped.push(DroppedLayer {
+                    quadrant: data[4],
+                    layer,
+                    texture_form_id: retained_texture_key(record, previous, source_order)?
+                        .map_or(0, shared::form_key::FormKey::to_packed),
+                });
             }
         }
     }
@@ -189,15 +189,87 @@ pub(crate) fn form_key_field(
     record.resolved_at(record.source_ordinal(index)?, byte_offset)
 }
 
+type NativeLandWinners = Vec<(shared::form_key::FormKey, shared::form_key::FormKey)>;
+
+/// Keep SQL physical-link outcomes and runtime caches consistent with final live LTEX winners.
+/// Source words and source-preserved caches retain the original owner/local identity.
+pub(crate) fn recover_runtime_land_links(
+    conversion: &mut super::form_key_merge::FormKeyConversion,
+    source_offsets: &HashMap<shared::form_key::FormKey, u64>,
+) -> Result<Vec<String>> {
+    use shared::form_key::FormKey;
+    let identity = conversion.order.pack_identity()?;
+    let textures = conversion
+        .records
+        .iter()
+        .filter_map(|(&key, record)| {
+            (record.canonical_record().record_type == *b"LTEX"
+                && !record.canonical_record().is_deleted())
+            .then_some(key)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut ordered = conversion
+        .records
+        .iter()
+        .filter_map(|(&key, record)| {
+            (record.canonical_record().record_type == *b"LAND"
+                && !record.canonical_record().is_deleted())
+            .then_some(key)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|key| {
+        (
+            conversion.records[key].source.load_order,
+            source_offsets.get(key).copied().unwrap_or(0),
+            shared::cache_identity::owner_order(&identity, *key),
+        )
+    });
+    let mut losses = BTreeMap::<u32, (usize, FormKey)>::new();
+    for key in ordered {
+        let record = conversion
+            .records
+            .get_mut(&key)
+            .expect("selected native LAND");
+        for site in &mut record.links {
+            if matches!(&site.signature, b"BTXT" | b"ATXT")
+                && site.byte_offset == 0
+                && let Some(target) = site.key
+                && !textures.contains(&target)
+            {
+                site.key = None;
+                site.outcome = super::form_key_merge::LinkOutcome::Cleared;
+                let entry = losses
+                    .entry(record.source.load_order)
+                    .or_insert((0, target));
+                entry.0 += 1;
+            }
+        }
+    }
+    texture_loss_warnings(&identity, losses)
+}
+
+fn texture_loss_warnings(
+    identity: &shared::pack_identity::PackIdentity,
+    losses: BTreeMap<u32, (usize, shared::form_key::FormKey)>,
+) -> Result<Vec<String>> {
+    losses.into_iter().map(|(supplier, (count, first))| {
+        let plugin = identity.order().get(supplier as usize)
+            .and_then(|id| identity.table().entry(*id))
+            .map(|entry| entry.display_name.as_str())
+            .unwrap_or("unknown supplier");
+        Ok(format!(
+            "warning: {plugin}: cleared {count} unavailable runtime LAND texture assignments (first: {})",
+            identity.table().named(first)?
+        ))
+    }).collect()
+}
+
 /// Select the same native LAND projection for SQL, cache and derived terrain.
 /// An ambiguous winning supplier group is omitted locally while neighboring cells survive.
 pub(crate) fn native_land_winners(
     conversion: &super::form_key_merge::FormKeyConversion,
     source_offsets: &HashMap<shared::form_key::FormKey, u64>,
-) -> Result<(
-    Vec<(shared::form_key::FormKey, shared::form_key::FormKey)>,
-    Vec<String>,
-)> {
+) -> Result<(NativeLandWinners, Vec<String>)> {
     use shared::form_key::FormKey;
     let identity = conversion.order.pack_identity()?;
     let mut groups = HashMap::<FormKey, Vec<FormKey>>::new();
@@ -266,9 +338,10 @@ pub fn write_form_key_cell_cache(
     let identity = conversion.order.pack_identity()?;
     let (ordered, mut warnings) = native_land_winners(conversion, source_offsets)?;
     let mut cells = Vec::new();
+    let mut unavailable = BTreeMap::<u32, (usize, FormKey)>::new();
     for (cell_key, land_key) in ordered {
         let record = &conversion.records[&land_key];
-        let build = (|| -> Result<CachedLand> {
+        let build = (|| -> Result<(CachedLand, Vec<FormKey>)> {
             let canonical = record.canonical_record();
             validate_inhouse_land(canonical)?;
             let view = SubrecordView::new(&canonical.subrecords);
@@ -280,7 +353,23 @@ pub fn write_form_key_cell_cache(
             } else {
                 form_key_texture_layers(record)?
             };
+            let mut cleared = Vec::new();
             if !preserved {
+                // Resolvable source identity does not establish a live runtime LTEX.
+                // Clear before ranking so unavailable assignments cannot displace live ones.
+                for layer in &mut layers {
+                    if layer.texture_form_id == 0 {
+                        continue;
+                    }
+                    let key = FormKey::from_packed(layer.texture_form_id)?;
+                    if !conversion.records.get(&key).is_some_and(|target| {
+                        target.canonical_record().record_type == *b"LTEX"
+                            && !target.canonical_record().is_deleted()
+                    }) {
+                        layer.texture_form_id = 0;
+                        cleared.push(key);
+                    }
+                }
                 limit_runtime_texture_layers(&mut layers);
             }
             let cell = conversion.records.get(&cell_key);
@@ -313,20 +402,31 @@ pub fn write_form_key_cell_cache(
                 .map(|world| form_key_field(world, b"NAM2", 0))
                 .transpose()?
                 .flatten();
-            Ok(CachedLand {
-                cell_id: cell_key.to_packed(),
-                width: LAND_SIDE,
-                height: LAND_SIDE,
-                heights,
-                normals,
-                vertex_colors,
-                layers,
-                water_height: own_height.or(world_height),
-                water_type_form_id: own_water.or(world_water).map(FormKey::to_packed),
-            })
+            Ok((
+                CachedLand {
+                    cell_id: cell_key.to_packed(),
+                    width: LAND_SIDE,
+                    height: LAND_SIDE,
+                    heights,
+                    normals,
+                    vertex_colors,
+                    layers,
+                    water_height: own_height.or(world_height),
+                    water_type_form_id: own_water.or(world_water).map(FormKey::to_packed),
+                },
+                cleared,
+            ))
         })();
         match build {
-            Ok(cell) => cells.push(cell),
+            Ok((cell, cleared)) => {
+                for key in cleared {
+                    let entry = unavailable
+                        .entry(record.source.load_order)
+                        .or_insert((0, key));
+                    entry.0 += 1;
+                }
+                cells.push(cell);
+            }
             Err(error) => warnings.push(format!(
                 "warning: skipped unusable LAND {} for CELL {}: {error}",
                 identity.table().named(land_key)?,
@@ -334,6 +434,7 @@ pub fn write_form_key_cell_cache(
             )),
         }
     }
+    warnings.extend(texture_loss_warnings(&identity, unavailable)?);
     let count = cells.len();
     let bytes = shared::cache_identity::encode_cell_cache(
         &identity,
@@ -1240,6 +1341,21 @@ mod tests {
             records: HashMap::from([
                 (key(zulu, 0x1234), native_record),
                 (key(alpha, 0x3333), broken),
+                // These resolved identities really exist in the final live catalogue.
+                // The cleared later ATXT remains unavailable even though its word equals BTXT.
+                (
+                    key(zulu, 0x844),
+                    FormKeyRecord {
+                        source: record(0x844, b"LTEX", None, &[]),
+                        canonical: None,
+                        canonical_ordinals: vec![],
+                        localized_text: Default::default(),
+                        runtime_omitted: Default::default(),
+                        cell: None,
+                        worldspace: None,
+                        links: vec![],
+                    },
+                ),
             ]),
             warnings: vec![],
             notices: vec![],

@@ -1665,9 +1665,8 @@ mod tests {
 
     #[test]
     fn only_the_records_the_stage_reads_are_kept() {
-        // The fixture conversion's merge, as `pipeline.rs` and `metadata.rs` hand it to the
-        // filter: what the stage keeps out of it is what it reads, and nothing else is held
-        // through the texture, mesh, script and LOD stages.
+        // Exercise the retained transient scalar filter on a real plugin merge. Native world
+        // publication no longer returns a scalar record map; its builder is tested separately.
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("Data");
         dummy_content::layout::prepare_directory(&data, false).unwrap();
@@ -1684,9 +1683,7 @@ mod tests {
             })
             .collect();
         assert!(!plugins.is_empty(), "the fixture writes a plugin");
-        let all =
-            EsmParser::convert_plugins_with_records(&plugins, &directory.path().join("world.db"))
-                .unwrap();
+        let all = EsmParser::merge_plugins(&plugins).unwrap();
         let total = all.len();
         let kept = terrain_records(all);
         let dropped = total - kept.len();
@@ -2241,11 +2238,7 @@ mod tests {
         assert_eq!(masters[&0], Vec::<String>::new());
         assert_eq!(masters[&1], vec!["Base.esm".to_string()]);
 
-        let merged = EsmParser::convert_plugins_with_records(
-            &[base.clone(), patch.clone()],
-            &directory.path().join("world.db"),
-        )
-        .unwrap();
+        let merged = EsmParser::merge_plugins(&[base.clone(), patch.clone()]).unwrap();
         let land = land_of_slot(&merged, 1);
         let key = cell_key(&merged, &masters, &land, &HashSet::new()).unwrap();
         assert_eq!(
@@ -2282,11 +2275,7 @@ mod tests {
             ["base.esm", "inserted.esp", "patch.esp"]
         );
         let shifted_masters = load_order_masters(&shifted_order);
-        let shifted = EsmParser::convert_plugins_with_records(
-            &[base.clone(), inserted.clone(), patch],
-            &directory.path().join("shifted.db"),
-        )
-        .unwrap();
+        let shifted = EsmParser::merge_plugins(&[base.clone(), inserted.clone(), patch]).unwrap();
         // The second plugin's records keep their load-order FormIDs (numbering is by master
         // index), so the same LAND is the one at that FormID, now declared from a later slot.
         let shifted_land = land_of_form_id(&shifted, land.form_id);
@@ -2308,11 +2297,7 @@ mod tests {
             moved_masters[&2],
             vec!["Base.esm".to_string(), "Inserted.esp".to_string()]
         );
-        let moved_merged = EsmParser::convert_plugins_with_records(
-            &[base, inserted, moved],
-            &directory.path().join("moved.db"),
-        )
-        .unwrap();
+        let moved_merged = EsmParser::merge_plugins(&[base, inserted, moved]).unwrap();
         let moved_land = land_of_slot(&moved_merged, 2);
         assert_ne!(
             key,

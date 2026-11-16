@@ -165,8 +165,8 @@ fn both_readers_publish_all_projectile_and_hazard_placements() {
     assert_eq!(before, placed(RecordReader::Legacy, &path, root.path()));
     assert_eq!(before.len(), placements.len());
     for (index, row) in before.iter().enumerate() {
-        assert_eq!(row.0, 0x0A00 + index as u32);
-        assert_eq!(row.1, 0x0800 + index as u32);
+        assert_eq!(row.0, stored(0x0A00 + index as u32));
+        assert_eq!(row.1, stored(0x0800 + index as u32));
         assert_eq!(row.3.as_deref(), Some("Effects\\Synthetic.nif"));
     }
 
@@ -180,7 +180,12 @@ fn both_readers_publish_all_projectile_and_hazard_placements() {
     }
 }
 
-type Placed = (u32, u32, Option<String>, Option<String>);
+type Placed = (i64, i64, Option<String>, Option<String>);
+
+/// Fresh single-plugin allocation gives Skyrim.esm owner1; source words remain four bytes.
+fn stored(local: u32) -> i64 {
+    0x0000_0001_0000_0000 | i64::from(local)
+}
 
 /// Every reference with its base's `statics` row, as the engine's `LEFT JOIN statics` sees it.
 fn placed(reader: RecordReader, plugin: &Path, root: &Path) -> Vec<Placed> {
@@ -207,7 +212,7 @@ fn archived_model(root: &Path, reader: RecordReader, form_id: u32) -> Option<Vec
     let bytes: Vec<u8> = database
         .query_row(
             "SELECT data FROM records WHERE form_id=?1",
-            [form_id],
+            [stored(form_id)],
             |row| row.get(0),
         )
         .unwrap();
@@ -243,8 +248,8 @@ fn both_record_readers_publish_models_for_every_placeable_base_type() {
             .iter()
             .enumerate()
             .map(|(index, (_, id, model))| (
-                0x0A00 + index as u32,
-                *id,
+                stored(0x0A00 + index as u32),
+                stored(*id),
                 Some(format!("Base{index}")),
                 Some(model.unwrap().to_owned()),
             ))
@@ -274,8 +279,8 @@ fn both_record_readers_project_missing_empty_and_valid_models_consistently() {
     assert_eq!(legacy, inhouse);
     for (index, (_, base_id, model)) in bases.iter().enumerate() {
         let projected = &inhouse[index];
-        assert_eq!(projected.0, 0x0A00 + index as u32);
-        assert_eq!(projected.1, *base_id);
+        assert_eq!(projected.0, stored(0x0A00 + index as u32));
+        assert_eq!(projected.1, stored(*base_id));
         assert_eq!(projected.2, Some(format!("Base{index}")));
         assert_eq!(
             projected.3.as_deref(),

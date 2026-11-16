@@ -7,7 +7,7 @@ use shared::{
 };
 
 /// Supply eight authenticated plugin priorities for asymmetric runtime-boundary fixtures.
-pub(crate) fn install(connection: &mut Connection) -> PackIdentity {
+pub(crate) fn install_projection(connection: &Connection) -> PackIdentity {
     let names = [
         "Base.esm",
         "Weather.esm",
@@ -41,13 +41,122 @@ pub(crate) fn install(connection: &mut Connection) -> PackIdentity {
     .unwrap();
     let order = names.iter().map(|name| table.id(name).unwrap()).collect();
     let identity = PackIdentity::new(table, order).unwrap();
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER); CREATE TABLE IF NOT EXISTS records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB)").unwrap();
+    connection
+        .execute_batch("CREATE TABLE IF NOT EXISTS schema_info(version INTEGER)")
+        .unwrap();
     connection.execute("INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM schema_info)",[shared::WORLD_DATABASE_SCHEMA_VERSION]).unwrap();
-    let transaction = connection.transaction().unwrap();
+    let version: u32 = connection
+        .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
+        .unwrap();
+    if version == 0 {
+        // create_tables supplies an unsealed, empty projection schema, never an old world.
+        let records: i64 = connection
+            .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            records, 0,
+            "native fixtures must allocate before writing records"
+        );
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
+    }
+    let transaction = connection.unchecked_transaction().unwrap();
+    identity.write_sql(&transaction).unwrap();
+    transaction.commit().unwrap();
+    shared::world_assets::install_runtime_identity_functions(connection).unwrap();
+    identity
+}
+
+/// Build a fresh canonical native fixture, including the contextual record contract.
+pub(crate) fn install(connection: &mut Connection) -> PackIdentity {
+    let identity = install_projection(connection);
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS records(form_id INTEGER PRIMARY KEY,record_type TEXT,flags INTEGER NOT NULL DEFAULT 0,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB)").unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
     shared::records::create_record_context(&transaction, &identity).unwrap();
     transaction.execute_batch("CREATE TABLE inhouse_localized_fields(form_id INTEGER,field_index INTEGER,resolved_text TEXT)").unwrap();
     transaction.commit().unwrap();
     identity
+}
+
+/// Write a current runtime cache bound to its already authenticated synthetic world.
+pub(crate) fn write_cache(
+    path: &std::path::Path,
+    identity: &PackIdentity,
+    cache: &shared::CellCache,
+) {
+    std::fs::write(
+        path,
+        shared::cache_identity::encode_cell_cache(identity, cache, false).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Convert newly generated single-owner source records through the production native writer.
+/// The destination is an in-memory fixture, never an existing converted world to migrate.
+pub(crate) fn publish_records(
+    connection: &mut Connection,
+    records: &std::collections::HashMap<u32, converter::esm::records::RawRecord>,
+) -> color_eyre::Result<()> {
+    let destination: String = connection.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        destination.is_empty(),
+        "synthetic source publication requires an in-memory destination"
+    );
+    let directory = tempfile::tempdir()?;
+    let plugin = directory.path().join("Skyrim.esm");
+    let database = directory.path().join("native.db");
+    let mut bytes = Vec::new();
+    let mut hedr = 1.7f32.to_le_bytes().to_vec();
+    hedr.extend((records.len() as u32).to_le_bytes());
+    hedr.extend(0x10000u32.to_le_bytes());
+    let mut header = b"HEDR".to_vec();
+    header.extend(12u16.to_le_bytes());
+    header.extend(hedr);
+    let append = |bytes: &mut Vec<u8>, kind: [u8; 4], id: u32, flags: u32, data: Vec<u8>| {
+        bytes.extend(kind);
+        bytes.extend((data.len() as u32).to_le_bytes());
+        bytes.extend(flags.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+        bytes.extend([0; 4]);
+        bytes.extend(44u16.to_le_bytes());
+        bytes.extend([0; 2]);
+        bytes.extend(data);
+    };
+    append(&mut bytes, *b"TES4", 0, 1, header);
+    let mut records: Vec<_> = records.values().collect();
+    records.sort_by_key(|record| record.form_id);
+    for record in records {
+        assert!(
+            record.cell_form_id.is_none() && record.worldspace_form_id.is_none(),
+            "grouped source fixtures require explicit GRUP serialization"
+        );
+        assert_eq!(record.load_order, 0);
+        let mut fields = Vec::new();
+        for (tag, data) in &record.subrecords {
+            fields.extend(tag);
+            fields.extend(u16::try_from(data.len())?.to_le_bytes());
+            fields.extend(data);
+        }
+        append(
+            &mut bytes,
+            record.record_type,
+            record.form_id,
+            record.flags,
+            fields,
+        );
+    }
+    std::fs::write(&plugin, bytes)?;
+    converter::esm::EsmParser::convert_form_key_plugins(&[plugin], &database)?;
+    connection.restore("main", database, rusqlite::backup::NO_PROGRESS)?;
+    Ok(())
 }
 
 /// Encode one explicitly written synthetic runtime request as this fresh pack's stored key.

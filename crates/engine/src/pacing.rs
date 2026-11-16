@@ -764,12 +764,17 @@ mod tests {
     fn empty_cell_cache() -> (tempfile::TempDir, CellCache) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cell_cache.rkyv");
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
-            version: shared::CELL_CACHE_VERSION,
-            cells: vec![],
-        })
-        .unwrap();
-        std::fs::write(&path, bytes).unwrap();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        let identity = crate::world::test_support::install_projection(&connection);
+        crate::world::test_support::write_cache(
+            &path,
+            &identity,
+            &shared::CellCache {
+                version: shared::CELL_CACHE_VERSION,
+                cells: vec![],
+            },
+        );
         (directory, CellCache::open(&path).unwrap())
     }
 

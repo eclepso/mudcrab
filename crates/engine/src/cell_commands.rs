@@ -254,25 +254,26 @@ mod tests {
     fn database() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::world::test_support::install_projection(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
                  -- EXTERIOR_CELL_ID_SQL LEFT JOINs `land` (rows only break ties), so it must exist.
                  CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
-                 INSERT INTO cells VALUES(1,60,4,-12,'Riverwood');
-                 INSERT INTO cells VALUES(2,60,5,-12,NULL);
-                 INSERT INTO cells VALUES(3,NULL,NULL,NULL,'WhiterunBanneredMare');
-                 INSERT INTO cells VALUES(4,61,0,0,'OtherWorldCell');
-                 -- A second Riverwood in another worldspace, with a lower id: the streaming
+                 INSERT INTO cells VALUES(stored_key(2),stored_key(60),4,-12,'Riverwood');
+                 INSERT INTO cells VALUES(stored_key(3),stored_key(60),5,-12,NULL);
+                 INSERT INTO cells VALUES(stored_key(4),NULL,NULL,NULL,'WhiterunBanneredMare');
+                 INSERT INTO cells VALUES(stored_key(5),stored_key(61),0,0,'OtherWorldCell');
+                 -- A second Riverwood in another worldspace, with a lower stored key: the streaming
                  -- worldspace's cell must still win.
-                 INSERT INTO cells VALUES(0,61,7,7,'Riverwood');
+                 INSERT INTO cells VALUES(stored_key(1),stored_key(61),7,7,'Riverwood');
                  -- An exterior with no terrain in the cell cache, and one with no grid.
-                 INSERT INTO cells VALUES(5,60,6,-12,'NoLand');
-                 INSERT INTO cells VALUES(6,60,NULL,NULL,'NoGrid');
+                 INSERT INTO cells VALUES(stored_key(6),stored_key(60),6,-12,'NoLand');
+                 INSERT INTO cells VALUES(stored_key(7),stored_key(60),NULL,NULL,'NoGrid');
                  -- A name shared by a gridless cell of the streaming worldspace (lower id) and its
                  -- real exterior: the one with a grid must win.
-                 INSERT INTO cells VALUES(7,60,NULL,NULL,'SharedName');
-                 INSERT INTO cells VALUES(8,60,9,9,'SharedName');",
+                 INSERT INTO cells VALUES(stored_key(8),stored_key(60),NULL,NULL,'SharedName');
+                 INSERT INTO cells VALUES(stored_key(9),stored_key(60),9,9,'SharedName');",
             )
             .unwrap();
         directory
@@ -322,7 +323,7 @@ mod tests {
         assert_eq!(
             row,
             CellRow {
-                id: 1,
+                id: 2,
                 worldspace_id: Some(60),
                 grid: Some((4, -12))
             }
@@ -331,7 +332,7 @@ mod tests {
             find_cell_by_editor_id(&connection, "riverwood", 61)
                 .unwrap()
                 .map(|row| row.id),
-            Some(0),
+            Some(1),
             "the other worldspace's Riverwood when that one streams"
         );
         assert_eq!(
@@ -340,7 +341,7 @@ mod tests {
         );
         assert_eq!(
             find_exterior_cell(&connection, 60, 5, -12).unwrap(),
-            Some(2)
+            Some(3)
         );
         assert_eq!(find_exterior_cell(&connection, 60, 99, 99).unwrap(), None);
     }
@@ -353,7 +354,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            row.id, 8,
+            row.id, 9,
             "the gridded exterior, not the lower-id gridless row"
         );
         assert_eq!(row.grid, Some((9, 9)));
@@ -443,11 +444,13 @@ mod tests {
         }
     }
 
-    /// A cell cache with flat terrain for cells 1 (height 0) and 2 (height 100); cell 5 has none.
+    /// A native cell cache for cells 2 (height 0) and 3 (height 100); cell 6 has none.
     fn cell_cache(directory: &tempfile::TempDir) -> CellCache {
         let path = directory.path().join("cell_cache.rkyv");
+        let connection = connection(directory);
+        let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
         let land = |cell_id, height| shared::CachedLand {
-            cell_id,
+            cell_id: u64::try_from(crate::world::test_support::key(&identity, cell_id)).unwrap(),
             width: 3,
             height: 3,
             heights: vec![height; 9],
@@ -459,10 +462,9 @@ mod tests {
         };
         let source = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
-            cells: vec![land(1, 0.0), land(2, 100.0)],
+            cells: vec![land(2, 0.0), land(3, 100.0)],
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&source).unwrap();
-        std::fs::write(&path, bytes).unwrap();
+        crate::world::test_support::write_cache(&path, &identity, &source);
         CellCache::open(&path).unwrap()
     }
 
@@ -634,13 +636,8 @@ mod tests {
         use std::time::Duration;
 
         let path = directory.path().join("skyrim_world.db");
-        connection(directory)
-            .execute_batch(&format!(
-                "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES({});",
-                shared::WORLD_DATABASE_SCHEMA_VERSION
-            ))
-            .unwrap();
+        // database() already published this fresh native fixture's current identity.
+        shared::world_assets::validate_world_database(&path).unwrap();
         let mut app = App::new();
         app.add_plugins((
             MinimalPlugins,

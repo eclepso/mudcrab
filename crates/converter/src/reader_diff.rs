@@ -863,7 +863,12 @@ mod tests {
         let identity = shared::pack_identity::PackIdentity::new(table, vec![zulu, alpha]).unwrap();
         let key = shared::form_key::FormKey::new(zulu, 0x1234).unwrap();
         let mut conn = Connection::open(path).unwrap();
-        conn.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB);").unwrap();
+        conn.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB); CREATE TABLE schema_info(version INTEGER NOT NULL);").unwrap();
+        conn.execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )
+        .unwrap();
         let tx = conn.transaction().unwrap();
         shared::records::create_record_context(&tx, &identity).unwrap();
         tx.execute(

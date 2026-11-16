@@ -139,6 +139,7 @@ fn cell_pipeline_fixture(
     }
     let path = directory.path().join("cell-catalog.db");
     let connection = rusqlite::Connection::open(&path).unwrap();
+    let identity = crate::world::test_support::install_projection(&connection);
     connection
         .execute_batch(
             "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
@@ -148,20 +149,19 @@ fn cell_pipeline_fixture(
         .unwrap();
     drop(connection);
     let cache_path = directory.path().join("cells.rkyv");
-    std::fs::write(
+    crate::world::test_support::write_cache(
         &cache_path,
-        rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
+        &identity,
+        &shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
             cells: vec![],
-        })
-        .unwrap(),
-    )
-    .unwrap();
+        },
+    );
     let (database, requests, responses) = WorldDatabase::channel_fixture(capacity);
     app.insert_resource(database)
         .insert_resource(AssetCatalog::open(&path).unwrap())
         .init_resource::<crate::world::actor_catalog::ActorCatalog>()
-        .insert_resource(CellCache::open(&cache_path).unwrap())
+        .insert_resource(CellCache::open_with_identity(&cache_path, identity).unwrap())
         .insert_resource(RenderOrigin(IVec2::ZERO))
         .insert_resource(WaterReflectionTexture(Handle::default()))
         .init_resource::<ActiveSpace>()
@@ -1668,24 +1668,24 @@ fn unfit_deferred_cell_does_not_block_affordable_cells_or_fresh_stale_responses(
     app.world_mut().resource_mut::<EngineConfig>().headless = true;
     let database_path = directory.path().join("collector.db");
     let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let identity = crate::world::test_support::install_projection(&connection);
     connection
-        .execute_batch(&format!(
-            "CREATE TABLE schema_info(version INTEGER NOT NULL);
-             INSERT INTO schema_info VALUES({});
-             CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
-             CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
-             CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
-             INSERT INTO texture_sets VALUES(1,'textures/too-large.dds');
-             INSERT INTO landscape_textures VALUES(1,1);",
-            shared::WORLD_DATABASE_SCHEMA_VERSION,
-        ))
+        .execute_batch(
+            "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+         CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+         CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
+         INSERT INTO texture_sets VALUES(stored_key(1),'textures/too-large.dds');
+         INSERT INTO landscape_textures VALUES(stored_key(1),stored_key(1));",
+        )
         .unwrap();
     drop(connection);
+    let native =
+        |runtime| u64::try_from(crate::world::test_support::key(&identity, runtime)).unwrap();
     let cache_path = directory.path().join("collector.rkyv");
     let cache = shared::CellCache {
         version: shared::CELL_CACHE_VERSION,
         cells: vec![shared::CachedLand {
-            cell_id: 1,
+            cell_id: native(1),
             width: 33,
             height: 33,
             heights: vec![0.0; 33 * 33],
@@ -1693,7 +1693,7 @@ fn unfit_deferred_cell_does_not_block_affordable_cells_or_fresh_stale_responses(
             vertex_colors: vec![],
             layers: (0..4)
                 .map(|quadrant| shared::TerrainLayer {
-                    texture_form_id: 1,
+                    texture_form_id: native(1),
                     quadrant,
                     layer: 0,
                     is_base: true,
@@ -1704,15 +1704,11 @@ fn unfit_deferred_cell_does_not_block_affordable_cells_or_fresh_stale_responses(
             water_type_form_id: None,
         }],
     };
-    std::fs::write(
-        &cache_path,
-        rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
-    )
-    .unwrap();
+    crate::world::test_support::write_cache(&cache_path, &identity, &cache);
     app.insert_resource(WorldDatabase::open(&database_path).unwrap())
         .insert_resource(AssetCatalog::open(&database_path).unwrap())
         .init_resource::<crate::world::actor_catalog::ActorCatalog>()
-        .insert_resource(CellCache::open(&cache_path).unwrap())
+        .insert_resource(CellCache::open_with_identity(&cache_path, identity).unwrap())
         .insert_resource(RenderOrigin(IVec2::ZERO))
         .insert_resource(WaterReflectionTexture(Handle::default()))
         .init_resource::<StreamingCommitBudget>()

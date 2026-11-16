@@ -15,6 +15,17 @@ const MOD_SOUND: u32 = 0x0200_0800;
 const MOD_LIGHT_AUTHORED: u32 = 0x0100_0801;
 const MOD_LIGHT: u32 = 0x0200_0801;
 
+/// Alphabetical fresh allocation is Mod=1, Other=2, Skyrim=3; supplying order stays separate.
+fn stored(runtime: u32) -> i64 {
+    let owner = match runtime >> 24 {
+        0 => 3,
+        1 => 2,
+        2 => 1,
+        _ => panic!("unexpected fixture runtime owner"),
+    };
+    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
+}
+
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
     let mut framed = tag.to_vec();
     framed.extend(u16::try_from(bytes.len()).unwrap().to_le_bytes());
@@ -177,7 +188,7 @@ fn both_record_readers_publish_the_same_light_details() {
                 "SELECT time, field_of_view, near_clip, flicker_period, flicker_intensity_amplitude,
                         flicker_movement_amplitude, value, weight, sound_id, lens_id
                  FROM lights WHERE id=?1",
-                [id],
+                [stored(id)],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -208,13 +219,13 @@ fn both_record_readers_publish_the_same_light_details() {
             Some(5.0),
             Some(7),
             Some(1.25),
-            Some(SOUND.into()),
-            Some(LENS.into())
+            Some(stored(SOUND)),
+            Some(stored(LENS))
         )
     );
     assert_eq!(
         details(MOD_LIGHT).8,
-        Some(MOD_SOUND.into()),
+        Some(stored(MOD_SOUND)),
         "SNAM is remapped through the mod's master list"
     );
 }

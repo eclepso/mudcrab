@@ -273,7 +273,7 @@ impl EsmParser {
                         super::exporter::validate_inhouse_record(&selected)
                             .map_err(color_eyre::eyre::Error::from)
                     } else if source.record_type == *b"LAND" {
-                        super::cell_cache::validate_inhouse_land(&checked)
+                        super::cell_cache::validate_inhouse_land(&source)
                     } else {
                         Ok(())
                     };

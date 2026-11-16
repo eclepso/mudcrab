@@ -272,6 +272,13 @@ mod tests {
             CREATE TABLE inhouse_source_records(form_id INTEGER PRIMARY KEY,record_type TEXT,payload BLOB);
             CREATE TABLE inhouse_schema_addons(ordinal INTEGER,name TEXT,sha256 TEXT,schema_json BLOB);
             CREATE TABLE plugins(id INTEGER,name TEXT,priority INTEGER,checksum BLOB);").unwrap();
+        conn.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )
+        .unwrap();
         let table = shared::plugin_table::PluginTable::fresh(vec![(
             "Fixture.esm".into(),
             shared::plugin_table::PluginFacts {
@@ -283,7 +290,7 @@ mod tests {
         let id = table.id("Fixture.esm").unwrap();
         let identity = shared::pack_identity::PackIdentity::new(table, vec![id]).unwrap();
         let transaction = conn.transaction().unwrap();
-        identity.write_sql(&transaction).unwrap();
+        shared::records::create_record_context(&transaction, &identity).unwrap();
         transaction.commit().unwrap();
         drop(conn);
         std::fs::write(
@@ -294,7 +301,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             path.join("conversion-manifest.json"),
-            br#"{"schema_version":28,"configuration_hash":"fixture"}"#,
+            serde_json::to_vec(&json!({"schema_version":shared::LOD_CONVERTER_SCHEMA_VERSION,"configuration_hash":"fixture"})).unwrap(),
         )
         .unwrap();
         path
@@ -433,7 +440,7 @@ mod tests {
         assert_eq!(report["coverage"]["status"], "empty");
         assert_eq!(report["coverage"]["matched_records"], 0);
         let conn = Connection::open(path.join("skyrim_world.db")).unwrap();
-        conn.execute("INSERT INTO records VALUES(16777217,'KYWD',X'')", [])
+        conn.execute("INSERT INTO records VALUES(4294967297,'KYWD',X'')", [])
             .unwrap();
         drop(conn);
         let before = hash_file(&path.join("skyrim_world.db")).unwrap();

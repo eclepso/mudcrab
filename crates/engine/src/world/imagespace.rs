@@ -342,18 +342,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut connection = Connection::open(directory.path().join("world.db")).unwrap();
         connection.execute_batch(
-            "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(9);
-             CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,load_order INTEGER NOT NULL,data BLOB NOT NULL);
+            "CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER NOT NULL,data BLOB NOT NULL);
              CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT NOT NULL,priority INTEGER NOT NULL);
              INSERT INTO plugins VALUES(91,'Winning.esm',7),(12,'Weather.esm',1),(44,'Base.esm',0);
              CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);")
             .unwrap();
-        connection
-            .execute(
-                "UPDATE schema_info SET version=?1",
-                [shared::WORLD_DATABASE_SCHEMA_VERSION],
-            )
-            .unwrap();
+
         crate::world::test_support::install(&mut connection);
         (directory, connection)
     }

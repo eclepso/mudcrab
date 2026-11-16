@@ -410,7 +410,12 @@ fn refuses_a_database_without_outfit_records() {
     let fixture = Fixture::new();
     Connection::open(fixture.clone.join("skyrim_world.db"))
         .unwrap()
-        .execute_batch("DELETE FROM records WHERE record_type='OTFT'")
+        .execute_batch("DELETE FROM record_field_origins WHERE record_key IN (SELECT form_id FROM records WHERE record_type='OTFT');
+            DELETE FROM resolved_links WHERE record_key IN (SELECT form_id FROM records WHERE record_type='OTFT');
+            DELETE FROM record_source_fields WHERE record_key IN (SELECT form_id FROM records WHERE record_type='OTFT');
+            DELETE FROM record_text WHERE record_key IN (SELECT form_id FROM records WHERE record_type='OTFT');
+            DELETE FROM record_context WHERE record_key IN (SELECT form_id FROM records WHERE record_type='OTFT');
+            DELETE FROM records WHERE record_type='OTFT';")
         .unwrap();
     let error = run(&fixture.options()).unwrap_err().to_string();
     assert!(error.contains("no OTFT records"), "{error}");

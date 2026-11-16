@@ -2498,13 +2498,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("lod-collector.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch(&format!(
-                "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES({});",
-                shared::WORLD_DATABASE_SCHEMA_VERSION,
-            ))
-            .unwrap();
+        crate::world::test_support::install_projection(&connection);
         drop(connection);
         let first = retry_test_metadata();
         let mut second = first.clone();
@@ -2835,13 +2829,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("lod-distances.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch(&format!(
-                "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES({});",
-                shared::WORLD_DATABASE_SCHEMA_VERSION,
-            ))
-            .unwrap();
+        crate::world::test_support::install_projection(&connection);
         drop(connection);
         let mut config = EngineConfig {
             headless: true,

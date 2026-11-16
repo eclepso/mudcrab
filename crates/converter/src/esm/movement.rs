@@ -60,8 +60,8 @@ pub fn rebuild_movement_projection(connection: &Connection) -> Result<usize> {
                         .ok_or_else(|| eyre!("MOVT lacks usable SPED"))?;
                     ensure!(matches!(bytes.len(), 40 | 44), "invalid MOVT SPED layout");
                     let mut speeds = [0f32; 8];
-                    for (value, word) in speeds.iter_mut().zip(bytes.chunks_exact(4)) {
-                        *value = f32::from_le_bytes(word.try_into()?);
+                    for (value, word) in speeds.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                        *value = f32::from_le_bytes(*word);
                     }
                     ensure!(
                         speeds.iter().all(|value| value.is_finite() && *value > 0.),

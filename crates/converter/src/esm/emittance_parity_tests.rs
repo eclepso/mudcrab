@@ -181,13 +181,23 @@ fn override_plugin() -> Vec<u8> {
     .concat()
 }
 
-type Emittance = (u32, String, Option<u32>, [u8; 12]);
+type Emittance = (i64, String, Option<i64>, [u8; 12]);
+
+/// Fresh alphabetical allocation is Skyrim=1 and Windows=2, independent of source selectors.
+fn stored(runtime: u32) -> i64 {
+    let owner = match runtime >> 24 {
+        0 => 1,
+        1 => 2,
+        _ => panic!("unexpected fixture owner"),
+    };
+    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
+}
 
 fn publish(
     reader: RecordReader,
     paths: &[PathBuf],
     root: &std::path::Path,
-) -> (Vec<(u32, Option<u32>)>, Vec<Emittance>) {
+) -> (Vec<(i64, Option<i64>)>, Vec<Emittance>) {
     let database = root.join(format!("{reader:?}.db"));
     EsmParser::convert_plugins_with_reader(paths, &database, reader, root).unwrap();
     let conn = Connection::open(database).unwrap();
@@ -237,24 +247,29 @@ fn both_record_readers_publish_the_same_emittance() {
     assert_eq!(
         references,
         vec![
-            (REGION_REFERENCE, Some(REGION)),
-            (LIGHT_REFERENCE, Some(LIGHT)),
-            (PLAIN_REFERENCE, None),
-            (LOCAL_LIGHT_REFERENCE, Some(LOCAL_LIGHT)),
+            (stored(REGION_REFERENCE), Some(stored(REGION))),
+            (stored(LIGHT_REFERENCE), Some(stored(LIGHT))),
+            (stored(PLAIN_REFERENCE), None),
+            (stored(LOCAL_LIGHT_REFERENCE), Some(stored(LOCAL_LIGHT))),
         ]
     );
     let light = |colour: [u8; 3]| -> [u8; 12] { [colour; 4].concat().try_into().unwrap() };
     assert_eq!(
         emittance,
         vec![
-            (LIGHT, "LIGH".into(), None, light([10, 20, 30])),
+            (stored(LIGHT), "LIGH".into(), None, light([10, 20, 30])),
             (
-                REGION,
+                stored(REGION),
                 "REGN".into(),
-                Some(WEATHER),
+                Some(stored(WEATHER)),
                 [1, 2, 3, 0, 0, 0, 7, 8, 9, 242, 176, 55]
             ),
-            (LOCAL_LIGHT, "LIGH".into(), None, light([40, 50, 60])),
+            (
+                stored(LOCAL_LIGHT),
+                "LIGH".into(),
+                None,
+                light([40, 50, 60])
+            ),
         ]
     );
 }

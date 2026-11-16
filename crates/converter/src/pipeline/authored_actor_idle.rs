@@ -843,25 +843,50 @@ mod tests {
     }
 
     fn actor_contract_fixture(parts: &[(u32, u32, &str, &str)]) -> Connection {
-        let connection = Connection::open_in_memory().unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE records(form_id INTEGER,record_type TEXT,data BLOB);
+                "CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,data BLOB,cell_id INTEGER,worldspace_id INTEGER);
                  CREATE TABLE actor_models(id INTEGER PRIMARY KEY,race_id INTEGER,sex TEXT);
-                 CREATE TABLE actor_model_parts(npc_id INTEGER,slot TEXT,model_path TEXT);",
+                 CREATE TABLE actor_model_parts(npc_id INTEGER,slot TEXT,model_path TEXT);
+                 CREATE TABLE schema_info(version INTEGER NOT NULL);",
             )
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_info VALUES(?1)",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
+            .unwrap();
+        let table = shared::plugin_table::PluginTable::fresh(vec![(
+            "Fixture.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x31; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let owner = table.id("Fixture.esm").unwrap();
+        let identity = PackIdentity::new(table, vec![owner]).unwrap();
+        let tx = connection.transaction().unwrap();
+        shared::records::create_record_context(&tx, &identity).unwrap();
+        tx.commit().unwrap();
+        let native = |local| {
+            shared::form_key::FormKey::new(owner, local)
+                .unwrap()
+                .to_sql_i64()
+        };
         for (npc, race, sex, path) in parts {
             connection
                 .execute(
                     "INSERT INTO actor_models(id,race_id,sex) VALUES (?1,?2,?3)",
-                    rusqlite::params![npc, race, sex],
+                    rusqlite::params![native(*npc), native(*race), sex],
                 )
                 .unwrap();
             connection
                 .execute(
                     "INSERT INTO actor_model_parts(npc_id,slot,model_path) VALUES (?1,'body',?2)",
-                    rusqlite::params![npc, path],
+                    rusqlite::params![native(*npc), path],
                 )
                 .unwrap();
         }
@@ -947,12 +972,37 @@ mod tests {
                     .collect(),
             };
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&record).unwrap();
+            let identity = PackIdentity::read_sql(&connection).unwrap();
+            let owner = identity.table().id("Fixture.esm").unwrap();
+            let race = shared::form_key::FormKey::new(owner, 7)
+                .unwrap()
+                .to_sql_i64();
             connection
                 .execute(
-                    "INSERT INTO records(form_id,record_type,data) VALUES(7,'RACE',?1)",
-                    [bytes.as_slice()],
+                    "INSERT INTO records(form_id,record_type,data) VALUES(?1,'RACE',?2)",
+                    rusqlite::params![race, bytes.as_slice()],
                 )
                 .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO record_context VALUES(?1,?2,7,NULL,NULL,?3)",
+                    rusqlite::params![race, owner.get(), record.subrecords.len()],
+                )
+                .unwrap();
+            for (ordinal, field) in record.subrecords.iter().enumerate() {
+                connection
+                    .execute(
+                        "INSERT INTO record_field_origins VALUES(?1,?2,?2,?3,1)",
+                        rusqlite::params![race, ordinal, field.tag.as_slice()],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO record_source_fields VALUES(?1,?2,?3,?4)",
+                        rusqlite::params![race, ordinal, field.tag.as_slice(), &field.data],
+                    )
+                    .unwrap();
+            }
             let set = contracts(&connection).unwrap();
             assert!(set.contracts.is_empty());
             assert_eq!(set.rejected.len(), 1);

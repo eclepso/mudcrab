@@ -1,15 +1,13 @@
 use super::*;
 use crate::nif_material::skin_load_tests::{loader_app_with_formats, wait_for_dependencies};
+use crate::world::test_support::publish_records as export_to_db;
 use bevy::{
     gltf::GltfAssetLabel,
     image::CompressedImageFormats,
     world_serialization::{WorldAsset, WorldAssetRoot},
 };
 use converter::{
-    esm::{
-        exporter::{create_tables, export_to_db},
-        records::RawRecord,
-    },
+    esm::{exporter::create_tables, records::RawRecord},
     mesh::MeshConverter,
     texture::{TextureConverter, TextureEncoding},
 };
@@ -71,7 +69,7 @@ const ROCKS: u32 = 126829;
 const NULL_TEXTURE_SET: u32 = 0x28;
 
 fn database() -> (Connection, HashMap<u32, RawRecord>) {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     create_tables(&conn).unwrap();
     let records = [
         txst(101, "red.dds", Some("red_n.dds")),
@@ -103,7 +101,7 @@ fn database() -> (Connection, HashMap<u32, RawRecord>) {
     .into_iter()
     .map(|record| (record.form_id, record))
     .collect();
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     (conn, records)
 }
 
@@ -503,7 +501,7 @@ fn an_empty_txst_slot_stays_empty_instead_of_keeping_the_model_texture() {
 fn every_entry_applies_by_geometry_index_with_minus_one_skipped_and_the_later_duplicate_winning() {
     let directory = tempfile::tempdir().unwrap();
     fixture(directory.path());
-    let (conn, mut records) = database();
+    let (mut conn, mut records) = database();
     for record in [
         // Multi-entry list (655 retail STATs carry several): geometry 0, 1 and 3 each get theirs.
         stat(20, &[("A:0", 101, 0), ("B:1", 102, 1), ("C:2", 103, 3)]),
@@ -516,7 +514,7 @@ fn every_entry_applies_by_geometry_index_with_minus_one_skipped_and_the_later_du
     ] {
         records.insert(record.form_id, record);
     }
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     let catalog = ObjectTextureCatalog::read(&conn).unwrap();
     let mut app = object_app(directory.path());
     let scene = load_scene(&mut app, "multi.glb");
@@ -572,10 +570,10 @@ fn every_entry_applies_by_geometry_index_with_minus_one_skipped_and_the_later_du
 fn a_null_texture_set_entry_hides_the_shape() {
     let directory = tempfile::tempdir().unwrap();
     fixture(directory.path());
-    let (conn, mut records) = database();
+    let (mut conn, mut records) = database();
     let hide = stat(30, &[("H:1", NULL_TEXTURE_SET, 1), ("A:0", 101, 0)]);
     records.insert(hide.form_id, hide);
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     let catalog = ObjectTextureCatalog::read(&conn).unwrap();
     let mut app = object_app(directory.path());
     let scene = load_scene(&mut app, "multi.glb");
@@ -789,7 +787,7 @@ fn unsupported_inputs_keep_the_model_material_and_say_why() {
         container.to_vec().unwrap(),
     )
     .unwrap();
-    let (conn, mut records) = database();
+    let (mut conn, mut records) = database();
     for record in [
         stat(7, &[("Rock:0", 104, 0)]),
         txst(104, "missing_file.dds", None),
@@ -810,7 +808,7 @@ fn unsupported_inputs_keep_the_model_material_and_say_why() {
     ] {
         records.insert(record.form_id, record);
     }
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     let catalog = ObjectTextureCatalog::read(&conn).unwrap();
     let mut app = object_app(directory.path());
     let scene = load_scene(&mut app, "shared.glb");
@@ -872,7 +870,7 @@ fn unsupported_inputs_keep_the_model_material_and_say_why() {
 
 #[test]
 fn projection_rows_resolve_texture_sets_and_keep_other_txst_consumers() {
-    let (conn, mut records) = database();
+    let (mut conn, mut records) = database();
     records.insert(
         101,
         record(
@@ -885,7 +883,7 @@ fn projection_rows_resolve_texture_sets_and_keep_other_txst_consumers() {
         ),
     );
     records.insert(102, record(102, b"MISC", &[]));
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     let catalog = ObjectTextureCatalog::read(&conn).unwrap();
     assert!(matches!(
         &catalog.get(1).unwrap().swaps[0].kind,
@@ -897,7 +895,7 @@ fn projection_rows_resolve_texture_sets_and_keep_other_txst_consumers() {
     ));
     let path: String = conn
         .query_row(
-            "SELECT specular_path FROM texture_sets WHERE id=101",
+            "SELECT specular_path FROM texture_sets WHERE id=stored_key(101)",
             [],
             |row| row.get(0),
         )
@@ -913,12 +911,12 @@ fn projection_rows_resolve_texture_sets_and_keep_other_txst_consumers() {
                 && unapplied.is_empty()
     ));
     records.insert(1, record(1, b"STAT", &[]));
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     assert!(ObjectTextureCatalog::read(&conn).unwrap().get(1).is_none());
     conn.execute_batch("DROP TABLE base_texture_swaps").unwrap();
     assert!(
         ObjectTextureCatalog::read(&conn).unwrap().get(2).is_none(),
-        "old packs remain compatible"
+        "a current native fixture with no optional swap table remains usable"
     );
 }
 
@@ -926,10 +924,10 @@ fn projection_rows_resolve_texture_sets_and_keep_other_txst_consumers() {
 fn refusals_warn_once_per_base_record_and_reason() {
     let directory = tempfile::tempdir().unwrap();
     fixture(directory.path());
-    let (conn, mut records) = database();
+    let (mut conn, mut records) = database();
     let other = stat(6, &[("Rock:0", 0xBEEF, 0)]);
     records.insert(other.form_id, other);
-    export_to_db(&conn, &records).unwrap();
+    export_to_db(&mut conn, &records).unwrap();
     let catalog = ObjectTextureCatalog::read(&conn).unwrap();
     let mut app = object_app(directory.path());
     let scene = load_scene(&mut app, "shared.glb");

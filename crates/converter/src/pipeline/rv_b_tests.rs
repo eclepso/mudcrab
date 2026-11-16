@@ -223,7 +223,11 @@ async fn reader_switch_reuses_archives_and_assets_but_rebuilds_database_and_cell
     let switched = publish_report(inhouse).await;
     assert!(!switched.complete);
     assert_eq!(switched.warnings.len(), 1, "{:?}", switched.warnings);
-    assert!(switched.warnings[0].contains("skyrim.esm"));
+    assert!(
+        switched.warnings[0]
+            .to_ascii_lowercase()
+            .contains("skyrim.esm")
+    );
     assert!(switched.warnings[0].contains("OBND"));
     assert!(!manifest(&fixture.output).complete);
     assert_eq!(
@@ -378,9 +382,11 @@ async fn known_legacy_full_hashes_reuse_dds_and_pex_but_regenerate_nif_without_k
         );
         let database = Connection::open(fixture.output.join("skyrim_world.db")).unwrap();
         let neighbor: String = database
-            .query_row("SELECT editor_id FROM statics WHERE id=24577", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT editor_id FROM statics WHERE id=?1",
+                [0x0000_0001_0000_6001i64],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(neighbor, "ReviewUsableNeighbor");
     }
@@ -603,8 +609,8 @@ async fn texture_role_change_after_metadata_drift_rebuilds_only_affected_dds() {
     let database = Connection::open(fixture.output.join("skyrim_world.db")).unwrap();
     let height: String = database
         .query_row(
-            "SELECT height_path FROM texture_sets WHERE id=20480",
-            [],
+            "SELECT height_path FROM texture_sets WHERE id=?1",
+            [0x0000_0001_0000_5000i64],
             |row| row.get(0),
         )
         .unwrap();
@@ -790,11 +796,11 @@ async fn historical_legacy_reader_identity_with_current_nif_proof_survives_repea
 
 /// Explicit historical byte retention does not upgrade old meshes or textures into normal hits.
 #[tokio::test]
-async fn pre_producer_28_metadata_sources_are_rejected_before_relabeling() {
+async fn pre_native_producer_metadata_sources_are_rejected_before_relabeling() {
     let fixture = Fixture::new(true);
     let legacy = fixture.config(RecordReader::Legacy);
     publish(legacy.clone()).await;
-    for schema in [16, PRODUCER_27] {
+    for schema in [16, PRODUCER_27, 28] {
         let mut original = manifest(&fixture.output);
         original.schema_version = schema;
         original.asset_configuration_hashes.clear();
@@ -818,8 +824,12 @@ async fn pre_producer_28_metadata_sources_are_rejected_before_relabeling() {
             .to_string();
         drain.await.unwrap();
         assert!(
-            error.contains("predate the current texture layout")
-                && error.contains("normal conversion"),
+            error.contains("convert again")
+                && error.contains(&format!("converter schema {schema}"))
+                && error.contains(&format!(
+                    "converter schema {}",
+                    crate::cache::CONVERTER_SCHEMA_VERSION
+                )),
             "schema {schema}: {error}"
         );
         assert!(

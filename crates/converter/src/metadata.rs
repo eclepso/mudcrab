@@ -304,8 +304,8 @@ impl AssetPipeline {
 fn source_reader_identity(source: &Path) -> Result<serde_json::Value> {
     let bytes = fs::read(source.join("record-reader.json"))
         .wrap_err("metadata source has no reader proof; convert again")?;
-    Ok(serde_json::from_slice(&bytes)
-        .wrap_err("metadata source reader proof is invalid; convert again")?)
+    serde_json::from_slice(&bytes)
+        .wrap_err("metadata source reader proof is invalid; convert again")
 }
 
 /// Retained bytes keep their producer identity across repeated metadata rebuilds.

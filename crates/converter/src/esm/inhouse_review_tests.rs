@@ -139,7 +139,7 @@ impl Fixture {
         &self,
         schema: Option<&Schema>,
         signatures: &[[u8; 4]],
-    ) -> (HashMap<u32, RawRecord>, Connection, PathBuf) {
+    ) -> (NativeTestSnapshot, Connection, PathBuf) {
         let output = self.directory.path().join("published");
         fs::create_dir(&output).unwrap();
         let db_path = output.join("skyrim_world.db");
@@ -154,18 +154,39 @@ impl Fixture {
         )
         .unwrap();
         write_terrain_caches(&records, &db_path, &output).unwrap();
-        (records, Connection::open(db_path).unwrap(), output)
+        let connection = Connection::open(db_path).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&connection).unwrap();
+        (records, connection, output)
     }
 }
 
-/// Read published canonical bytes through the established rkyv SQL contract.
+/// Read the authenticated transient runtime interpretation; the old scalar control is memory-only.
 fn canonical(db: &Connection, id: u32) -> ArchivedRecordData {
+    let file: String = db
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !file.is_empty() {
+        return test_runtime_record(db, id).unwrap();
+    }
     let bytes: Vec<u8> = db
         .query_row("SELECT data FROM records WHERE form_id=?1", [id], |row| {
             row.get(0)
         })
         .unwrap();
     rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap()
+}
+
+fn named(db: &Connection, id: u32) -> String {
+    let identity = shared::pack_identity::PackIdentity::read_sql(db).unwrap();
+    identity
+        .table()
+        .named(identity.runtime_key(id).unwrap().unwrap())
+        .unwrap()
+        .to_string()
 }
 
 /// Select by native signature so fixture assertions do not depend on decoder role names.
@@ -228,7 +249,10 @@ fn r10_sndr_fnam_flags_publish_without_localization() {
         let runtime = canonical(&db, id);
         assert_eq!(runtime.subrecords[0].tag, *b"FNAM");
         assert_eq!(runtime.subrecords[0].data, bits.to_le_bytes());
-        let row = rows.iter().find(|row| row["form_id"] == id).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["form_id"] == named(&db, id))
+            .unwrap();
         assert_eq!(row["fields"][0]["value"]["Unsigned"], bits);
         assert_eq!(row["localization"], serde_json::json!({}));
     }
@@ -272,7 +296,7 @@ fn r10_navm_onam_reference_remaps_and_preserves_source() {
     assert_eq!(runtime.subrecords[0].data, 0x0200_0920u32.to_le_bytes());
     let source: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            "SELECT payload FROM inhouse_source_records WHERE form_id=stored_key(?1)",
             [0x0200_0930],
             |row| row.get(0),
         )
@@ -603,7 +627,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
     for id in [RACE_MISSING_TEXT, RACE_NULL_TEXT] {
         assert_eq!(
             SubrecordView::new(&records[&id].subrecords).find(b"FULL"),
-            Some(&[0][..])
+            None
         );
     }
     let movement = SubrecordView::new(&records[&MOVEMENT].subrecords);
@@ -620,7 +644,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
         assert_eq!(raw.load_order, 2);
         let supplier: u32 = db
             .query_row(
-                "SELECT load_order FROM records WHERE form_id=?1",
+                "SELECT load_order FROM records WHERE form_id=stored_key(?1)",
                 [raw.form_id],
                 |row| row.get(0),
             )
@@ -629,7 +653,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
     }
     assert_eq!(
         db.query_row(
-            "SELECT forward_walk,forward_run,load_order FROM movement_types WHERE id=?1",
+            "SELECT forward_walk,forward_run,load_order FROM movement_types WHERE id=stored_key(?1)",
             [MOVEMENT],
             |row| Ok((
                 row.get::<_, f32>(0)?,
@@ -656,7 +680,7 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
     }
     assert_eq!(
         db.query_row(
-            "SELECT walk_movt_id,run_movt_id,load_order FROM race_movement_links WHERE id=?1",
+            "SELECT walk_movt_id,run_movt_id,load_order FROM race_movement_links WHERE id=stored_key(?1)",
             [RACE_OVERRIDE],
             |row| Ok((
                 row.get::<_, Option<u32>>(0)?,
@@ -669,18 +693,18 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
     );
     let source: Vec<u8> = db
         .query_row(
-            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            "SELECT payload FROM inhouse_source_records WHERE form_id=stored_key(?1)",
             [RACE_OVERRIDE],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(&source[..11], &sub(b"EDID", b"Caf\xe9\0"));
-    let states: Vec<(u32, String, Option<String>)> = db.prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=?1 ORDER BY chain_position").unwrap().query_map([RACE_OVERRIDE], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let states: Vec<(u32, String, Option<String>)> = db.prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=stored_key(?1) ORDER BY chain_position").unwrap().query_map([RACE_OVERRIDE], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
     assert_eq!(
         states,
         [(0, "accepted".into(), None), (2, "accepted".into(), None)]
     );
-    let localized: Vec<(u32, String, u32)> = db.prepare("SELECT form_id,status,load_order FROM inhouse_localized_fields WHERE form_id IN (?1,?2,?3) ORDER BY form_id").unwrap().query_map([RACE_OVERRIDE, RACE_MISSING_TEXT, RACE_NULL_TEXT], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let localized: Vec<(u32, String, u32)> = db.prepare("SELECT runtime_id(form_id),status,load_order FROM inhouse_localized_fields WHERE form_id IN (stored_key(?1),stored_key(?2),stored_key(?3)) ORDER BY runtime_id(form_id)").unwrap().query_map([RACE_OVERRIDE, RACE_MISSING_TEXT, RACE_NULL_TEXT], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
     assert_eq!(
         localized,
         [
@@ -779,11 +803,14 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
         .collect::<Vec<_>>();
     let typed_race = rows
         .iter()
-        .find(|row| row["form_id"] == RACE_OVERRIDE)
+        .find(|row| row["form_id"] == named(&db, RACE_OVERRIDE))
         .unwrap();
     assert_eq!(typed_race["load_order"], 2);
     assert_eq!(typed_race["localization"]["1"]["status"], "resolved");
-    assert_eq!(typed_race["localization"]["1"]["text"], "Carte\u{e9}");
+    assert_eq!(
+        typed_race["localization"]["1"]["resolved_text"],
+        "Carte\u{e9}"
+    );
     assert!(!typed.contains("\"Deferred\""));
 }
 
@@ -831,7 +858,7 @@ fn rv_a_runtime_late_validation_text_normalization_preserves_predecessor() {
     let (records, db, output) = fixture.publish(None, &[*b"GMST"]);
     let count: u32 = db
         .query_row(
-            "SELECT count(*) FROM records WHERE form_id=?1",
+            "SELECT count(*) FROM records WHERE form_id=stored_key(?1)",
             [WALK_SETTING],
             |row| row.get(0),
         )
@@ -859,13 +886,13 @@ fn rv_a_runtime_late_validation_text_normalization_preserves_predecessor() {
     );
     let (supplier, source): (u32, Vec<u8>) = db
         .query_row(
-            "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=?1",
+            "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=stored_key(?1)",
             [WALK_SETTING],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!((supplier, source), (0, prior_setting));
-    let states: Vec<(u32, String, Option<String>)> = db.prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=?1 ORDER BY chain_position").unwrap().query_map([WALK_SETTING], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let states: Vec<(u32, String, Option<String>)> = db.prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=stored_key(?1) ORDER BY chain_position").unwrap().query_map([WALK_SETTING], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
     assert_eq!(states.len(), 2);
     assert_eq!((states[0].0, states[0].1.as_str()), (0, "accepted"));
     assert_eq!((states[1].0, states[1].1.as_str()), (2, "skipped"));
@@ -877,9 +904,9 @@ fn rv_a_runtime_late_validation_text_normalization_preserves_predecessor() {
         .collect::<Vec<_>>();
     let row = rows
         .iter()
-        .find(|row| row["form_id"] == WALK_SETTING)
+        .find(|row| row["form_id"] == named(&db, WALK_SETTING))
         .unwrap();
-    assert_eq!(row["form_id"], WALK_SETTING);
+    assert_eq!(row["form_id"], named(&db, WALK_SETTING));
     assert_eq!(row["load_order"], 0);
     for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
         let cache = crate::esm::cell_cache::runtime_fixture_cache(&output.join(name));
@@ -1007,14 +1034,14 @@ fn rv_a_deferred_replay_failure_publishes_predecessor_and_neighbor_with_private_
     assert!(records.contains_key(&0x0200_0901));
     let (supplier, source): (u32, Vec<u8>) = db
         .query_row(
-            "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=2304",
+            "SELECT load_order,payload FROM inhouse_source_records WHERE form_id=stored_key(2304)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(supplier, 0);
     assert_eq!(source, sub(b"EDID", b"EarlierVersion\0"));
-    let states: Vec<(u32, String, Option<String>)> = db.prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=2304 ORDER BY chain_position").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let states: Vec<(u32, String, Option<String>)> = db.prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=stored_key(2304) ORDER BY chain_position").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
     assert_eq!(states.len(), 2);
     assert_eq!((states[0].0, states[0].1.as_str()), (0, "accepted"));
     assert_eq!((states[1].0, states[1].1.as_str()), (2, "skipped"));
@@ -1063,7 +1090,7 @@ fn rv_a_deferred_replay_failure_publishes_safe_first_definition_with_private_sch
     );
     let (source_id, supplier, source): (u32, u32, Vec<u8>) = db
         .query_row(
-            "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=?1",
+            "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=stored_key(?1)",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -1076,7 +1103,7 @@ fn rv_a_deferred_replay_failure_publishes_safe_first_definition_with_private_sch
     assert!(records.contains_key(&0x0200_0901));
     let (status, reason): (String, Option<String>) = db
         .query_row(
-            "SELECT status,reason FROM record_overrides WHERE form_id=?1",
+            "SELECT status,reason FROM record_overrides WHERE form_id=stored_key(?1)",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -1086,7 +1113,7 @@ fn rv_a_deferred_replay_failure_publishes_safe_first_definition_with_private_sch
     let typed = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
     assert!(!typed.contains("\"Deferred\""));
     let row: Json = serde_json::from_str(typed.trim()).unwrap();
-    assert_eq!(row["form_id"], id);
+    assert_eq!(row["form_id"], named(&db, id));
     assert_eq!(row["source_form_id"], 0x0100_0900u32);
     assert_eq!(row["load_order"], 2);
 }
@@ -1135,7 +1162,7 @@ fn rv_a_deferred_builtin_damaged_optional_coed_publishes_safe_neighbors() {
     assert!(records.contains_key(&0x0200_0901));
     let count: u32 = db
         .query_row(
-            "SELECT count(*) FROM statics WHERE id IN (?1,?2)",
+            "SELECT count(*) FROM statics WHERE id IN (stored_key(?1),stored_key(?2))",
             [0x0200_0900u32, 0x0200_0901],
             |row| row.get(0),
         )
@@ -1198,7 +1225,7 @@ fn race_base_movement_links_match_legacy_and_inhouse_publication() {
             for (index, tag) in tags.iter().enumerate() {
                 let expected =
                     (if light { 0xFE00_0000 } else { 0x0200_0000 }) | (first_id + index as u32);
-                for records in [&inhouse, &legacy] {
+                for records in [&*inhouse, &legacy] {
                     let bytes = SubrecordView::new(&records[&0x900].subrecords);
                     assert_eq!(word(bytes.find(tag).unwrap()), expected);
                 }

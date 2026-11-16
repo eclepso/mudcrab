@@ -176,7 +176,28 @@ fn cached_snapshot(record: &RawRecord) -> TerrainSnapshot {
         worldspace: None,
         links,
     };
-    let records = HashMap::from([(stored(record.form_id), native)]);
+    let live_textures: Vec<_> = native.links.iter().filter_map(|link| link.key).collect();
+    let mut records = HashMap::from([(stored(record.form_id), native)]);
+    for key in live_textures {
+        records.entry(key).or_insert_with(|| FormKeyRecord {
+            source: RawRecord {
+                form_id: key.local(),
+                record_type: *b"LTEX",
+                flags: 0,
+                subrecords: Vec::new(),
+                cell_form_id: None,
+                worldspace_form_id: None,
+                load_order: 0,
+            },
+            canonical: None,
+            canonical_ordinals: Vec::new(),
+            localized_text: Default::default(),
+            runtime_omitted: Default::default(),
+            cell: None,
+            worldspace: None,
+            links: Vec::new(),
+        });
+    }
     let conversion = FormKeyConversion {
         order,
         records,

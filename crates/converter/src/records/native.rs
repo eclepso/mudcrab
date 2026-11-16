@@ -86,35 +86,20 @@ pub struct NativeReadResult {
 }
 
 impl NativeReadResult {
-    /// Data loss reaches publication warnings, including cleared semantic links.
+    /// Omitted fields and records remain warnings; faithful link clearing keeps its severity.
     pub fn warnings(&self) -> Vec<String> {
         self.diagnostics
             .iter()
-            .flat_map(|(name, diagnostics)| {
-                let mut lines = diagnostics.warning_summary_lines(name);
-                if diagnostics.invalid_links != 0 {
-                    lines.push(format!(
-                        "warning: {name}: cleared {} invalid native links (first: {})",
-                        diagnostics.invalid_links,
-                        diagnostics
-                            .first_by_category
-                            .get("link")
-                            .map_or("unknown source site", String::as_str)
-                    ));
-                }
-                lines
-            })
+            .flat_map(|(name, diagnostics)| diagnostics.warning_summary_lines(name))
             .collect()
     }
 
-    /// Successful supplier-self admission remains separate from data-loss warnings.
+    /// Preserve the typed reader's bounded compatibility and faithfully cleared-link notices.
     pub fn notices(&self) -> Vec<String> {
-        self.diagnostics.iter().filter_map(|(name, diagnostics)| {
-            let example = diagnostics.first_by_category.get("compatibility")?;
-            (diagnostics.compatibility_headers != 0).then(|| format!(
-                "notice: {name}: used supplier-self native compatibility for {} headers (original owners unresolved; first: {example})",
-                diagnostics.compatibility_headers))
-        }).collect()
+        self.diagnostics
+            .iter()
+            .flat_map(|(name, diagnostics)| diagnostics.notice_summary_lines(name))
+            .collect()
     }
 }
 
@@ -458,7 +443,7 @@ pub fn read_plugins_form_keys_with_validation(
             .table()
             .entry(order.plugin_order()[supplier])
             .expect("allocated supplier")
-            .display_name
+            .normalized_name
             .clone();
         let mut plugin_diagnostics = PluginDiagnostics::default();
         let mut seen = HashSet::new();
@@ -590,20 +575,22 @@ pub fn read_plugins_form_keys_with_validation(
                     key = None;
                 }
                 let duplicate_key = native_key.or(key);
-                let reason = if key.is_none() {
-                    Some("record has a null, colliding or unusable native identity")
-                } else if duplicate_key.is_some_and(|key| seen.contains(&key)) {
-                    Some("duplicate native record candidate in one supplier")
-                } else if !deleted
-                    && !record.decoded.payload_complete
-                    && candidates
-                        .get(&key.expect("checked key"))
-                        .and_then(|chain| chain.last())
-                        .is_some_and(|old| old.record.decoded.payload_complete)
-                {
-                    Some("incomplete override keeps the earlier complete version")
-                } else {
-                    None
+                let reason = match key {
+                    None => Some("record has a null, colliding or unusable native identity"),
+                    Some(_) if duplicate_key.is_some_and(|key| seen.contains(&key)) => {
+                        Some("duplicate native record candidate in one supplier")
+                    }
+                    Some(key)
+                        if !deleted
+                            && !record.decoded.payload_complete
+                            && candidates
+                                .get(&key)
+                                .and_then(|chain| chain.last())
+                                .is_some_and(|old| old.record.decoded.payload_complete) =>
+                    {
+                        Some("incomplete override keeps the earlier complete version")
+                    }
+                    Some(_) => None,
                 };
                 if let Some(reason) = reason {
                     diagnostics.note("record", || format!("source {raw:08X}: {reason}"));
@@ -699,7 +686,7 @@ pub fn read_plugins_form_keys_with_validation(
                         .table()
                         .entry(order.plugin_order()[supplier])
                         .expect("supplier")
-                        .display_name;
+                        .normalized_name;
                     merge_diagnostics(
                         result.diagnostics.entry(name.clone()).or_default(),
                         &diagnostics,
@@ -732,7 +719,7 @@ pub fn read_plugins_form_keys_with_validation(
                 .table()
                 .entry(order.plugin_order()[candidate.record.source.load_order as usize])
                 .expect("supplier")
-                .display_name;
+                .normalized_name;
             merge_diagnostics(
                 result.diagnostics.entry(name.clone()).or_default(),
                 &candidate.diagnostics,

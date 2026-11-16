@@ -516,7 +516,7 @@ fn real_old_record_oracle_sol3_publication_clears_absent_links_and_keeps_referen
     let new_path = dir.path().join("new.db");
     super::EsmParser::convert_plugins(&paths, &new_path).unwrap();
     let new_db = Connection::open(new_path).unwrap();
-    let published = |conn: &Connection, id: u32| {
+    let published = |conn: &Connection, id: i64| {
         let blob: Vec<u8> = conn
             .query_row("SELECT data FROM records WHERE form_id=?1", [id], |r| {
                 r.get(0)
@@ -525,14 +525,28 @@ fn real_old_record_oracle_sol3_publication_clears_absent_links_and_keeps_referen
         rkyv::from_bytes::<super::types::ArchivedRecordData, rkyv::rancor::Error>(&blob).unwrap()
     };
     let old_cell = published(&old_db, 0x0200_0800);
-    let new_cell = published(&new_db, 0x0200_0800);
+    let new_cell = published(&new_db, 0x0000_0003_0000_0800);
+    let context = shared::records::RecordContextReader::new(&new_db).unwrap();
+    let cell_key = context
+        .identity()
+        .required_key(0x0000_0003_0000_0800)
+        .unwrap();
+    let cell = context.record(cell_key).unwrap();
     for tag in [b"XOWN", b"XCWT"] {
         let word = |record: &super::types::ArchivedRecordData| {
             let field = record.subrecords.iter().find(|f| &f.tag == tag).unwrap();
             u32::from_le_bytes(field.data.as_slice().try_into().unwrap())
         };
         assert_eq!(word(&old_cell), 0);
-        assert_eq!(word(&new_cell), 0);
+        assert_eq!(
+            word(&new_cell),
+            if tag == b"XOWN" {
+                0x0200_0900
+            } else {
+                0x0200_0901
+            }
+        );
+        assert_eq!(cell.first_link(*tag, 0).unwrap(), None);
     }
     let old_count: u32 = old_db
         .query_row(
@@ -542,13 +556,25 @@ fn real_old_record_oracle_sol3_publication_clears_absent_links_and_keeps_referen
         )
         .unwrap();
     assert_eq!(old_count, 0);
-    let reference = published(&new_db, 0x0200_0802);
+    let reference_key = context
+        .identity()
+        .required_key(0x0000_0003_0000_0802)
+        .unwrap();
+    let reference = published(&new_db, reference_key.to_sql_i64());
     let name = reference
         .subrecords
         .iter()
         .find(|f| f.tag == *b"NAME")
         .unwrap();
-    assert_eq!(name.data, 0u32.to_le_bytes());
+    assert_eq!(name.data, 0x0200_0904u32.to_le_bytes());
+    assert_eq!(
+        context
+            .record(reference_key)
+            .unwrap()
+            .first_link(*b"NAME", 0)
+            .unwrap(),
+        None
+    );
 }
 
 /// Handwritten remaps emit one counted projection notice rather than two summaries.
@@ -691,11 +717,11 @@ fn typed_publication_skips_invalid_name_before_identity_construction() {
     let ids = conn
         .prepare("SELECT form_id FROM records ORDER BY form_id")
         .unwrap()
-        .query_map([], |r| r.get::<_, u32>(0))
+        .query_map([], |r| r.get::<_, i64>(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(ids, [0x811, 0x0100_0833]);
+    assert_eq!(ids, [0x0000_0001_0000_0833, 0x0000_0002_0000_0811]);
     let plugins: u32 = conn
         .query_row("SELECT COUNT(*) FROM plugins", [], |r| r.get(0))
         .unwrap();

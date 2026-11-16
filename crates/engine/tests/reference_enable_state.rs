@@ -1,17 +1,12 @@
 //! Initial enable state from a generated plugin, through converter export and
 //! the database worker used by cell streaming.
 
-use converter::esm::{
-    binary::parse_plugin_file,
-    exporter::{create_tables, export_to_db},
-    records::RawRecord,
-};
+use converter::esm::{EsmParser, binary::parse_plugin_file, records::RawRecord};
 use dummy_content::{
     esm::{self, Cell, Light, Plugin},
     layout,
 };
 use engine::world::database::{CellKey, CellPayload, DatabaseRequest, ReferenceRow, WorldDatabase};
-use rusqlite::Connection;
 use std::{
     collections::HashMap,
     fs,
@@ -131,6 +126,53 @@ fn with_enable_state(
     record
 }
 
+/// Preserve the generated source fields and group context when adding enable-state cases.
+fn write_source_fixture(path: &Path, records: &HashMap<u32, RawRecord>) {
+    fn group(label: u32, kind: i32, data: Vec<u8>) -> Vec<u8> {
+        let mut bytes = b"GRUP".to_vec();
+        bytes.extend((data.len() as u32 + 24).to_le_bytes());
+        bytes.extend(label.to_le_bytes());
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend([0; 8]);
+        bytes.extend(data);
+        bytes
+    }
+    let mut ordered: Vec<_> = records.values().collect();
+    ordered.sort_by_key(|record| (record.record_type != *b"TES4", record.form_id));
+    let original = fs::read(path).unwrap();
+    assert_eq!(&original[..4], b"TES4");
+    let header_size = u32::from_le_bytes(original[4..8].try_into().unwrap()) as usize;
+    let mut plugin = original[..24 + header_size].to_vec();
+    for record in ordered {
+        assert_ne!(
+            record.record_type, *b"TES4",
+            "parsed body records exclude the original header"
+        );
+        let mut fields = Vec::new();
+        for (tag, data) in &record.subrecords {
+            fields.extend(tag);
+            fields.extend(u16::try_from(data.len()).unwrap().to_le_bytes());
+            fields.extend(data);
+        }
+        let mut bytes = record.record_type.to_vec();
+        bytes.extend((fields.len() as u32).to_le_bytes());
+        bytes.extend(record.flags.to_le_bytes());
+        bytes.extend(record.form_id.to_le_bytes());
+        bytes.extend([0; 4]);
+        bytes.extend(44u16.to_le_bytes());
+        bytes.extend([0; 2]);
+        bytes.extend(fields);
+        if let Some(cell) = record.cell_form_id {
+            bytes = group(cell, 6, bytes);
+        }
+        if let Some(world) = record.worldspace_form_id {
+            bytes = group(world, 1, bytes);
+        }
+        plugin.extend(bytes);
+    }
+    fs::write(path, plugin).unwrap();
+}
+
 fn load_cell(database: &WorldDatabase, generation: u64, key: CellKey) -> CellPayload {
     database
         .request(DatabaseRequest::Load {
@@ -199,10 +241,8 @@ fn database_worker_resolves_initial_enable_state_across_exterior_cells() {
     }
 
     let database_path = directory.path().join("world.db");
-    let connection = Connection::open(&database_path).unwrap();
-    create_tables(&connection).unwrap();
-    export_to_db(&connection, &records).unwrap();
-    drop(connection);
+    write_source_fixture(&plugin_path, &records);
+    EsmParser::convert_form_key_plugins(&[plugin_path], &database_path).unwrap();
 
     let database = WorldDatabase::open(&database_path).unwrap();
     // Load the children first so their parents must be found outside the loaded

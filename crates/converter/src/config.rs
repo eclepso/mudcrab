@@ -787,6 +787,7 @@ mod tests {
         let output = directory.path().join("modern");
         let staging = directory.path().join("modern.staging-1-1");
         std::fs::create_dir_all(&staging).unwrap();
+        crate::cache::write_staging_generation(&staging).unwrap();
 
         let mut config = PipelineConfig::new(&data, &output);
         config.resume_staging = Some(staging.clone());
@@ -815,6 +816,7 @@ mod tests {
         let staging = directory.path().join("modern.staging-1-1");
         let data = staging.join("Data");
         std::fs::create_dir_all(&data).unwrap();
+        crate::cache::write_staging_generation(&staging).unwrap();
         std::fs::write(data.join("Skyrim.esm"), b"game data").unwrap();
 
         let mut config = PipelineConfig::new(&data, &output);

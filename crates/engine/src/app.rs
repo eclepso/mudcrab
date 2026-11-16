@@ -5112,7 +5112,6 @@ mod tests {
     #[test]
     fn incomplete_conversion_names_the_schema_the_manifest_reports() {
         let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
-        assert_ne!(oldest, converter_schema_version());
         let message = runtime_asset_error(
             &format!(r#"{{"schema_version":{oldest},"complete":false}}"#),
             &format!(

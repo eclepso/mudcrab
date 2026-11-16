@@ -39,8 +39,8 @@ pub fn rebuild_door_links(conn: &Connection) -> color_eyre::Result<usize> {
                 return Ok(false);
             };
             let mut arrival = [0f32; 6];
-            for (value, word) in arrival.iter_mut().zip(bytes[4..28].chunks_exact(4)) {
-                *value = f32::from_le_bytes(word.try_into()?);
+            for (value, word) in arrival.iter_mut().zip(bytes[4..28].as_chunks::<4>().0) {
+                *value = f32::from_le_bytes(*word);
             }
             ensure!(
                 arrival.iter().all(|value| value.is_finite()),

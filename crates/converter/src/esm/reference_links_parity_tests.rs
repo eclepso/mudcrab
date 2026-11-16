@@ -321,8 +321,27 @@ fn publish(
 ) -> (Connection, HashMap<u32, super::records::RawRecord>) {
     let paths: Vec<_> = plugins.iter().map(|name| root.join(name)).collect();
     let database = root.join(format!("{reader:?}.db"));
-    let records = EsmParser::convert_plugins_with_reader(&paths, &database, reader, root).unwrap();
-    (Connection::open(database).unwrap(), records)
+    let conversion = EsmParser::convert_plugins_with_reader_and_schemas(
+        &paths, &database, reader, root, "english", None,
+    )
+    .unwrap();
+    let connection = Connection::open(database).unwrap();
+    let records =
+        super::inhouse::test_runtime_records(&connection, conversion.native.as_ref().unwrap())
+            .unwrap();
+    shared::world_assets::install_runtime_identity_functions(&connection).unwrap();
+    (connection, records)
+}
+
+/// The three-plugin case allocates Mod=1, Other=2, Skyrim=3 in alphabetical order.
+fn stored(runtime: u32) -> i64 {
+    let owner = match runtime >> 24 {
+        0 => 3,
+        1 => 2,
+        2 => 1,
+        _ => panic!("unexpected fixture owner"),
+    };
+    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
 }
 
 fn get<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
@@ -342,10 +361,13 @@ fn both_record_readers_publish_the_same_reference_links() {
         let live_link: Option<i64> = get(
             &before_deletion,
             &format!(
-                "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id={CHEST} AND position=7"
+                "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id=stored_key({CHEST}) AND position=7"
             ),
         );
-        assert_eq!(live_link, Some(DELETED_REFERENCE.into()));
+        assert_eq!(
+            live_link,
+            Some(0x0000_0001_0000_0000 | i64::from(DELETED_REFERENCE))
+        );
     }
 
     let plugins = ["Skyrim.esm", "Other.esm", "Mod.esp"];
@@ -357,7 +379,7 @@ fn both_record_readers_publish_the_same_reference_links() {
         get(
             conn,
             &format!(
-                "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id={CHEST} AND position=7"
+                "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id=stored_key({CHEST}) AND position=7"
             ),
         )
     };
@@ -366,31 +388,33 @@ fn both_record_readers_publish_the_same_reference_links() {
     assert_eq!(rows(&legacy), rows(&inhouse));
 
     let conn = inhouse;
-    let destination: u32 = get(
+    let destination: i64 = get(
         &conn,
-        &format!("SELECT destination_ref_id FROM door_links WHERE ref_id={MOD_DOOR}"),
+        &format!("SELECT destination_ref_id FROM door_links WHERE ref_id=stored_key({MOD_DOOR})"),
     );
-    assert_eq!(destination, DESTINATION);
+    assert_eq!(destination, stored(DESTINATION));
     let arrival: f64 = get(
         &conn,
-        &format!("SELECT pos_x FROM door_links WHERE ref_id={MOD_DOOR}"),
+        &format!("SELECT pos_x FROM door_links WHERE ref_id=stored_key({MOD_DOOR})"),
     );
     assert_eq!(arrival, 1.0);
-    let linked: u32 = get(
-        &conn,
-        &format!("SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id={MOD_DOOR}"),
-    );
-    assert_eq!(linked, LEVER);
-    let parent: u32 = get(
+    let linked: i64 = get(
         &conn,
         &format!(
-            "SELECT parent_ref_id FROM reference_activate_parents WHERE reference_id={MOD_DOOR}"
+            "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id=stored_key({MOD_DOOR})"
         ),
     );
-    assert_eq!(parent, LEVER);
+    assert_eq!(linked, stored(LEVER));
+    let parent: i64 = get(
+        &conn,
+        &format!(
+            "SELECT parent_ref_id FROM reference_activate_parents WHERE reference_id=stored_key({MOD_DOOR})"
+        ),
+    );
+    assert_eq!(parent, stored(LEVER));
     let links: Vec<(i64, Option<i64>, Option<i64>)> = conn
         .prepare(&format!(
-            "SELECT position, keyword_id, linked_ref_id FROM reference_linked_refs WHERE reference_id={CHEST} ORDER BY position"
+            "SELECT position, keyword_id, linked_ref_id FROM reference_linked_refs WHERE reference_id=stored_key({CHEST}) ORDER BY position"
         ))
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -400,22 +424,22 @@ fn both_record_readers_publish_the_same_reference_links() {
     assert_eq!(
         links,
         vec![
-            (0, Some(KEYWORD.into()), Some(LEVER.into())),
-            (1, None, Some(TRAP.into())),
-            (2, Some(KEYWORD.into()), None),
-            (3, None, Some(0x14)),
+            (0, Some(stored(KEYWORD)), Some(stored(LEVER))),
+            (1, None, Some(stored(TRAP))),
+            (2, Some(stored(KEYWORD)), None),
+            (3, None, Some(stored(0x14))),
             (4, None, None),
-            (5, Some(ACTOR.into()), Some(LEVER.into())),
+            (5, Some(stored(ACTOR)), Some(stored(LEVER))),
             (6, None, None),
             (7, None, None),
             (8, None, None),
-            (9, None, Some(TRAP.into())),
+            (9, None, Some(stored(TRAP))),
         ],
         "positions remain stable for hardcoded, null, missing, deleted, and mistyped links"
     );
     let parents: Vec<(i64, Option<i64>, Option<f64>)> = conn
         .prepare(&format!(
-            "SELECT position, parent_ref_id, delay FROM reference_activate_parents WHERE reference_id={CHEST} ORDER BY position"
+            "SELECT position, parent_ref_id, delay FROM reference_activate_parents WHERE reference_id=stored_key({CHEST}) ORDER BY position"
         ))
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -425,9 +449,9 @@ fn both_record_readers_publish_the_same_reference_links() {
     assert_eq!(
         parents,
         vec![
-            (0, Some(LEVER.into()), Some(0.5)),
+            (0, Some(stored(LEVER)), Some(0.5)),
             (1, None, Some(1.0)),
-            (2, Some(0x14), Some(0.25)),
+            (2, Some(stored(0x14)), Some(0.25)),
             (3, None, Some(0.75)),
             (4, None, Some(1.25)),
             (5, None, Some(1.5)),
@@ -438,17 +462,17 @@ fn both_record_readers_publish_the_same_reference_links() {
     let detail = |id: u32, column: &str| -> Option<i64> {
         get(
             &conn,
-            &format!("SELECT {column} FROM reference_details WHERE reference_id={id}"),
+            &format!("SELECT {column} FROM reference_details WHERE reference_id=stored_key({id})"),
         )
     };
-    assert_eq!(detail(CHEST, "owner_id"), Some(FACTION.into()));
+    assert_eq!(detail(CHEST, "owner_id"), Some(stored(FACTION)));
     assert_eq!(detail(CHEST, "owner_rank"), Some(3));
     assert_eq!(detail(CHEST, "activate_parent_flags"), Some(1));
     assert_eq!(detail(CHEST, "lock_level"), Some(50));
-    assert_eq!(detail(CHEST, "lock_key_id"), Some(KEY.into()));
+    assert_eq!(detail(CHEST, "lock_key_id"), Some(stored(KEY)));
     assert_eq!(detail(CHEST, "lock_flags"), Some(4));
-    assert_eq!(detail(CHEST, "location_id"), Some(LOCATION.into()));
-    assert_eq!(detail(CHEST, "encounter_zone_id"), Some(ZONE.into()));
+    assert_eq!(detail(CHEST, "location_id"), Some(stored(LOCATION)));
+    assert_eq!(detail(CHEST, "encounter_zone_id"), Some(stored(ZONE)));
     assert_eq!(detail(CHEST, "map_marker"), Some(0));
     assert_eq!(detail(MARKER, "map_marker"), Some(1));
     assert_eq!(detail(MARKER, "map_marker_flags"), Some(3));
@@ -457,22 +481,22 @@ fn both_record_readers_publish_the_same_reference_links() {
     assert_eq!(detail(MOD_DOOR, "lock_level"), Some(255));
     assert_eq!(
         detail(MOD_DOOR, "lock_key_id"),
-        Some(MOD_KEY.into()),
+        Some(stored(MOD_KEY)),
         "the XLOC key is remapped through the mod's master list"
     );
     assert_eq!(
         detail(MOD_PLATE, "attached_ref_id"),
-        Some(MOD_DOOR.into()),
+        Some(stored(MOD_DOOR)),
         "XATR is remapped by both readers"
     );
     let forbidden_details: i64 = get(
         &conn,
         &format!(
-            "SELECT count(*) FROM reference_details WHERE reference_id IN ({PLATE_ACRE}, {PLATE_ACHR})"
+            "SELECT count(*) FROM reference_details WHERE reference_id IN (stored_key({PLATE_ACRE}), stored_key({PLATE_ACHR}))"
         ),
     );
     assert_eq!(forbidden_details, 0);
-    assert_eq!(detail(PLATE_VALID, "attached_ref_id"), Some(LEVER.into()));
+    assert_eq!(detail(PLATE_VALID, "attached_ref_id"), Some(stored(LEVER)));
 
     let subset_ids = [CHEST, KEYWORD, FACTION, KEY, LOCATION, ZONE, LEVER, TRAP];
     let subset: HashMap<_, _> = legacy_records
@@ -499,7 +523,9 @@ fn both_record_readers_publish_the_same_reference_links() {
     assert_eq!(subset_link, Some(LEVER.into()));
     let plain: i64 = get(
         &conn,
-        &format!("SELECT count(*) FROM reference_details WHERE reference_id IN ({LEVER}, {TRAP})"),
+        &format!(
+            "SELECT count(*) FROM reference_details WHERE reference_id IN (stored_key({LEVER}), stored_key({TRAP}))"
+        ),
     );
     assert_eq!(
         plain, 0,

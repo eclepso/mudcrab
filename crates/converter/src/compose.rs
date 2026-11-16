@@ -70,11 +70,14 @@ pub struct DefaultSkinTextureSet {
 ///
 /// The catalog stores each `NPC_`'s armature parts with the armature's race and skin texture set;
 /// the shared humanoid body is the one their `DefaultRace` armatures describe. Per slot, the set
-/// most parts use wins, then the lowest FormID. A database without the catalog columns, or
-/// without a catalog at all, yields no sets, and the composed body keeps the NIFs' textures.
+/// most parts use wins, then the original full/light owner and local-ID order. A current-generation database without
+/// the catalog columns or catalog yields no sets, and the composed body keeps NIF textures.
+/// Earlier world generations require re-conversion before their content is read.
 pub fn default_skin_texture_sets(database: &Path, sex: &str) -> Result<Vec<DefaultSkinTextureSet>> {
+    shared::world_assets::validate_world_database(database)?;
     let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .wrap_err_with(|| format!("open {}", database.display()))?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
     let has_columns: bool = connection.query_row(
         "SELECT count(*) = 2 FROM pragma_table_info('actor_model_parts') \
          WHERE name IN ('armature_race_id', 'skin_texture_set_id')",
@@ -89,6 +92,10 @@ pub fn default_skin_texture_sets(database: &Path, sex: &str) -> Result<Vec<Defau
     if !has_columns || !has_texture_sets {
         return Ok(Vec::new());
     }
+    let Some(skyrim) = identity.table().id("Skyrim.esm") else {
+        return Ok(Vec::new());
+    };
+    let default_race = shared::form_key::FormKey::new(skyrim, DEFAULT_RACE_FORM_ID)?;
     let mut statement = connection.prepare(
         "SELECT p.slot, min(p.model_path), p.skin_texture_set_id, count(*) AS uses \
          FROM actor_model_parts p JOIN actor_models m ON m.id = p.npc_id \
@@ -97,22 +104,38 @@ pub fn default_skin_texture_sets(database: &Path, sex: &str) -> Result<Vec<Defau
          ORDER BY p.slot, uses DESC, p.skin_texture_set_id",
     )?;
     let candidates = statement
-        .query_map(rusqlite::params![sex, DEFAULT_RACE_FORM_ID], |row| {
+        .query_map(rusqlite::params![sex, default_race.to_sql_i64()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u32>(2)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, u64>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut candidates = candidates
+        .into_iter()
+        .map(|(slot, model, id, uses)| {
+            let key = identity.required_key(id)?;
+            Ok((
+                slot,
+                model,
+                key,
+                std::cmp::Reverse(uses),
+                shared::cache_identity::owner_order(&identity, key),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    candidates.sort_by(|left, right| (&left.0, left.3, left.4).cmp(&(&right.0, right.3, right.4)));
     let mut sets = Vec::new();
     for kind in [BodyPartKind::Body, BodyPartKind::Hands, BodyPartKind::Feet] {
-        let Some((_, model_path, texture_set_id)) =
-            candidates.iter().find(|(slot, _, _)| slot == kind.slot())
+        let Some((_, model_path, key, _, _)) = candidates
+            .iter()
+            .find(|(slot, _, _, _, _)| slot == kind.slot())
         else {
             continue;
         };
-        let Some(textures) = read_texture_set(&connection, *texture_set_id)? else {
+        let Some(textures) = read_texture_set(&connection, *key)? else {
             continue;
         };
         sets.push(DefaultSkinTextureSet {
@@ -125,12 +148,15 @@ pub fn default_skin_texture_sets(database: &Path, sex: &str) -> Result<Vec<Defau
 }
 
 /// A `texture_sets` row in NIF slot order (see [`NifSlotTextureSet`]).
-fn read_texture_set(connection: &Connection, id: u32) -> Result<Option<NifSlotTextureSet>> {
+fn read_texture_set(
+    connection: &Connection,
+    id: shared::form_key::FormKey,
+) -> Result<Option<NifSlotTextureSet>> {
     let slots = connection
         .query_row(
             "SELECT diffuse_path, normal_path, glow_path, height_path, environment_path, \
              mask_path, detail_path, specular_path FROM texture_sets WHERE id = ?1",
-            [id],
+            [id.to_sql_i64()],
             |row| {
                 let mut slots: [Option<String>; 8] = Default::default();
                 for (index, slot) in slots.iter_mut().enumerate() {
@@ -140,7 +166,10 @@ fn read_texture_set(connection: &Connection, id: u32) -> Result<Option<NifSlotTe
             },
         )
         .optional()?;
-    Ok(slots.map(|slots| NifSlotTextureSet { form_id: id, slots }))
+    Ok(slots.map(|slots| NifSlotTextureSet {
+        form_id: id.to_packed(),
+        slots,
+    }))
 }
 
 /// The set whose armature uses `part`'s NIF in `kind`'s slot. A set authored for another mesh

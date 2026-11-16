@@ -1033,7 +1033,9 @@ impl AssetPipeline {
 
         let mut merged_terrain_records = None;
         let mut merged_terrain_offsets = std::collections::HashMap::new();
-        if !plugins.is_empty() {
+        // Asset-only conversions also publish an authenticated empty world. Their
+        // manifests and subsequent resume/repair checks use the same generation contract.
+        {
             send(
                 progress_tx,
                 ProgressStage::Database,
@@ -1165,7 +1167,7 @@ impl AssetPipeline {
                     warnings: conversion.warnings,
                     notices: conversion.notices,
                 };
-                let phases = conversion.phases;
+                let mut phases = conversion.phases;
                 let merged = conversion
                     .native
                     .ok_or_else(|| eyre!("native world generation missing"))?;
@@ -1183,9 +1185,7 @@ impl AssetPipeline {
                     database_validation_started.elapsed().as_millis(),
                 );
                 let terrain_caches_started = Instant::now();
-                if config.record_reader == crate::config::RecordReader::Inhouse {
-                    crate::esm::inhouse::write_database_profile(staging, &db_path, &phases)?;
-                }
+                let runtime_cache_started = Instant::now();
                 let (terrain_cells, cache_warnings) =
                     crate::esm::cell_cache::write_form_key_cell_cache(
                         &merged,
@@ -1194,7 +1194,9 @@ impl AssetPipeline {
                         false,
                     )?;
                 record_notes.warnings.extend(cache_warnings);
+                phases.insert("terrain_runtime_cache".into(), runtime_cache_started.elapsed().as_secs_f64());
                 if config.record_reader == crate::config::RecordReader::Inhouse {
+                    let preserved_cache_started = Instant::now();
                     let (_, cache_warnings) = crate::esm::cell_cache::write_form_key_cell_cache(
                         &merged,
                         &source_offsets,
@@ -1202,6 +1204,7 @@ impl AssetPipeline {
                         true,
                     )?;
                     record_notes.warnings.extend(cache_warnings);
+                    phases.insert("terrain_preserved_cache".into(), preserved_cache_started.elapsed().as_secs_f64());
                 }
                 let mut seen_notes = std::collections::HashSet::new();
                 record_notes
@@ -1212,6 +1215,7 @@ impl AssetPipeline {
                 report.warnings.extend(record_notes.warnings);
                 report.notices.extend(record_notes.notices);
                 if config.record_reader == crate::config::RecordReader::Inhouse {
+                    crate::esm::inhouse::write_database_profile(staging, &db_path, &phases)?;
                     crate::esm::inhouse::write_terrain_cache_profile(
                         staging,
                         terrain_cells,
@@ -1360,18 +1364,6 @@ impl AssetPipeline {
         let vfs_files: Vec<_> = source_paths.keys().cloned().collect();
         if config.mo2.is_some() {
             prune_removed_mo2_outputs(staging, &vfs_files)?;
-            if plugins.is_empty() {
-                for name in [
-                    "skyrim_world.db",
-                    "cell_cache.rkyv",
-                    "integration-report.json",
-                ] {
-                    let path = staging.join(name);
-                    if path.is_file() {
-                        fs::remove_file(path)?;
-                    }
-                }
-            }
         }
         // Canonical source texture keys, used to tell a failed publication from absent game data
         // and to detect a pruned texture whose source is back in the installed data.
@@ -11311,6 +11303,7 @@ mod tests {
         let entry = pack_with_foreign_capability(&data, &output).await;
         let staging = temp.path().join("modern.staging-resume");
         fs::create_dir_all(&staging).unwrap();
+        crate::cache::write_staging_generation(&staging).unwrap();
         fs::copy(output.join(FOREIGN_PAYLOAD), staging.join(FOREIGN_PAYLOAD)).unwrap();
         let mut config = cpu_lod_config(&data, &output);
         config.resume_staging = Some(staging);
@@ -11406,7 +11399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_does_not_publish_unverified_staged_meshes_for_any_manifest_schema() {
+    async fn resume_refuses_unproven_staged_meshes_for_legacy_manifest_schemas() {
         let manifests = std::iter::once(("absent".to_owned(), None)).chain(
             (14..=22).map(|schema| (
                 format!("schema-{schema}"),
@@ -11428,21 +11421,45 @@ mod tests {
             }
 
             let mut config = cpu_lod_config(&data, &output);
-            config.resume_staging = Some(staging);
-            let report = run_without_progress(config).await;
-
-            assert!(report.complete, "resume failed with {name} manifest");
+            config.resume_staging = Some(staging.clone());
+            let (tx, _rx) = mpsc::channel(64);
+            let error = AssetPipeline::run_async(config, tx).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("convert again"),
+                "{name}: {error:#}"
+            );
             assert!(
                 !output.join("meshes/stale.glb").exists(),
                 "stale mesh published with {name} manifest"
             );
             assert_eq!(
-                ConversionManifest::load(&output.join("conversion-manifest.json"))
-                    .unwrap()
-                    .schema_version,
-                crate::cache::CONVERTER_SCHEMA_VERSION
+                fs::read(staging.join("meshes/stale.glb")).unwrap(),
+                b"unverified mesh"
             );
         }
+    }
+
+    /// Current generation proof permits resume, but does not certify arbitrary staged assets.
+    #[tokio::test]
+    async fn current_resume_does_not_publish_unverified_staged_meshes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        let staging = temp.path().join("modern.staging-current");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&staging).unwrap();
+        crate::cache::write_staging_generation(&staging).unwrap();
+        fs::create_dir(staging.join("meshes")).unwrap();
+        fs::write(staging.join("meshes/stale.glb"), b"unverified mesh").unwrap();
+        let mut config = cpu_lod_config(&data, &output);
+        config.resume_staging = Some(staging);
+        let report = run_without_progress(config).await;
+        assert!(report.complete);
+        assert!(!output.join("meshes/stale.glb").exists());
+        assert_eq!(
+            published_manifest(&output).schema_version,
+            crate::cache::CONVERTER_SCHEMA_VERSION
+        );
     }
 
     #[tokio::test]
@@ -13476,6 +13493,18 @@ mod tests {
     /// Copies a published asset tree into a staging directory, so a run can
     /// resume from it.
     fn copy_tree(source: &Path, destination: &Path) {
+        // These fixtures simulate a stopped current-generation run, rather than upgrading
+        // retained old staging. Authenticate the source and stamp a fresh destination first.
+        ConversionManifest::load(&source.join("conversion-manifest.json"))
+            .unwrap()
+            .validate_world_generation(source)
+            .unwrap();
+        assert!(
+            !destination.exists(),
+            "resume fixture destination must be fresh"
+        );
+        fs::create_dir_all(destination).unwrap();
+        crate::cache::write_staging_generation(destination).unwrap();
         for entry in WalkDir::new(source) {
             let entry = entry.unwrap();
             let relative = entry.path().strip_prefix(source).unwrap();
@@ -13534,6 +13563,8 @@ mod tests {
         let output = directory.path().join("assets");
         let staging = directory.path().join("assets.staging-abandoned-packs");
         fs::create_dir_all(&data).unwrap();
+        fs::create_dir(&staging).unwrap();
+        crate::cache::write_staging_generation(&staging).unwrap();
         let archive = dummy_content::ba2::general(
             &[dummy_content::Entry::new(
                 "strings/review_english.strings",
@@ -13869,6 +13900,7 @@ mod tests {
         // resumed staging folder must leave every published file in place.
         let staging = temp.path().join("modern.staging-resume-links");
         fs::create_dir_all(&staging).unwrap();
+        crate::cache::write_staging_generation(&staging).unwrap();
         let mut config = cpu_lod_config(&data, &output);
         config.resume_staging = Some(staging.clone());
         let resumed = run_without_progress(config).await;

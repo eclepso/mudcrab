@@ -1183,8 +1183,8 @@ fn lighting_texture_slot(
 /// `TX05` environment (4), `TX02` environment mask (5), `TX06` multilayer (6), `TX07` specular (7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NifSlotTextureSet {
-    /// The `TXST` FormID, for diagnostics.
-    pub form_id: u32,
+    /// The native `TXST` FormKey, for diagnostics without runtime slot truncation.
+    pub form_id: u64,
     /// The path for each NIF slot; `None` or empty leaves the shape's own slot in place.
     pub slots: [Option<String>; 8],
 }

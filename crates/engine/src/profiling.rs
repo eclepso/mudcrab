@@ -2613,7 +2613,13 @@ mod tests {
             )
             .is_err()
         );
-        assert!(portable_worldspace(&EngineConfig::default()).is_err());
+        assert!(
+            portable_worldspace(&EngineConfig {
+                bound_identity: None,
+                ..EngineConfig::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
