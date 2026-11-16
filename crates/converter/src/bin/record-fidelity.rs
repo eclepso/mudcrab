@@ -127,6 +127,9 @@ fn audit_before_final_check(
         observed.canonical_records_without_source
     );
     before_final_check();
+    // Reject newly created/populated recovery state before a scope validator can reopen
+    // the database through ordinary read-only SQLite and attempt to inspect that state.
+    require_settled_database(&database)?;
     ensure!(
         bundle_scope == converter::esm::inhouse::validate_record_bundle_scope(&database, &conn)?,
         "record bundle scope changed during audit"
@@ -440,7 +443,7 @@ mod tests {
         assert_eq!(report["coverage"]["status"], "empty");
         assert_eq!(report["coverage"]["matched_records"], 0);
         let conn = Connection::open(path.join("skyrim_world.db")).unwrap();
-        conn.execute("INSERT INTO records VALUES(4294967297,'KYWD',X'')", [])
+        conn.execute("INSERT INTO records VALUES(16777217,'KYWD',X'')", [])
             .unwrap();
         drop(conn);
         let before = hash_file(&path.join("skyrim_world.db")).unwrap();

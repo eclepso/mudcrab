@@ -1044,9 +1044,13 @@ mod tests {
         assert_eq!(catalog.unresolved.len(), 1);
         assert!(
             report
-                .notices
+                .warnings
                 .iter()
                 .any(|notice| notice.contains("1 unresolved bodies"))
+        );
+        assert!(
+            report.notices.is_empty(),
+            "unresolved body warning must not be duplicated as a notice"
         );
         let error = convert(
             directory.path(),

@@ -342,7 +342,7 @@ fn incomplete(report: &PipelineReport, output: &Path, warning_count: usize) {
 
 /// Match a compatibility category without confusing it with a data-loss summary.
 fn compatibility_kind(_reader: RecordReader) -> &'static str {
-    "FormID occurrence(s) past the original master list resolved to self"
+    "supplier-self runtime compatibility"
 }
 
 /// Require one counted compatibility notice while retaining unrelated metadata advisories.
@@ -361,7 +361,12 @@ fn compatibility_notice(report: &PipelineReport, reader: RecordReader) {
     );
     let message = messages[0];
     assert!(message.starts_with("notice:"), "{message}");
-    assert!(message.contains("2 FormID occurrence(s)"), "{message}");
+    let count = if reader == RecordReader::Legacy { 2 } else { 1 };
+    assert!(
+        message.contains(&format!("compatibility for {count} headers")),
+        "{message}"
+    );
+    assert!(message.contains("original owners unresolved"), "{message}");
     assert!(message.contains("first:"), "{message}");
     assert!(message.contains("07000810"), "{message}");
 }
@@ -448,11 +453,11 @@ async fn legacy_malformed_frames_warn_once_and_publish_neighbors() {
     let localization = warning(
         &report,
         "broken.esm",
-        "legacy reader left 1 localized fields without text",
+        "inhouse adapter reported 2 local decode/lookup issues",
     );
     assert!(localization.contains("00000806"), "{localization}");
     assert!(
-        localization.contains("FULL ID 6515: unreadable strings table"),
+        localization.contains("NPC_ source 00000806 FULL missing localized ID 6515"),
         "{localization}"
     );
     incomplete(&report, &output, 2);
@@ -525,7 +530,22 @@ async fn inhouse_decoder_and_adapter_summaries_reach_report() {
     assert_eq!(diagnostics["decoder"]["broken.esm"]["skipped_records"], 2);
     assert_eq!(diagnostics["decoder"]["broken.esm"]["skipped_fields"], 1);
     assert_eq!(diagnostics["decoder"]["broken.esm"]["invalid_links"], 1);
-    assert_eq!(diagnostics["adapter"]["broken.esm"][0], 2);
+    assert_eq!(diagnostics["format_version"], 2);
+    let stored_warnings = diagnostics["warnings"].as_array().unwrap();
+    assert_eq!(
+        diagnostics["warnings"],
+        serde_json::to_value(&report.warnings).unwrap()
+    );
+    assert_eq!(
+        stored_warnings
+            .iter()
+            .filter(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("broken.esm: inhouse adapter reported 2 local decode/lookup issues"))
+            .count(),
+        1
+    );
     let decoder = warning(&report, "broken.esm", "in-house reader skipped");
     assert!(decoder.contains("2 records, 1 fields"), "{decoder}");
     assert!(!decoder.contains("links"), "{decoder}");
@@ -558,10 +578,7 @@ async fn missing_localized_text_marks_both_readers_incomplete_without_losing_nei
         let output = directory.path().join(name);
         let report = publish(&data, &output, reader).await;
         assert_eq!(record_ids(&output), [0x801, 0x806, 0x807]);
-        let expected = match reader {
-            RecordReader::Legacy => "FULL ID 17: unreadable strings table",
-            RecordReader::Inhouse => "missing localized ID 17",
-        };
+        let expected = "inhouse adapter reported 2 local decode/lookup issues (first: NPC_ source 00000806 FULL missing localized ID 17)";
         assert!(
             report
                 .warnings
@@ -741,11 +758,11 @@ fn legacy_cli_report_json_marks_published_warning_pack_incomplete() {
     let localization = warning(
         &report,
         "broken.esm",
-        "legacy reader left 1 localized fields without text",
+        "inhouse adapter reported 2 local decode/lookup issues",
     );
     assert!(localization.contains("00000806"), "{localization}");
     assert!(
-        localization.contains("FULL ID 6515: unreadable strings table"),
+        localization.contains("NPC_ source 00000806 FULL missing localized ID 6515"),
         "{localization}"
     );
     incomplete(&report, &output, 2);
@@ -983,7 +1000,7 @@ async fn severity_reuse_assets_cli_replays_compatibility_notices_and_exits_zero(
     }
 }
 
-/// Native ESL identities keep full locals; only the absent optional target is cleared.
+/// Native ESL identities keep full locals; only the absent past-master target is cleared.
 #[tokio::test]
 async fn severity_native_light_full_local_is_preserved_and_optional_clear_remains_warning() {
     let directory = tempfile::tempdir().unwrap();
@@ -1007,6 +1024,16 @@ async fn severity_native_light_full_local_is_preserved_and_optional_clear_remain
             ]
             .concat(),
         ),
+        record(
+            b"CELL",
+            0x831,
+            0,
+            &[
+                field(b"DATA", &[1, 0]),
+                field(b"XOWN", &0x0100_1900u32.to_le_bytes()),
+            ]
+            .concat(),
+        ),
     ]
     .concat();
     plugin(&data, "loss.esl", 0x201, &[], &body);
@@ -1014,7 +1041,7 @@ async fn severity_native_light_full_local_is_preserved_and_optional_clear_remain
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
     let owner = identity.table().id("loss.esl").unwrap();
-    let expected = [0x822, 0x830, 0x1821].map(|local| {
+    let expected = [0x822, 0x830, 0x831, 0x1821].map(|local| {
         shared::form_key::FormKey::new(owner, local)
             .unwrap()
             .to_sql_i64()
@@ -1032,7 +1059,7 @@ async fn severity_native_light_full_local_is_preserved_and_optional_clear_remain
     );
     assert_eq!(
         identity
-            .runtime_id_if_available(identity.required_key(expected[2]).unwrap())
+            .runtime_id_if_available(identity.required_key(expected[3]).unwrap())
             .unwrap(),
         None
     );
@@ -1043,6 +1070,44 @@ async fn severity_native_light_full_local_is_preserved_and_optional_clear_remain
     assert_eq!(
         common::native_fields(&db, 0xFE00_0830, b"XOWN"),
         [0x1900u32.to_le_bytes().to_vec()]
+    );
+    let context = shared::records::RecordContextReader::new(&db).unwrap();
+    let cell = context
+        .record(
+            context
+                .identity()
+                .runtime_key(0xFE00_0830)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let wide = cell.first_link(*b"XOWN", 0).unwrap().unwrap();
+    assert_eq!(
+        identity.table().named(wide).unwrap().to_string(),
+        "001900:loss.esl"
+    );
+    assert_eq!(identity.runtime_id_if_available(wide).unwrap(), None);
+    assert_eq!(
+        common::native_fields(&db, 0xFE00_0831, b"XOWN"),
+        [0x0100_1900u32.to_le_bytes().to_vec()]
+    );
+    let broken = context
+        .record(
+            context
+                .identity()
+                .runtime_key(0xFE00_0831)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        broken.first_link(*b"XOWN", 0).unwrap(),
+        None,
+        "the warning must describe a genuinely cleared native target, not merely an unavailable runtime handle"
+    );
+    assert_eq!(
+        common::runtime_fields(&db, 0xFE00_0831, b"XOWN"),
+        [0u32.to_le_bytes().to_vec()]
     );
     assert!(
         !report.notices.iter().any(|notice| {
@@ -1058,8 +1123,11 @@ async fn severity_native_light_full_local_is_preserved_and_optional_clear_remain
             .iter()
             .any(|line| line.contains("truncated"))
     );
-    let optional = warning(&report, "loss.esl", "invalid native links");
-    assert!(optional.contains("1 invalid native links"), "{optional}");
-    assert!(optional.contains("00001900"), "{optional}");
+    let optional = warning(&report, "loss.esl", "invalid optional FormID links");
+    assert!(
+        optional.contains("1 invalid optional FormID links"),
+        "{optional}"
+    );
+    assert!(optional.contains("01001900"), "{optional}");
     incomplete(&report, &output, 1);
 }

@@ -556,7 +556,14 @@ fn native_logical_dump(
                 source.load_order,
                 String::from_utf8(source.record_type.to_vec()).unwrap(),
                 source.flags,
-                converter::esm::extractors::serialize_subrecords(&source.subrecords)
+                source
+                    .subrecords
+                    .iter()
+                    .flat_map(|(tag, bytes)| native_field(
+                        tag.as_slice().try_into().unwrap(),
+                        bytes
+                    ))
+                    .collect::<Vec<_>>()
             )
         );
         normalized.insert(

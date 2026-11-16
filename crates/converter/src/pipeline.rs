@@ -6357,7 +6357,7 @@ fn validate_publication_package(backup: &Path) -> Result<()> {
     ensure!(
         (shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=CONVERTER_SCHEMA_VERSION)
             .contains(&manifest.schema_version),
-        "backup has an unsupported conversion manifest"
+        "backup has an unsupported conversion manifest; convert again from the original plugins"
     );
     ensure!(
         !manifest.entries.is_empty() || root.join("scripts/papyrus_runtime.luau").is_file(),
@@ -6615,7 +6615,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::esm::cell_cache::write_cell_cache;
 
     fn cpu_lod_config(data: impl Into<PathBuf>, output: impl Into<PathBuf>) -> PipelineConfig {
         let mut config = PipelineConfig::new(data, output);
@@ -7948,7 +7947,7 @@ mod tests {
         assert!(output.join("skyrim_world.db").is_file());
         assert!(!backup.exists());
 
-        // Supported schema-16/world-3 packs retain full-detail recovery.
+        // Owned old generations remain intact and require conversion from the source plugins.
         fs::remove_dir_all(output.join("lod")).unwrap();
         fs::remove_file(output.join("lod-manifest.json")).unwrap();
         let mut legacy = published_manifest(&output);
@@ -7967,19 +7966,44 @@ mod tests {
         fs::write(&integration_path, serde_json::to_vec(&integration).unwrap()).unwrap();
         fs::rename(&output, &backup).unwrap();
         seal_test_backup(&output, &backup);
-        recover_interrupted_publication(&output).unwrap();
-        assert_eq!(published_manifest(&output).schema_version, 16);
-        assert!(!output.join("lod-manifest.json").exists());
-        // Grass-only schema5 has no LOD tables, and must remain recoverable.
-        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let assert_old_backup_refused = || {
+            let paths = [
+                "conversion-manifest.json",
+                "skyrim_world.db",
+                "integration-report.json",
+            ];
+            let before = paths.map(|path| fs::read(backup.join(path)).unwrap());
+            let error = recover_interrupted_publication(&output).unwrap_err();
+            assert!(format!("{error:?}").contains("convert again"), "{error:?}");
+            assert!(!output.exists());
+            assert!(backup.is_dir());
+            for (path, expected) in paths.into_iter().zip(before) {
+                assert_eq!(
+                    fs::read(backup.join(path)).unwrap(),
+                    expected,
+                    "changed {path}"
+                );
+            }
+        };
+        assert_old_backup_refused();
+        assert_eq!(published_manifest(&backup).schema_version, 16);
+        assert!(!backup.join("lod-manifest.json").exists());
+        // Isolate the old world floor with a current producer and the grass-only layout.
+        legacy.schema_version = CONVERTER_SCHEMA_VERSION;
+        legacy
+            .save(&backup.join("conversion-manifest.json"))
+            .unwrap();
+        let database = Connection::open(backup.join("skyrim_world.db")).unwrap();
         database.execute_batch("UPDATE schema_info SET version=5; DROP TABLE lod_chunks; DROP TABLE lod_chunks_spatial; DROP TABLE lod_build;").unwrap();
         drop(database);
         integration["schema_version"] = serde_json::json!(5);
-        fs::write(&integration_path, serde_json::to_vec(&integration).unwrap()).unwrap();
-        fs::rename(&output, &backup).unwrap();
+        fs::write(
+            backup.join("integration-report.json"),
+            serde_json::to_vec(&integration).unwrap(),
+        )
+        .unwrap();
         seal_test_backup(&output, &backup);
-        recover_interrupted_publication(&output).unwrap();
-        assert!(output.join("skyrim_world.db").is_file());
+        assert_old_backup_refused();
     }
 
     /// An unchanged conversion at the current producer reuses every mesh and its manifest entry.
@@ -8065,6 +8089,32 @@ mod tests {
         }
     }
 
+    /// Use the same authenticated world/cache pair as the production terrain compiler.
+    fn native_lod_fixture(
+        plugins: &[PathBuf],
+        staging: &Path,
+    ) -> (shared::CellCache, shared::pack_identity::PackIdentity) {
+        let conversion = EsmParser::convert_plugins_with_records_report(
+            plugins,
+            &staging.join("skyrim_world.db"),
+        )
+        .unwrap();
+        let native = conversion.native.unwrap();
+        let identity = native.order.pack_identity().unwrap();
+        let path = staging.join("cell_cache.rkyv");
+        crate::esm::cell_cache::write_form_key_cell_cache(
+            &native,
+            &std::collections::HashMap::new(),
+            &path,
+            false,
+        )
+        .unwrap();
+        (
+            crate::esm::cell_cache::read_form_key_cell_cache(&path).unwrap(),
+            identity,
+        )
+    }
+
     #[tokio::test]
     async fn invalid_world_compiler_content_is_omitted_without_partial_publication() {
         let directory = tempfile::tempdir().unwrap();
@@ -8079,18 +8129,12 @@ mod tests {
         .unwrap();
         fs::create_dir_all(staging.join("vfs")).unwrap();
         overlay_loose_assets(&data, &staging.join("vfs"), &discover(&data).unwrap()).unwrap();
-        let plugins = vec![data.join("Skyrim.esm")];
-        let records =
-            EsmParser::convert_plugins_with_records(&plugins, &staging.join("skyrim_world.db"))
-                .unwrap();
-        write_cell_cache(&records, &staging.join("cell_cache.rkyv")).unwrap();
-        let bytes = fs::read(staging.join("cell_cache.rkyv")).unwrap();
-        let mut cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(&bytes).unwrap();
-        let mut good_cell = cache.cells[0].clone();
+        let mut plugins = vec![data.join("Skyrim.esm")];
+        let (mut cache, identity) = native_lod_fixture(&plugins, &staging);
         cache.cells[0].heights[0] = f32::NAN;
         fs::write(
             staging.join("cell_cache.rkyv"),
-            rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
+            shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
         )
         .unwrap();
         let mut config = cpu_lod_config(&data, directory.path().join("output"));
@@ -8130,28 +8174,55 @@ mod tests {
             0
         );
 
-        let old_cell_id = good_cell.cell_id;
-        good_cell.cell_id = 0x00ff0001;
-        conn.execute(
-            "INSERT INTO worldspaces(id,editor_id,flags) VALUES(2,'ValidWorld',0)",
-            [],
+        drop(conn);
+        // Add a genuinely authored neighboring world instead of inserting unauthenticated rows.
+        let valid_plugin = data.join("Valid.esm");
+        fs::write(
+            &valid_plugin,
+            dummy_content::esm::plugin(&dummy_content::esm::Plugin {
+                author: dummy_content::layout::GENERATED_AUTHOR,
+                worldspace: "ValidWorld",
+                cells: &[dummy_content::esm::Cell {
+                    grid_x: 0,
+                    grid_y: 0,
+                }],
+                model_path: dummy_content::layout::GENERATED_MODEL_PATH,
+                diffuse: dummy_content::layout::GENERATED_DIFFUSE_PATH,
+                normal_texture: dummy_content::layout::GENERATED_NORMAL_PATH,
+            })
+            .unwrap(),
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO cells(id,worldspace_id,grid_x,grid_y,flags) SELECT ?1,2,grid_x,grid_y,flags FROM cells WHERE id=?2",
-            rusqlite::params![good_cell.cell_id, old_cell_id],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO land(cell_id,heightmap,vtex,vclr,normals) SELECT ?1,heightmap,vtex,vclr,normals FROM land WHERE cell_id=?2",
-            rusqlite::params![good_cell.cell_id, old_cell_id],
-        ).unwrap();
-        cache.cells.push(good_cell);
+        plugins.push(valid_plugin);
+        let (mut cache, identity) = native_lod_fixture(&plugins, &staging);
+        let bad_owner = identity.table().id("Skyrim.esm").unwrap();
+        for cell in &mut cache.cells {
+            if shared::cache_identity::required(&identity, cell.cell_id)
+                .unwrap()
+                .plugin()
+                == bad_owner
+            {
+                cell.heights[0] = f32::NAN;
+            }
+        }
+        let conn = Connection::open(staging.join("skyrim_world.db")).unwrap();
+        let valid_world: i64 = conn
+            .query_row(
+                "SELECT id FROM worldspaces WHERE editor_id='ValidWorld'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         fs::write(
             staging.join("cell_cache.rkyv"),
-            rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
+            shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
         )
         .unwrap();
         config.lod_origins.insert("ValidWorld".into(), [0, 0]);
+        let hashes = plugins
+            .iter()
+            .map(|path| hash_file(path).unwrap())
+            .collect::<Vec<_>>();
         let mut mixed = PipelineReport::default();
         compile_lod_chunks(
             &config,
@@ -8174,8 +8245,8 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
-                "SELECT count(*) FROM lod_chunks WHERE worldspace_id != 2",
-                [],
+                "SELECT count(*) FROM lod_chunks WHERE worldspace_id != ?1",
+                [valid_world],
                 |row| row.get::<_, u64>(0)
             )
             .unwrap(),
@@ -8223,14 +8294,7 @@ mod tests {
         fs::create_dir_all(staging.join("vfs")).unwrap();
         overlay_loose_assets(&data, &staging.join("vfs"), &discover(&data).unwrap()).unwrap();
         let plugins = vec![data.join("Skyrim.esm")];
-        let records =
-            EsmParser::convert_plugins_with_records(&plugins, &staging.join("skyrim_world.db"))
-                .unwrap();
-        write_cell_cache(&records, &staging.join("cell_cache.rkyv")).unwrap();
-        let mut cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(
-            &fs::read(staging.join("cell_cache.rkyv")).unwrap(),
-        )
-        .unwrap();
+        let (mut cache, identity) = native_lod_fixture(&plugins, &staging);
         let last = cache
             .cells
             .iter_mut()
@@ -8248,7 +8312,7 @@ mod tests {
         });
         fs::write(
             staging.join("cell_cache.rkyv"),
-            rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
+            shared::cache_identity::encode_cell_cache(&identity, &cache, false).unwrap(),
         )
         .unwrap();
         let mut config = cpu_lod_config(&data, directory.path().join("output"));
@@ -8292,7 +8356,10 @@ mod tests {
                 0
             );
         }
-        assert!(!staging.join("lod/00000001").exists());
+        let world: i64 = database
+            .query_row("SELECT id FROM worldspaces", [], |row| row.get(0))
+            .unwrap();
+        assert!(!staging.join(format!("lod/{world:08x}")).exists());
         assert!(!staging.join("lod-manifest.json").exists());
         assert!(!report.artifacts.iter().any(|path| path.starts_with("lod")));
     }
@@ -13444,13 +13511,15 @@ mod tests {
         .unwrap();
         assert_eq!(profile["cache_hit"], true);
         assert_eq!(profile["timing_source"], "cache_restore");
-        assert!(profile["producer_elapsed_seconds"]["total_reader"].is_number());
-        assert!(
-            !profile["elapsed_seconds"]
-                .as_object()
-                .unwrap()
-                .contains_key("total_reader")
-        );
+        for phase in ["native_read", "native_form_key_world"] {
+            assert!(profile["producer_elapsed_seconds"][phase].is_number());
+            assert!(
+                !profile["elapsed_seconds"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(phase)
+            );
+        }
         let receipt = config
             .ingestion_cache_dir()
             .join(".database-cache")

@@ -219,6 +219,7 @@ async fn publish_configured(
         .concat(),
     );
     let mut fields = [
+        sub(b"VNML", &[1, 2, 126].repeat(33 * 33)),
         sub(b"VHGT", &heights(3.5)),
         assignment(b"BTXT", 0x855, 0),
         sub(
@@ -237,7 +238,6 @@ async fn publish_configured(
         fields.extend(assignment(b"ATXT", 0x999, 4));
         fields.extend(weight(17, 0.5));
     }
-    fields.extend(sub(b"VNML", &[1, 2, 126].repeat(33 * 33)));
     let mut selected_cell = Vec::new();
     if cache_findings {
         // Different LAND identities share a cell. Native source order keeps the following

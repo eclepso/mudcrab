@@ -379,10 +379,20 @@ fn movement_annotation_preserves_grass(version: u32) {
             .concat(),
         ));
     }
-    let source = plugin(dir.path(), "Movement.esm", &[], 0, records);
+    let source = plugin(dir.path(), "Skyrim.esm", &[], 0, records);
     let database = dir.path().join("world.db");
     EsmParser::convert_plugins(&[source], &database).unwrap();
     let conn = Connection::open(&database).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    assert_eq!(
+        identity
+            .table()
+            .named(identity.runtime_key(0x3580D).unwrap().unwrap())
+            .unwrap()
+            .to_string(),
+        "03580D:Skyrim.esm",
+        "the builtin MOVT validator is qualified by its original named owner"
+    );
     let before_links = associations(&conn);
     let before_grass: (u32, Vec<u8>) = conn
         .query_row(

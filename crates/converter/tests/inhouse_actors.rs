@@ -973,14 +973,18 @@ fn typed_actor_export_uses_strings_and_dlstrings_without_conflating_ids() {
     )
     .unwrap();
     let dump = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
-    let record: serde_json::Value = serde_json::from_str(dump.lines().next().unwrap()).unwrap();
+    let record: serde_json::Value = dump
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["form_id"] == "003500:Localized.esp")
+        .unwrap();
     let localization = record["localization"].as_object().unwrap();
     let lookups: Vec<_> = localization
         .values()
         .map(|value| {
             (
-                value["bank"].as_str().unwrap(),
-                value["text"].as_str().unwrap(),
+                value["string_table"].as_str().unwrap(),
+                value["resolved_text"].as_str().unwrap(),
             )
         })
         .collect();

@@ -75,8 +75,24 @@ fn unresolved_marker_text_preserves_identical_reference_and_record_archives() {
         0,
         &subrecord(b"EDID", b"ReferenceLocalizationBase\0"),
     ));
-    plugin.extend(marker(0x0100_3F11, 17));
-    plugin.extend(marker(0x0100_3F12, 100));
+    plugin.extend(record(
+        b"CELL",
+        0x0100_3F13,
+        0,
+        &subrecord(b"DATA", &[1, 0]),
+    ));
+    let markers = [marker(0x0100_3F11, 17), marker(0x0100_3F12, 100)].concat();
+    plugin.extend(
+        [
+            b"GRUP".as_slice(),
+            &(markers.len() as u32 + 24).to_le_bytes(),
+            &0x0100_3F13u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &[0; 8],
+            &markers,
+        ]
+        .concat(),
+    );
     fs::write(data.join("ReferenceLocalization.esp"), plugin).unwrap();
     let strings = data.join("Strings");
     fs::create_dir(&strings).unwrap();

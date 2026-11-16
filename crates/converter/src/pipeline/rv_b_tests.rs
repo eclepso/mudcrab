@@ -258,9 +258,11 @@ async fn reader_switch_reuses_archives_and_assets_but_rebuilds_database_and_cell
         .unwrap();
     assert_eq!(cells, 9);
     let published: Vec<u8> = database
-        .query_row("SELECT data FROM records WHERE form_id=24576", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT data FROM records WHERE form_id=?1",
+            [0x0100_6000i64],
+            |row| row.get(0),
+        )
         .unwrap();
     let recovered =
         rkyv::from_bytes::<crate::esm::types::ArchivedRecordData, rkyv::rancor::Error>(&published)
@@ -384,7 +386,7 @@ async fn known_legacy_full_hashes_reuse_dds_and_pex_but_regenerate_nif_without_k
         let neighbor: String = database
             .query_row(
                 "SELECT editor_id FROM statics WHERE id=?1",
-                [0x0000_0001_0000_6001i64],
+                [0x0000_0000_0100_6001i64],
                 |row| row.get(0),
             )
             .unwrap();
@@ -610,7 +612,7 @@ async fn texture_role_change_after_metadata_drift_rebuilds_only_affected_dds() {
     let height: String = database
         .query_row(
             "SELECT height_path FROM texture_sets WHERE id=?1",
-            [0x0000_0001_0000_5000i64],
+            [0x0000_0000_0100_5000i64],
             |row| row.get(0),
         )
         .unwrap();

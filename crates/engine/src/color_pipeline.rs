@@ -1196,7 +1196,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut connection =
             rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB); CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT,priority INTEGER); INSERT INTO plugins VALUES(1,'Winner.esm',7); CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);").unwrap();
+        connection.execute_batch("CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,cell_id INTEGER,worldspace_id INTEGER,load_order INTEGER,data BLOB); CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT,priority INTEGER); INSERT INTO plugins VALUES(1,'Winning.esm',7); CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);").unwrap();
 
         let identity = crate::world::test_support::install(&mut connection);
         let write_record = |brightness: f32| {
@@ -1272,7 +1272,7 @@ mod tests {
             [0.31, 0.47, 0.59]
         );
         let evidence = changed.evidence(SceneGradeMode::RecordSrgb, SceneVisualPreset::CoolGray);
-        assert_eq!(evidence["loaded_record"]["winner_plugin"], "Winner.esm");
+        assert_eq!(evidence["loaded_record"]["winner_plugin"], "Winning.esm");
         assert_eq!(evidence["loaded_record"]["hdr"]["sky_scale"], 18.0);
         assert_eq!(evidence["hnam_applied"], false);
         assert_eq!(evidence["approved_override"]["applied_to_grade"], false);

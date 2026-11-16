@@ -280,7 +280,9 @@ mod tests {
     }
 
     fn connection(directory: &tempfile::TempDir) -> Connection {
-        Connection::open(directory.path().join("skyrim_world.db")).unwrap()
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        shared::world_assets::install_runtime_identity_functions(&connection).unwrap();
+        connection
     }
 
     #[test]

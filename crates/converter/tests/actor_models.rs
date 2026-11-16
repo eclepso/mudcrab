@@ -1444,8 +1444,22 @@ fn an_older_actor_models_table_gains_the_skin_tone_and_weight_columns() {
         .unwrap();
     converter::esm::exporter::create_tables(&connection).unwrap();
     converter::esm::exporter::create_tables(&connection).unwrap();
-    assert_eq!(stored_skin_tone(&connection, 0x100), [None; 3]);
-    assert_eq!(stored_weight(&connection, 0x100), None);
+    let tone: [Option<f64>; 3] = connection
+        .query_row(
+            "SELECT skin_tone_r,skin_tone_g,skin_tone_b FROM actor_models WHERE id=0x100",
+            [],
+            |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]),
+        )
+        .unwrap();
+    let weight: Option<f64> = connection
+        .query_row(
+            "SELECT weight FROM actor_models WHERE id=0x100",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tone, [None; 3]);
+    assert_eq!(weight, None);
 }
 
 const FEMALE_HANDS: &str = "actors\\character\\character assets\\femalehands_1.nif";

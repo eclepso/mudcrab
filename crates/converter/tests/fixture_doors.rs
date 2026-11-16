@@ -81,7 +81,11 @@ fn write_door_override(directory: &Path, source: &RawRecord) -> std::path::PathB
         field(b"DATA", &[0; 8]),
     ]
     .concat();
-    let payload = converter::esm::extractors::serialize_subrecords(&source.subrecords);
+    let payload = source
+        .subrecords
+        .iter()
+        .flat_map(|(tag, bytes)| field(tag.as_slice().try_into().unwrap(), bytes))
+        .collect::<Vec<_>>();
     let native = record(&source.record_type, source.form_id, source.flags, &payload);
     let cell = source
         .cell_form_id

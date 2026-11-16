@@ -261,14 +261,30 @@ mod tests {
                 )
                 .unwrap();
                 let conn = Connection::open(database).unwrap();
+                let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
                 for base in [0x800, expected_base] {
-                    let row: (u32, String) = conn.query_row(
-                        "SELECT texture_set_id,disposition FROM base_texture_swaps WHERE base_id=?1", [base],
+                    let base_key = shared::form_key::FormKey::new(
+                        shared::form_key::PluginId::new(if base == 0x800 { 1 } else { 3 }).unwrap(),
+                        base & 0xffffff,
+                    )
+                    .unwrap();
+                    let texture_key = shared::form_key::FormKey::new(
+                        shared::form_key::PluginId::new(3).unwrap(),
+                        0x801,
+                    )
+                    .unwrap();
+                    let row: (i64, String) = conn.query_row(
+                        "SELECT texture_set_id,disposition FROM base_texture_swaps WHERE base_id=?1", [base_key.to_sql_i64()],
                         |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
                     assert_eq!(
                         row,
-                        (expected_texture, "texture_set".into()),
+                        (texture_key.to_sql_i64(), "texture_set".into()),
                         "{reader:?}, light={light}"
+                    );
+                    assert_eq!(
+                        identity.runtime_id(texture_key).unwrap(),
+                        expected_texture,
+                        "checked full/light runtime view"
                     );
                 }
                 let invalid: u32 = conn.query_row("SELECT count(*) FROM base_texture_swaps WHERE disposition='missing_texture_set'", [], |row| row.get(0)).unwrap();

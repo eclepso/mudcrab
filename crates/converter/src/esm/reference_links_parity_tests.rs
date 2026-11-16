@@ -341,7 +341,7 @@ fn stored(runtime: u32) -> i64 {
         2 => 1,
         _ => panic!("unexpected fixture owner"),
     };
-    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
+    (i64::from(owner) << 24) | i64::from(runtime & 0x00ff_ffff)
 }
 
 fn get<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
@@ -366,7 +366,7 @@ fn both_record_readers_publish_the_same_reference_links() {
         );
         assert_eq!(
             live_link,
-            Some(0x0000_0001_0000_0000 | i64::from(DELETED_REFERENCE))
+            Some(0x0000_0000_0100_0000 | i64::from(DELETED_REFERENCE))
         );
     }
 

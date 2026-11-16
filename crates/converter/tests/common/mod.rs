@@ -75,6 +75,25 @@ pub fn runtime_record(
     connection: &rusqlite::Connection,
     runtime: u32,
 ) -> shared::records::ArchivedRecordData {
+    interpreted_record(connection, runtime, false)
+}
+
+/// Interpret certified semantic sites while retaining every canonical opaque occurrence.
+/// Full-record byte oracles use this view together with the exact native payload assertion;
+/// runtime projections instead use `runtime_record`, which omits unusable occurrences.
+#[allow(dead_code)]
+pub fn canonical_record(
+    connection: &rusqlite::Connection,
+    runtime: u32,
+) -> shared::records::ArchivedRecordData {
+    interpreted_record(connection, runtime, true)
+}
+
+fn interpreted_record(
+    connection: &rusqlite::Connection,
+    runtime: u32,
+    retain_opaque: bool,
+) -> shared::records::ArchivedRecordData {
     let reader = shared::records::RecordContextReader::new(connection).unwrap();
     let key = reader.identity().runtime_key(runtime).unwrap().unwrap();
     let record = reader.record(key).unwrap();
@@ -94,6 +113,9 @@ pub fn runtime_record(
     let mut fields = Vec::new();
     for (ordinal, field) in record.subrecords.iter().enumerate() {
         if !record.is_runtime_usable(ordinal) {
+            if retain_opaque {
+                fields.push(field.clone());
+            }
             continue;
         }
         let text: Option<Option<String>> = connection
@@ -120,14 +142,18 @@ pub fn runtime_record(
             // The inherited byte oracle represents an unavailable runtime string by
             // its empty wire leaf; SQL NULL and the original native ID are asserted
             // independently. Omission is controlled only by runtime_usable above.
-            bytes = text.unwrap_or_default().into_bytes();
+            bytes = text
+                .unwrap_or_default()
+                .trim_end_matches('\0')
+                .as_bytes()
+                .to_vec();
             bytes.push(0);
         }
         for offset in offsets {
             let runtime = record
                 .resolve_at(ordinal, offset)
                 .unwrap()
-                .map(|target| reader.identity().runtime_id(target).unwrap())
+                .and_then(|target| reader.identity().runtime_id_if_available(target).unwrap())
                 .unwrap_or(0);
             bytes[offset..offset + 4].copy_from_slice(&runtime.to_le_bytes());
         }

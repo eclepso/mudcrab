@@ -63,7 +63,7 @@ fn ids(conn: &Connection) -> Vec<u32> {
 }
 
 #[test]
-/// Absent past-master and wide light memberships clear while rank/padding survive.
+/// Absent past-master links clear; wide native memberships preserve identity without a runtime alias.
 fn npc_faction_structures_publish_resolved_ids_and_preserve_rank_padding() {
     let dir = tempfile::tempdir().unwrap();
     let membership = |id: u32, rank: u8| [id.to_le_bytes(), [rank, 0xA1, 0xB2, 0xC3]].concat();
@@ -104,6 +104,41 @@ fn npc_faction_structures_publish_resolved_ids_and_preserve_rank_padding() {
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&paths, &db).unwrap();
     let conn = Connection::open(db).unwrap();
+    let context = shared::records::RecordContextReader::new(&conn).unwrap();
+    let npc = context
+        .record(
+            context
+                .identity()
+                .runtime_key(0x0200_0800)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        npc.subrecords
+            .iter()
+            .filter(|field| field.tag == *b"SNAM")
+            .map(|field| field.data.clone())
+            .collect::<Vec<_>>(),
+        [
+            membership(0x0000_0801, 0xFF),
+            membership(0x0100_0802, 4),
+            membership(0x0200_0803, 7),
+            membership(0x0300_0804, 8),
+            membership(0x0000_1805, 9),
+            vec![0xAB; 7],
+        ]
+    );
+    assert_eq!(npc.resolve_at(3, 0).unwrap(), None);
+    let wide = npc.resolve_at(4, 0).unwrap().unwrap();
+    assert_eq!(
+        context.identity().table().named(wide).unwrap().to_string(),
+        "001805:Light.esl"
+    );
+    assert_eq!(
+        context.identity().runtime_id_if_available(wide).unwrap(),
+        None
+    );
     assert_eq!(
         fields(&conn, 0x0200_0800, b"SNAM"),
         [
@@ -379,7 +414,7 @@ fn unusable_movement_override_does_not_claim_a_deletion_alias() {
     };
     let base = plugin(
         dir.path(),
-        "Base.esm",
+        "Skyrim.esm",
         &[],
         1,
         [setting(0x800, 50.0), movement(&speeds)].concat(),
@@ -389,7 +424,7 @@ fn unusable_movement_override_does_not_claim_a_deletion_alias() {
     let patch = plugin(
         dir.path(),
         "Patch.esp",
-        &["Base.esm"],
+        &["Skyrim.esm"],
         0,
         [
             setting(0x0100_0801, f32::NAN),
@@ -402,6 +437,16 @@ fn unusable_movement_override_does_not_claim_a_deletion_alias() {
     let db = dir.path().join("world.db");
     EsmParser::convert_plugins(&[base, patch], &db).unwrap();
     let conn = Connection::open(db).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    assert_eq!(
+        identity
+            .table()
+            .named(identity.runtime_key(0x3580D).unwrap().unwrap())
+            .unwrap()
+            .to_string(),
+        "03580D:Skyrim.esm",
+        "the builtin MOVT validator is qualified by its original named owner"
+    );
     assert_eq!(ids(&conn), [0x800, 0x0003_580D, 0x0100_0802]);
     let value: f32 = conn
         .query_row(

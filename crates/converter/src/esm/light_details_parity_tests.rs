@@ -23,7 +23,7 @@ fn stored(runtime: u32) -> i64 {
         2 => 1,
         _ => panic!("unexpected fixture runtime owner"),
     };
-    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
+    (i64::from(owner) << 24) | i64::from(runtime & 0x00ff_ffff)
 }
 
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {

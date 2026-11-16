@@ -190,7 +190,7 @@ fn stored(runtime: u32) -> i64 {
         1 => 2,
         _ => panic!("unexpected fixture owner"),
     };
-    (i64::from(owner) << 32) | i64::from(runtime & 0x00ff_ffff)
+    (i64::from(owner) << 24) | i64::from(runtime & 0x00ff_ffff)
 }
 
 fn publish(

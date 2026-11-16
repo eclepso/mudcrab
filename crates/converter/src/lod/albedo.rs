@@ -1571,6 +1571,7 @@ mod tests {
     fn lod_configured_origin_compiles_zero_overlay_all_tiers() {
         let mut source = zero_overlay_source();
         source.cell_id = 0xabc;
+        source.cell_name = "000ABC:Fixture.esm".into();
         source.grid_x = -95;
         source.grid_y = -95;
         let sources = [source];
@@ -1612,9 +1613,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter_map(|node| node["extras"]["cell_id"].as_u64())
+                .filter_map(|node| node["extras"]["cell_id"].as_str())
                 .collect();
-            assert_eq!(cell_ids, vec![0xabc]);
+            assert_eq!(cell_ids, vec!["000ABC:Fixture.esm"]);
         }
         let after: Vec<_> = sources[0]
             .layers

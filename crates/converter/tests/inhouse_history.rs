@@ -128,6 +128,36 @@ async fn history_replay_marks_differences_and_changed_plugin_without_losing_neig
     let report: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
     assert_eq!(report["versions"][1]["decode_status"], "undecodable");
     assert_eq!(report["versions"][3]["decode_status"], "decoded");
+    let named = std::process::Command::new(env!("CARGO_BIN_EXE_inhouse-records"))
+        .arg("history")
+        .arg(&output)
+        .arg("001800:Skyrim.esm")
+        .arg("--json")
+        .arg("--data")
+        .arg(&data)
+        .output()
+        .unwrap();
+    assert!(
+        named.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+    let named: serde_json::Value = serde_json::from_slice(&named.stdout).unwrap();
+    assert_eq!(named["form_id"], "001800:Skyrim.esm");
+    assert_eq!(named["versions"].as_array().unwrap().len(), 4);
+    for (native, runtime) in named["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(report["versions"].as_array().unwrap())
+    {
+        assert_eq!(native["decode_status"], runtime["decode_status"]);
+        assert_eq!(native["source_form_id"], runtime["source_form_id"]);
+        assert_eq!(native["winner"], runtime["winner"]);
+    }
+    assert!(named["fields"].as_array().unwrap().iter().any(|field| {
+        field["field"].as_str().unwrap().starts_with("EDID:") && field["different"] == true
+    }));
 }
 
 /// Original metadata rejection is a clean command diagnostic, independent of runtime tables.

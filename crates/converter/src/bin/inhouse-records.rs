@@ -202,30 +202,48 @@ fn source_history(args: &[std::ffi::OsString], physical: bool) -> Result<()> {
 fn history(args: &[std::ffi::OsString]) -> Result<()> {
     ensure!(
         args.len() >= 2,
-        "usage: inhouse-records history <pack> <000123:Owner.esm> [--json]"
+        "usage: inhouse-records history <pack> <000123:Owner.esm|checked runtime hex> [--json] [--data DIR]"
     );
     let pack = PathBuf::from(&args[0]);
-    let id = args[1]
-        .to_string_lossy()
-        .parse::<shared::form_key::NamedFormKey>()?;
-    let json = args[2..].iter().any(|arg| arg == "--json");
-    ensure!(
-        args[2..].iter().all(|arg| arg == "--json"),
-        "native history accepts --json; use history-source for original payload access"
-    );
-    let database = if pack.is_file() {
-        pack
-    } else {
-        pack.join("skyrim_world.db")
-    };
-    let report = converter::records::history::read_native_chain(&database, &id)?;
+    let mut json = false;
+    let mut data = None;
+    let mut index = 2;
+    while index < args.len() {
+        if args[index] == "--json" {
+            ensure!(!json, "duplicate history --json option");
+            json = true;
+            index += 1;
+        } else {
+            ensure!(args[index] == "--data", "unknown history option");
+            ensure!(data.is_none(), "duplicate history --data option");
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| color_eyre::eyre::eyre!("history --data requires a directory"))?;
+            ensure!(
+                !value.is_empty() && value != "--json" && value != "--data",
+                "history --data requires a directory"
+            );
+            data = Some(PathBuf::from(value));
+            index += 2;
+        }
+    }
+    let input = args[1].to_string_lossy();
+    if !input.contains(':') {
+        let id = u32::from_str_radix(input.trim_start_matches("0x").trim_start_matches("0X"), 16)?;
+        // This is a transient gameplay handle checked against the current authenticated pack.
+        // Persisted integers and named owners never pass through an old-world adapter.
+        let report = converter::records::history::read_history(&pack, data.as_deref(), id)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", converter::records::history::display(&report));
+        }
+        return Ok(());
+    }
+    let id = input.parse::<shared::form_key::NamedFormKey>()?;
+    let report = converter::records::history::read_named_history(&pack, data.as_deref(), &id)?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"schema_version":2,"history":report})
-            )?
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
             "Record {} ({} versions{})",
@@ -235,14 +253,25 @@ fn history(args: &[std::ffi::OsString]) -> Result<()> {
         );
         for version in report.versions {
             println!(
-                "{}: {} source_word={:08X} offset={} {}{}{}",
-                version.chain_position,
-                version.plugin,
-                version.source_form_id,
-                version.source_record_offset,
-                version.status,
-                if version.deleted { " deleted" } else { "" },
-                if version.winner { " winner" } else { "" }
+                "{}: {} source_word={} offset={} {} {}{}",
+                version["chain_position"],
+                version["plugin"],
+                version["source_form_id"],
+                version["source_record_offset"],
+                version["status"],
+                version["decode_status"],
+                version["decode_reason"]
+                    .as_str()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+        for field in report.fields {
+            println!(
+                "{}{} | {}",
+                if field.different { "* " } else { "  " },
+                field.field,
+                serde_json::to_string(&field.values)?
             );
         }
     }

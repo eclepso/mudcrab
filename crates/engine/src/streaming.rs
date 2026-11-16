@@ -10617,8 +10617,11 @@ mod tests {
             0
         );
         let directory = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let identity = crate::world::test_support::install_projection(&connection);
         let config = EngineConfig {
             profile_output_dir: Some(directory.path().to_owned()),
+            bound_identity: Some(std::sync::Arc::new(identity)),
             ..default()
         };
         let profiler = app.world().resource::<ProfilingState>();

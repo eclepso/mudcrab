@@ -549,6 +549,7 @@ fn remap(
         if key.is_some()
             && (value >> 24) as usize > supplier.facts.masters.len()
             && diagnostics.event_context.field.as_deref() == Some("record_header")
+            && diagnostics.event_context.record_type != Some(*b"GMST")
         {
             diagnostics.note("compatibility", || {
                 format!("native source header {value:08X} uses supplier-self ownership")
@@ -731,8 +732,37 @@ pub(crate) fn decode_with_identity(
     diagnostics: &mut PluginDiagnostics,
     identity: &mut impl FnMut(&str),
 ) -> Result<DecodedRecord, String> {
-    let decoded =
-        decode_with_identity_inner(scanned, schema, prepared, context, diagnostics, identity);
+    decode_with_identity_omitting(
+        scanned,
+        schema,
+        prepared,
+        context,
+        diagnostics,
+        identity,
+        &[],
+    )
+}
+
+/// Recover a first definition by rejecting only its original deferred root occurrences.
+/// Original framing stays intact, so grammar guards and captured source sites remain authoritative.
+pub(super) fn decode_with_identity_omitting(
+    scanned: ScannedRecord,
+    schema: &Schema,
+    prepared: &PreparedSchemas,
+    context: &Context<'_>,
+    diagnostics: &mut PluginDiagnostics,
+    identity: &mut impl FnMut(&str),
+    omitted: &[usize],
+) -> Result<DecodedRecord, String> {
+    let decoded = decode_with_identity_inner(
+        scanned,
+        schema,
+        prepared,
+        context,
+        diagnostics,
+        identity,
+        omitted,
+    );
     diagnostics.deferred_contexts.clear();
     diagnostics.deferred_link_events = None;
     decoded
@@ -746,6 +776,7 @@ fn decode_with_identity_inner(
     context: &Context<'_>,
     diagnostics: &mut PluginDiagnostics,
     identity: &mut impl FnMut(&str),
+    omitted: &[usize],
 ) -> Result<DecodedRecord, String> {
     let initial_counts = DiagnosticCounts::read(diagnostics);
     diagnostics.deferred_contexts.clear();
@@ -855,6 +886,7 @@ fn decode_with_identity_inner(
     let framed = subrecords(&scanned.payload, diagnostics, scanned.source_form_id);
     let link_kind = |source_id| context.link_kind(source_id);
     for (position, &(signature, bytes)) in framed.fields.iter().enumerate() {
+        let omit_deferred = omitted.contains(&position);
         if let Some(native) = context.native {
             native.start_field(position, signature, bytes);
         }
@@ -931,7 +963,12 @@ fn decode_with_identity_inner(
                 diagnostics.deferred_link_events = (context.winning_types.is_none()
                     && schema_can_defer(&common, schema))
                 .then(Vec::new);
-                match value(&common, bytes, schema, context, diagnostics, &selection, 0) {
+                let decoded = if omit_deferred {
+                    Err("omitted after deferred replay failure".into())
+                } else {
+                    value(&common, bytes, schema, context, diagnostics, &selection, 0)
+                };
+                match decoded {
                     Ok((value, canonical_bytes)) => {
                         capture_deferred_field(
                             &mut deferred_fields,
@@ -1010,7 +1047,9 @@ fn decode_with_identity_inner(
                 source_bindings[position] =
                     Some(FieldBinding::Extension(extension_index, duplicate));
             }
-            let decoded = if duplicate {
+            let decoded = if omit_deferred {
+                Err("omitted after deferred replay failure".to_owned())
+            } else if duplicate {
                 Err("duplicate singleton extension".to_owned())
             } else {
                 if capture_ownership {
@@ -1062,7 +1101,13 @@ fn decode_with_identity_inner(
                     }
                 }
                 Err(error) => {
-                    if field_schema.reject_record_on_error && scanned.flags & 0x20 == 0 {
+                    if field_schema.reject_record_on_error
+                        && scanned.flags & 0x20 == 0
+                        && !omit_deferred
+                    {
+                        if let Some(native) = context.native {
+                            native.reject_root(position);
+                        }
                         return Err(format!(
                             "{} {id:08X} mandatory {}: {error}",
                             String::from_utf8_lossy(&scanned.record_type),
@@ -1168,15 +1213,20 @@ fn decode_with_identity_inner(
         if capture_ownership {
             source_interpreted[position] = true;
         }
-        match value(
-            field_schema,
-            bytes,
-            schema,
-            context,
-            diagnostics,
-            &selection,
-            0,
-        ) {
+        let decoded = if omit_deferred {
+            Err("omitted after deferred replay failure".into())
+        } else {
+            value(
+                field_schema,
+                bytes,
+                schema,
+                context,
+                diagnostics,
+                &selection,
+                0,
+            )
+        };
+        match decoded {
             Ok((value, canonical_bytes)) => {
                 capture_deferred_field(
                     &mut deferred_fields,
@@ -1228,7 +1278,13 @@ fn decode_with_identity_inner(
                         .find(|range| range.start == index)
                         .map(|range| (range.start, range.end));
                 }
-                if field_schema.reject_record_on_error && scanned.flags & 0x20 == 0 {
+                if field_schema.reject_record_on_error
+                    && scanned.flags & 0x20 == 0
+                    && !omit_deferred
+                {
+                    if let Some(native) = context.native {
+                        native.reject_root(position);
+                    }
                     return Err(format!(
                         "{} {id:08X} mandatory {}: {error}",
                         String::from_utf8_lossy(&scanned.record_type),
@@ -2117,6 +2173,15 @@ pub(crate) fn record_contains_deferred(record: &DecodedRecord) -> bool {
         .fields
         .iter()
         .any(|field| value_contains_deferred(&field.value))
+}
+
+/// Native recovery addresses physical roots, never every field sharing a signature.
+pub(super) fn deferred_source_positions(record: &DecodedRecord) -> Vec<usize> {
+    record
+        .deferred_fields
+        .iter()
+        .map(|field| field.source_position)
+        .collect()
 }
 
 /// Retain deferred roots and grammar-sensitive tails; other fields move between views.

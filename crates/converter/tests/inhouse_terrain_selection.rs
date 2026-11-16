@@ -181,7 +181,7 @@ fn published_terrain_uses_native_order_and_winning_full_light_priority() {
             assert_eq!(
                 db.query_row(
                     "SELECT COUNT(*) FROM records WHERE form_id=?",
-                    [id],
+                    [common::stored_key(&db, id)],
                     |row| row.get::<_, u32>(0)
                 )
                 .unwrap(),
@@ -191,14 +191,14 @@ fn published_terrain_uses_native_order_and_winning_full_light_priority() {
         let earlier: u64 = db
             .query_row(
                 "SELECT source_record_offset FROM inhouse_terrain_source_order WHERE form_id=?",
-                [0x0200_08F2u32],
+                [common::stored_key(&db, 0x0200_08F2u32)],
                 |row| row.get(0),
             )
             .unwrap();
         let later: u64 = db
             .query_row(
                 "SELECT source_record_offset FROM inhouse_terrain_source_order WHERE form_id=?",
-                [0x0200_08A1u32],
+                [common::stored_key(&db, 0x0200_08A1u32)],
                 |row| row.get(0),
             )
             .unwrap();
@@ -260,7 +260,7 @@ async fn malformed_terrain_override_preserves_prior_winner_and_neighbor_publicat
         assert_eq!(
             db.query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?",
-                [id],
+                [common::stored_key(&db, id)],
                 |row| row.get::<_, u32>(0)
             )
             .unwrap(),
@@ -270,7 +270,7 @@ async fn malformed_terrain_override_preserves_prior_winner_and_neighbor_publicat
     let priority: u32 = db
         .query_row(
             "SELECT load_order FROM inhouse_source_records WHERE form_id=?",
-            [0x0200_08A1u32],
+            [common::stored_key(&db, 0x0200_08A1u32)],
             |row| row.get(0),
         )
         .unwrap();
@@ -373,8 +373,8 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     assert_eq!(
         db.query_row(
-            "SELECT record_type FROM records WHERE form_id=4",
-            [],
+            "SELECT record_type FROM records WHERE form_id=?1",
+            [common::stored_key(&db, 4)],
             |row| row.get::<_, String>(0)
         )
         .unwrap(),
@@ -383,7 +383,7 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
     let blob: Vec<u8> = db
         .query_row(
             "SELECT layer_data FROM inhouse_terrain_layers WHERE form_id=?",
-            [0x0100_08A1u32],
+            [common::stored_key(&db, 0x0100_08A1u32)],
             |row| row.get(0),
         )
         .unwrap();
@@ -402,20 +402,35 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
             "SELECT texture_form_id FROM inhouse_unresolved_terrain_textures WHERE form_id=? ORDER BY texture_form_id",
         )
         .unwrap()
-        .query_map([0x0100_08A1u32], |row| row.get::<_, u32>(0))
+        .query_map([common::stored_key(&db, 0x0100_08A1u32)], |row| row.get::<_, i64>(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(unresolved, vec![0x844]);
     assert_eq!(
-        rkyv::from_bytes::<Vec<converter::shared::TerrainLayer>, rkyv::rancor::Error>(&blob)
-            .unwrap(),
-        preserved.layers
+        unresolved
+            .into_iter()
+            .map(|key| common::runtime_id(&db, key))
+            .collect::<Vec<_>>(),
+        vec![0x844]
     );
+    let mut stored_layers =
+        rkyv::from_bytes::<Vec<converter::shared::TerrainLayer>, rkyv::rancor::Error>(&blob)
+            .unwrap();
+    assert_eq!(
+        stored_layers[1].texture_form_id,
+        common::stored_key(&db, 0x844) as u64
+    );
+    for layer in &mut stored_layers {
+        if layer.texture_form_id != 0 {
+            layer.texture_form_id =
+                u64::from(common::runtime_id(&db, layer.texture_form_id as i64));
+        }
+    }
+    assert_eq!(stored_layers, preserved.layers);
     let native: Vec<u8> = db
         .query_row(
             "SELECT payload FROM inhouse_source_records WHERE form_id=?",
-            [0x0100_08A1u32],
+            [common::stored_key(&db, 0x0100_08A1u32)],
             |row| row.get(0),
         )
         .unwrap();
@@ -426,7 +441,7 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
     assert_eq!(
         db.query_row(
             "SELECT load_order FROM inhouse_terrain_layers WHERE form_id=?",
-            [0x0100_08A1u32],
+            [common::stored_key(&db, 0x0100_08A1u32)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),
@@ -435,7 +450,7 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
     assert_eq!(
         db.query_row(
             "SELECT COUNT(*) FROM records WHERE form_id=?",
-            [0x0200_0D03u32],
+            [common::stored_key(&db, 0x0200_0D03u32)],
             |row| row.get::<_, u32>(0)
         )
         .unwrap(),

@@ -142,7 +142,7 @@ async fn fallback_orders_dependencies_and_ignores_nested_plugins_but_keeps_asset
 
 /// Nested plugins are not conversion inputs; their advisory must not block assets.
 #[tokio::test]
-async fn nested_only_plugins_warn_but_asset_conversion_completes_without_database() {
+async fn nested_only_plugins_warn_but_asset_conversion_publishes_an_empty_world() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("Data");
     layout::prepare_directory(&data, false).unwrap();
@@ -164,7 +164,7 @@ async fn nested_only_plugins_warn_but_asset_conversion_completes_without_databas
         )]
     );
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-    assert!(!output.join("skyrim_world.db").exists());
+    assert_empty_world(&output);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
             .unwrap();
@@ -213,9 +213,9 @@ async fn nested_only_plugin_notice_reaches_the_progress_channel() {
     );
 }
 
-/// A deliberately asset-only input needs neither a plugin warning nor a database.
+/// A deliberately asset-only input publishes the paired empty world without a plugin warning.
 #[tokio::test]
-async fn no_plugins_converts_assets_without_warning_or_database() {
+async fn no_plugins_converts_assets_without_warning_with_an_empty_world() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("Data");
     layout::prepare_directory(&data, false).unwrap();
@@ -237,7 +237,7 @@ async fn no_plugins_converts_assets_without_warning_or_database() {
     assert_eq!(report.skipped, 0);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert!(report.notices.is_empty(), "{:?}", report.notices);
-    assert!(!output.join("skyrim_world.db").exists());
+    assert_empty_world(&output);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
             .unwrap();
@@ -831,4 +831,31 @@ fn header_errors_include_the_plugin_path_and_framed_record_errors_recover_locall
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(ids, [0x0100_0801]);
+}
+
+/// Empty source selection is still a current authenticated world/cache pair.
+fn assert_empty_world(output: &Path) {
+    shared::world_assets::validate_world_database(&output.join("skyrim_world.db")).unwrap();
+    let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let context = shared::records::RecordContextReader::new(&database).unwrap();
+    assert!(context.identity().table().entries().is_empty());
+    for table in [
+        "plugins",
+        "records",
+        "record_context",
+        "record_source_fields",
+        "resolved_links",
+    ] {
+        let count: usize = database
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "empty source selection must leave {table} empty");
+    }
+    assert!(
+        common::runtime_cache(output, "cell_cache.rkyv")
+            .cells
+            .is_empty()
+    );
 }

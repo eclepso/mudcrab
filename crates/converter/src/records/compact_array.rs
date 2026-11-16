@@ -662,7 +662,7 @@ mod tests {
         export_record_bundle_typed(&data, &order, &output, &[*b"LAND", *b"STAT"]).unwrap();
         let db = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
         // This single-plugin native pack allocates ArrayNeighbors.esp as owner1.
-        let stored = |local: u32| 0x0000_0001_0000_0000i64 | i64::from(local);
+        let stored = |local: u32| 0x0000_0000_0100_0000i64 | i64::from(local);
         for id in ids {
             assert_eq!(
                 db.query_row(

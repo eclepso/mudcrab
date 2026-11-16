@@ -2328,11 +2328,13 @@ fn held_setup_fixture() -> (
         world::cache::CellCache,
     };
     let (mut app, directory, requests, responses) = cell_pipeline_fixture(4);
+    let identity = app.world().resource::<WorldDatabase>().identity().clone();
+    let stored_cell = u64::try_from(crate::world::test_support::key(&identity, 1)).unwrap();
     let cache_path = directory.path().join("held-cells.rkyv");
     let cache = shared::CellCache {
         version: shared::CELL_CACHE_VERSION,
         cells: vec![shared::CachedLand {
-            cell_id: 1,
+            cell_id: stored_cell,
             width: 33,
             height: 33,
             heights: vec![0.0; 33 * 33],
@@ -2340,7 +2342,7 @@ fn held_setup_fixture() -> (
             vertex_colors: vec![],
             layers: (0..4)
                 .map(|quadrant| shared::TerrainLayer {
-                    texture_form_id: 1,
+                    texture_form_id: stored_cell,
                     quadrant,
                     layer: 0,
                     is_base: true,
@@ -2351,12 +2353,8 @@ fn held_setup_fixture() -> (
             water_type_form_id: None,
         }],
     };
-    std::fs::write(
-        &cache_path,
-        rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
-    )
-    .unwrap();
-    app.insert_resource(CellCache::open(&cache_path).unwrap());
+    crate::world::test_support::write_cache(&cache_path, &identity, &cache);
+    app.insert_resource(CellCache::open_with_identity(&cache_path, identity).unwrap());
     let classes = std::sync::Arc::new(
         TerrainClasses::from_table(crate::terrain_merge::classes::tests::vanilla_table(9)).unwrap(),
     );

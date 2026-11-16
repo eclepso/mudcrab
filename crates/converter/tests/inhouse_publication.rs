@@ -464,9 +464,16 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
         diagnostic["warnings"],
         serde_json::to_value(&report.warnings).unwrap()
     );
+    let mut persisted_notices = diagnostic["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|notice| notice.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    persisted_notices.push("Terrain LOD compilation disabled by --no-lod".to_owned());
     assert_eq!(
-        diagnostic["notices"],
-        serde_json::to_value(&report.notices).unwrap()
+        persisted_notices, report.notices,
+        "reader findings plus exactly one run-local LOD notice"
     );
     assert!(
         !diagnostic["warnings"]

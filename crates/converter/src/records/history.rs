@@ -503,6 +503,278 @@ pub struct HistoryField {
     pub values: Vec<Option<Value>>,
 }
 
+/// Portable lazy history. Version objects retain physical header facts and named typed records.
+#[derive(Debug, Serialize)]
+pub struct NamedHistoryReport {
+    pub form_id: shared::form_key::NamedFormKey,
+    pub plugin_table_digest: String,
+    pub versions: Vec<serde_json::Value>,
+    pub fields: Vec<HistoryField>,
+    pub total_versions: u64,
+    pub truncated: bool,
+}
+
+type NativeHeaderAuthority = (
+    std::collections::HashSet<shared::form_key::FormKey>,
+    HashMap<shared::form_key::FormKey, [u8; 4]>,
+);
+
+/// Rejected/deleted physical headers still establish source identities for original replay.
+fn native_header_authority(
+    conn: &Connection,
+    order: &crate::esm::form_keys::FormKeyOrder,
+    identity: &shared::pack_identity::PackIdentity,
+) -> Result<NativeHeaderAuthority> {
+    use shared::source_form_id::ZeroPolicy;
+    let mut source_ids = std::collections::HashSet::new();
+    let mut headers = conn.prepare("SELECT record_signature,source_form_id,plugin_id FROM record_overrides ORDER BY plugin_id,source_record_offset")?;
+    for row in headers.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, u32>(1)?,
+            row.get::<_, usize>(2)?,
+        ))
+    })? {
+        let (signature, word, supplier) = row?;
+        ensure!(
+            supplier < order.plugin_order().len(),
+            "absent stored supplying plugin"
+        );
+        let signature: [u8; 4] = signature
+            .try_into()
+            .map_err(|_| color_eyre::eyre::eyre!("invalid stored signature"))?;
+        if signature != *b"TES4"
+            && let Some(key) = order.resolve(supplier, word, ZeroPolicy::Null)?
+        {
+            source_ids.insert(key);
+        }
+    }
+    // A rejected/deleted physical candidate can prove existence without becoming the
+    // admitted type authority for deferred selectors in another source version.
+    let mut kinds = HashMap::new();
+    let mut admitted = conn.prepare("SELECT form_id,record_type FROM inhouse_source_records")?;
+    for row in admitted.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (stored, signature) = row?;
+        let key = identity.required_key(stored)?;
+        let signature = signature.as_bytes().try_into().map_err(|_| {
+            color_eyre::eyre::eyre!("invalid admitted record signature in native history")
+        })?;
+        kinds.insert(key, signature);
+    }
+    Ok((source_ids, kinds))
+}
+
+/// Decode current native history without assigning legacy runtime slots.
+/// Each source version is independently checksum/header guarded and remains visible on failure.
+pub fn read_named_history(
+    pack: &Path,
+    data: Option<&Path>,
+    named: &shared::form_key::NamedFormKey,
+) -> Result<NamedHistoryReport> {
+    use crate::esm::form_keys::FormKeyOrder;
+    use shared::source_form_id::ZeroPolicy;
+    let database = if pack.is_file() {
+        pack.to_path_buf()
+    } else {
+        pack.join("skyrim_world.db")
+    };
+    let conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = crate::esm::inhouse::validate_record_bundle_scope(&database, &conn)?;
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn)?;
+    let chain = read_native_chain(&database, named)?;
+    let order = FormKeyOrder::from_facts(
+        identity
+            .order()
+            .iter()
+            .map(|&id| {
+                let entry = identity.table().entry(id).expect("authenticated supplier");
+                (entry.display_name.clone(), entry.facts.clone())
+            })
+            .collect(),
+    )?;
+    ensure!(
+        order.pack_identity()?.digest() == identity.digest(),
+        "history allocation differs from authenticated source facts; convert again"
+    );
+    // Build the catalogue only after a requested source version passes its physical guards.
+    let authority = std::cell::OnceCell::new();
+    let schemas = stored_schemas(&conn).map_err(|error| error.to_string());
+    let prepared = schemas.as_ref().ok().map(decoder::prepare_runtime_schema);
+    let mut versions = Vec::with_capacity(chain.versions.len());
+    let mut decoded_versions = Vec::with_capacity(chain.versions.len());
+    for version in &chain.versions {
+        let mut output = serde_json::to_value(version)?;
+        let mut diagnostics = PluginDiagnostics::default();
+        let decoded = (|| -> Result<DecodedRecord> {
+            let schemas = schemas
+                .as_ref()
+                .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
+            let mut physical = None;
+            super::history_source::visit_native_source_history(
+                pack,
+                data,
+                super::history_source::SourceQuery::Physical {
+                    plugin_id: version.plugin_id,
+                    source_record_offset: version.source_record_offset,
+                },
+                |source| {
+                    physical = Some(source);
+                    Ok(())
+                },
+            )?;
+            let source =
+                physical.ok_or_else(|| color_eyre::eyre::eyre!("absent stored physical source"))?;
+            let raw = source.raw.ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "{}",
+                    source
+                        .raw_access_failure
+                        .unwrap_or_else(|| "source unavailable".into())
+                )
+            })?;
+            let mut payload = raw.stored_payload.ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "truncated native record payload or diagnostic allocation bound exceeded"
+                )
+            })?;
+            if source.flags & 0x40000 != 0 {
+                payload = scanner::inflate(&payload).map_err(color_eyre::eyre::Error::msg)?;
+            }
+            let word = |at| {
+                u32::from_le_bytes(
+                    raw.header[at..at + 4]
+                        .try_into()
+                        .expect("fixed native header"),
+                )
+            };
+            let scanned = scanner::ScannedRecord {
+                record_type: source.record_signature,
+                flags: source.flags,
+                source_form_id: source.source_form_id,
+                version_control: word(16),
+                form_version: u16::from_le_bytes(
+                    raw.header[20..22].try_into().expect("fixed native header"),
+                ),
+                header_unknown: u16::from_le_bytes(
+                    raw.header[22..24].try_into().expect("fixed native header"),
+                ),
+                cell_form_id: source.source_cell_form_id,
+                worldspace_form_id: source.source_worldspace_form_id,
+                source_topic_form_id: source.source_topic_form_id,
+                topic_group_offset: source.topic_group_offset,
+                source_record_offset: source.source_record_offset,
+                payload,
+            };
+            let supplier = source.plugin_id as usize;
+            let (source_ids, kinds) = authority
+                .get_or_init(|| {
+                    native_header_authority(&conn, &order, &identity)
+                        .map_err(|error| error.to_string())
+                })
+                .as_ref()
+                .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
+            let capture =
+                super::native::DecodeContext::new(&order, supplier, source_ids, Some(kinds));
+            let marker = HashMap::new();
+            let plugin_flags: u32 = conn.query_row("SELECT flags FROM record_overrides WHERE plugin_id=?1 AND record_type='TES4' AND source_record_offset=0", [supplier as u64], |row| row.get(0))?;
+            let context = decoder::Context {
+                order: None,
+                native: Some(&capture),
+                plugin_index: supplier,
+                localized: plugin_flags & 0x80 != 0,
+                source_ids: None,
+                winning_types: Some(&marker),
+            };
+            let record = decoder::decode_with_prepared(
+                scanned,
+                schemas.schema(),
+                prepared.as_ref().expect("prepared validated schema"),
+                &context,
+                &mut diagnostics,
+            )
+            .map_err(color_eyre::eyre::Error::msg)?;
+            ensure!(
+                record.payload_complete
+                    && record.rejected_fields.is_empty()
+                    && record.deferred_fields.is_empty(),
+                "undecodable fields or incomplete subrecord framing: {:?}",
+                record.rejected_fields
+            );
+            Ok(record)
+        })();
+        match decoded {
+            Ok(record) => {
+                let mut json = serde_json::to_value(&record)?;
+                json["form_id"] = serde_json::to_value(&chain.form_id)?;
+                let supplier = version.plugin_id as usize;
+                for (field, raw) in [
+                    ("cell_form_id", record.cell_form_id),
+                    ("worldspace_form_id", record.worldspace_form_id),
+                    ("topic_form_id", record.topic_form_id),
+                ] {
+                    let named = raw
+                        .map(|word| order.resolve(supplier, word, ZeroPolicy::Null))
+                        .transpose()?
+                        .flatten()
+                        .map(|key| identity.table().named(key))
+                        .transpose()?;
+                    json[field] = serde_json::to_value(named)?;
+                }
+                output["decode_status"] = "decoded".into();
+                output["decode_reason"] = serde_json::Value::Null;
+                output["record"] = json;
+                decoded_versions.push(Some(record));
+            }
+            Err(error) => {
+                output["decode_status"] = "undecodable".into();
+                output["decode_reason"] = error.to_string().into();
+                output["record"] = serde_json::Value::Null;
+                decoded_versions.push(None);
+            }
+        }
+        output["diagnostics"] = serde_json::to_value(diagnostics)?;
+        versions.push(output);
+    }
+    let mut roles = BTreeMap::<String, Vec<Option<Value>>>::new();
+    for (column, record) in decoded_versions.iter().enumerate() {
+        let mut occurrences = HashMap::<String, u32>::new();
+        if let Some(record) = record {
+            for field in &record.fields {
+                let count = occurrences.entry(field.name.clone()).or_default();
+                let name = format!(
+                    "{}:{}[{}]",
+                    String::from_utf8_lossy(&field.signature),
+                    field.name,
+                    *count
+                );
+                *count += 1;
+                roles
+                    .entry(name)
+                    .or_insert_with(|| vec![None; versions.len()])[column] =
+                    Some(field.value.clone());
+            }
+        }
+    }
+    let fields = roles
+        .into_iter()
+        .map(|(field, values)| HistoryField {
+            different: values.windows(2).any(|v| v[0] != v[1]),
+            field,
+            values,
+        })
+        .collect();
+    Ok(NamedHistoryReport {
+        form_id: chain.form_id,
+        plugin_table_digest: identity.digest_hex(),
+        versions,
+        fields,
+        total_versions: chain.total_versions,
+        truncated: chain.truncated,
+    })
+}
+
 /// Reconstitute original slot/master assignment without reading any source plugin headers.
 /// New packs use scalar ordered master rows; retained older packs keep read compatibility.
 pub(crate) fn stored_order(conn: &Connection) -> Result<(LoadOrder, Vec<PluginSource>)> {
@@ -1070,6 +1342,44 @@ pub fn display(report: &HistoryReport) -> String {
 #[cfg(test)]
 mod normalized_masters_tests {
     use super::*;
+
+    /// Rejected later headers retain source presence without selecting a different union layout.
+    #[test]
+    fn native_history_separates_source_presence_from_admitted_target_type() {
+        let order = crate::esm::form_keys::FormKeyOrder::from_facts(vec![(
+            "Owner.esm".into(),
+            shared::plugin_table::PluginFacts {
+                content_hash: Some([0x41; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let identity = order.pack_identity().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE record_overrides(record_signature BLOB,source_form_id INTEGER,plugin_id INTEGER,source_record_offset INTEGER);
+             CREATE TABLE inhouse_source_records(form_id INTEGER,record_type TEXT);
+             INSERT INTO record_overrides VALUES(X'57415452',2080,0,24);
+             INSERT INTO record_overrides VALUES(X'52414345',2080,0,48);
+             INSERT INTO record_overrides VALUES(X'474C4F42',2096,0,72);
+             INSERT INTO inhouse_source_records VALUES(16779296,'WATR');"
+        ).unwrap();
+        let admitted = identity.required_key(0x0100_0820).unwrap();
+        let rejected_only = identity.required_key(0x0100_0830).unwrap();
+        let (source_ids, kinds) = native_header_authority(&conn, &order, &identity).unwrap();
+        assert_eq!(
+            source_ids,
+            std::collections::HashSet::from([admitted, rejected_only])
+        );
+        assert_eq!(kinds, HashMap::from([(admitted, *b"WATR")]));
+        // A foreign allocation number must fail rather than becoming a plausible runtime id.
+        conn.execute(
+            "INSERT INTO inhouse_source_records VALUES(33556544,'FACT')",
+            [],
+        )
+        .unwrap();
+        assert!(native_header_authority(&conn, &order, &identity).is_err());
+    }
 
     /// Raw signatures remain authoritative even when their display text is lossy.
     #[test]

@@ -525,11 +525,11 @@ fn real_old_record_oracle_sol3_publication_clears_absent_links_and_keeps_referen
         rkyv::from_bytes::<super::types::ArchivedRecordData, rkyv::rancor::Error>(&blob).unwrap()
     };
     let old_cell = published(&old_db, 0x0200_0800);
-    let new_cell = published(&new_db, 0x0000_0003_0000_0800);
+    let new_cell = published(&new_db, 0x0000_0000_0300_0800);
     let context = shared::records::RecordContextReader::new(&new_db).unwrap();
     let cell_key = context
         .identity()
-        .required_key(0x0000_0003_0000_0800)
+        .required_key(0x0000_0000_0300_0800)
         .unwrap();
     let cell = context.record(cell_key).unwrap();
     for tag in [b"XOWN", b"XCWT"] {
@@ -558,7 +558,7 @@ fn real_old_record_oracle_sol3_publication_clears_absent_links_and_keeps_referen
     assert_eq!(old_count, 0);
     let reference_key = context
         .identity()
-        .required_key(0x0000_0003_0000_0802)
+        .required_key(0x0000_0000_0300_0802)
         .unwrap();
     let reference = published(&new_db, reference_key.to_sql_i64());
     let name = reference
@@ -721,7 +721,7 @@ fn typed_publication_skips_invalid_name_before_identity_construction() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(ids, [0x0000_0001_0000_0833, 0x0000_0002_0000_0811]);
+    assert_eq!(ids, [0x0000_0000_0100_0833, 0x0000_0000_0200_0811]);
     let plugins: u32 = conn
         .query_row("SELECT COUNT(*) FROM plugins", [], |r| r.get(0))
         .unwrap();

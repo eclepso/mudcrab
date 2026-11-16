@@ -174,7 +174,7 @@ fn navm_onam_projection_preserves_null_after_native_self_resolution() {
         event,
         (
             0x3f00_003f,
-            "native source 3F00003F is absent or has a disallowed target type".into()
+            "optional FormID 3F00003F exceeds master list".into()
         )
     );
     let paths = [data.join("Synthetic.esm")];
@@ -406,6 +406,21 @@ fn self_selector_publication_keeps_optional_owner_lock_and_diagnostic_id() {
     inhouse::export_record_bundle(&data, &list, &output).unwrap();
     for path in [legacy, output.join("skyrim_world.db")] {
         let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            common::native_fields(&conn, 0x0100_0870, b"XLOC"),
+            [lock.clone()]
+        );
+        let opaque_sites: usize = conn
+            .query_row(
+                "SELECT count(*) FROM resolved_links WHERE record_key=?1 AND source_ordinal=1",
+                [common::stored_key(&conn, 0x0100_0870)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            opaque_sites, 0,
+            "opaque XLOC must not manufacture a typed link site"
+        );
         let archived = common::runtime_record(&conn, 0x0100_0860);
         let owner = archived
             .subrecords

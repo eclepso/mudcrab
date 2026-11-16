@@ -66,7 +66,7 @@ fn required_header_compatibility_publishes_with_optional_link_and_broken_neighbo
     let count: u32 = db
         .query_row(
             "SELECT count(*) FROM records WHERE form_id=?1",
-            [0x0100_0711u32],
+            [common::stored_key(&db, 0x0100_0711)],
             |row| row.get(0),
         )
         .unwrap();

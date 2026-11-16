@@ -219,6 +219,7 @@ fn assert_publication(config: &PipelineConfig, expected: &[&str], jump_height: f
 /// Reads synthetic GMST editors, values and winning priorities from published generic records.
 fn published_settings(config: &PipelineConfig) -> Vec<(String, f32, u32)> {
     let conn = Connection::open(config.output_dir.join("skyrim_world.db")).unwrap();
+    let context = shared::records::RecordContextReader::new(&conn).unwrap();
     let mut query = conn
         .prepare("SELECT form_id, load_order FROM records WHERE record_type='GMST'")
         .unwrap();
@@ -227,22 +228,12 @@ fn published_settings(config: &PipelineConfig) -> Vec<(String, f32, u32)> {
         .unwrap()
         .map(|row| {
             let (key, priority) = row.unwrap();
-            let data = common::runtime_record(&conn, common::runtime_id(&conn, key));
-            let editor = &data
-                .subrecords
-                .iter()
-                .find(|sub| &sub.tag == b"EDID")
-                .unwrap()
-                .data;
-            let value = &data
-                .subrecords
-                .iter()
-                .find(|sub| &sub.tag == b"DATA")
-                .unwrap()
-                .data;
+            let data = context
+                .record(context.identity().required_key(key).unwrap())
+                .unwrap();
             (
-                String::from_utf8(editor.strip_suffix(&[0]).unwrap_or(editor).to_vec()).unwrap(),
-                f32::from_le_bytes(value.as_slice().try_into().unwrap()),
+                data.text(*b"EDID").unwrap(),
+                f32::from_le_bytes(data.bytes(*b"DATA").unwrap().try_into().unwrap()),
                 priority,
             )
         })
@@ -654,15 +645,24 @@ async fn inhouse_mo2_localized_banks_follow_loose_winners_and_preserve_neighbors
         444.0,
     );
     let conn = Connection::open(config.output_dir.join("skyrim_world.db")).unwrap();
-    let lookups: Vec<(u32, String, String, Option<String>, String)> = conn
-        .prepare("SELECT form_id,signature,string_table,resolved_text,status FROM inhouse_localized_fields WHERE form_id IN (33556736,50333952) ORDER BY form_id,field_index")
+    let lookups: Vec<(i64, String, String, Option<String>, String)> = conn
+        .prepare("SELECT form_id,signature,string_table,resolved_text,status FROM inhouse_localized_fields WHERE form_id IN (?1,?2) ORDER BY CASE WHEN form_id=?1 THEN 0 ELSE 1 END,field_index")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .query_map([common::stored_key(&conn, 0x0200_0900), common::stored_key(&conn, 0x0300_0900)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
     assert_eq!(
-        lookups,
+        lookups
+            .into_iter()
+            .map(|(key, signature, bank, text, status)| (
+                common::runtime_id(&conn, key),
+                signature,
+                bank,
+                text,
+                status
+            ))
+            .collect::<Vec<_>>(),
         [
             (
                 0x0200_0900,
@@ -949,7 +949,7 @@ async fn final_unicode_profile_master_override_publishes() {
         ["Skyrim.esm", "Middle.esp", "CAF\u{c9}.esp", "PATCH.esp"]
     );
     assert_eq!(value(&config), 93.0);
-    let winning: Vec<(u32, u32)> = conn
+    let winning: Vec<(i64, u32)> = conn
         .prepare("SELECT form_id, load_order FROM records WHERE record_type='GMST'")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -957,7 +957,10 @@ async fn final_unicode_profile_master_override_publishes() {
         .map(Result::unwrap)
         .collect();
     // GMST retains the first owner's identity despite overrides from both later plugins.
-    assert!(winning.contains(&(0x0100_0800, 3)), "{winning:?}");
+    assert!(
+        winning.contains(&(common::stored_key(&conn, 0x0100_0800), 3)),
+        "{winning:?}"
+    );
     assert!(
         report
             .notices
@@ -1019,7 +1022,7 @@ async fn final_cycle_closure_preserves_profile_publication() {
     );
 }
 
-/// A 256-full-plugin MO2 profile keeps its first 254 and publishes usable neighboring records.
+/// A 256-full-plugin MO2 profile preserves every native owner and its dependent beyond runtime slots.
 #[tokio::test]
 async fn final_full_slot_overflow_preserves_profile_publication() {
     let (_dir, config, instance) = fixture();
@@ -1057,7 +1060,8 @@ async fn final_full_slot_overflow_preserves_profile_publication() {
     write(&instance, "profiles/Default/loadorder.txt", order);
     let report = publish(&config).await;
     let expected: Vec<_> = std::iter::once("skyrim.esm".to_owned())
-        .chain((0..253).map(|index| format!("full{index:03}.esp")))
+        .chain((0..255).map(|index| format!("full{index:03}.esp")))
+        .chain(std::iter::once("dependent.esp".to_owned()))
         .collect();
     assert_publication(
         &config,
@@ -1070,27 +1074,45 @@ async fn final_full_slot_overflow_preserves_profile_publication() {
             .iter()
             .any(|(editor, _, priority)| editor == "fProfileFull252" && *priority == 253)
     );
-    assert!(!settings.iter().any(|(editor, _, _)| {
-        [
-            "fProfileFull253",
-            "fProfileFull254",
-            "fProfileOverflowDependent",
-        ]
-        .contains(&editor.as_str())
-    }));
+    for (name, value, priority) in [
+        ("fProfileFull253", 73.0, 254),
+        ("fProfileFull254", 73.0, 255),
+        ("fProfileOverflowDependent", 19.0, 256),
+    ] {
+        assert!(
+            settings
+                .iter()
+                .any(|(editor, actual, supplier)| editor == name
+                    && *actual == value
+                    && *supplier == priority),
+            "missing native setting {name}: {settings:?}"
+        );
+    }
+    let database = Connection::open(config.output_dir.join("skyrim_world.db")).unwrap();
+    let context = shared::records::RecordContextReader::new(&database).unwrap();
+    for name in ["Full253.esp", "Full254.esp"] {
+        let key =
+            shared::form_key::FormKey::new(context.identity().table().id(name).unwrap(), 0x800)
+                .unwrap();
+        assert_eq!(
+            context.identity().runtime_id_if_available(key).unwrap(),
+            None
+        );
+        assert_eq!(context.record(key).unwrap().source_header, 0x0100_0800);
+    }
     let summaries: Vec<_> = report
         .notices
         .iter()
         .filter(|notice| notice.contains("full plugin slot overflow"))
         .collect();
-    assert_eq!(summaries.len(), 1, "{:?}", report.notices);
     assert!(
-        summaries[0].contains('2') && summaries[0].contains("Full253.esp"),
-        "{summaries:?}"
+        summaries.is_empty(),
+        "native publication must not impose gameplay slot caps: {summaries:?}"
     );
-    assert_eq!(
-        report.skipped_plugins,
-        ["Full253.esp", "Full254.esp", "Dependent.esp"]
+    assert!(
+        report.skipped_plugins.is_empty(),
+        "{:?}",
+        report.skipped_plugins
     );
 }
 

@@ -169,9 +169,9 @@ fn localized_summary<'a>(
 ) -> &'a str {
     assert_eq!(diagnostics["format_version"], 2);
     let kind = if category == "warnings" {
-        "unusable localized fields"
+        "local decode/lookup issues"
     } else {
-        "localized IDs missing from readable tables"
+        "localized IDs missing from readable string tables"
     };
     let summaries = diagnostics[category]
         .as_array()
@@ -313,11 +313,11 @@ fn localized_fields_preserve_zero_missing_resolved_and_repeated_keys() {
             .unwrap();
     assert!(
         localized_summary(&diagnostics, "warnings", "localizedfields.esp", 4)
-            .contains("localized ID Some(42)")
+            .contains("malformed strings entry for localized ID 42")
     );
     assert!(
         localized_summary(&diagnostics, "notices", "localizedfields.esp", 3)
-            .contains("localized ID Some(17)")
+            .contains("missing localized ID 17")
     );
 }
 
@@ -726,11 +726,16 @@ fn move_sql_snapshot(database: &Connection) -> (MoveSqlRows, MoveSqlTables) {
 }
 
 /// Compare typed records by identity while rejecting duplicate output rows.
-fn move_typed_snapshot(path: &Path) -> std::collections::BTreeMap<u32, serde_json::Value> {
+fn move_typed_snapshot(path: &Path) -> std::collections::BTreeMap<(u64, u64), serde_json::Value> {
     let mut result = std::collections::BTreeMap::new();
     for line in fs::read_to_string(path).unwrap().lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
-        let id = u32::try_from(row["form_id"].as_u64().unwrap()).unwrap();
+        // Include TES4 and every physical source record. Portable identity can be
+        // null for headers, and repeated native versions must not overwrite one another.
+        let id = (
+            row["load_order"].as_u64().unwrap(),
+            row["source_record_offset"].as_u64().unwrap(),
+        );
         assert!(result.insert(id, row).is_none(), "duplicate typed identity");
     }
     result
@@ -825,7 +830,22 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
             row.get(0)
         })
         .unwrap();
-    assert_eq!(copied_typed.len(), source_count);
+    assert_eq!(
+        copied_typed
+            .values()
+            .filter(|row| !row["form_id"].is_null())
+            .count(),
+        source_count
+    );
+    let headers = copied_typed
+        .values()
+        .filter(|row| row["form_id"].is_null())
+        .collect::<Vec<_>>();
+    assert_eq!(headers.len(), 2);
+    for header in headers {
+        assert_eq!(header["record_type"], serde_json::json!(*b"TES4"));
+        assert_eq!(header["source_form_id"], 0);
+    }
     assert!(
         copied_db
             .query_row("SELECT count(*) FROM record_overrides", [], |row| row
@@ -861,7 +881,11 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
             source(&copied_db, rid),
             (rid, 1, message(rid, string_id)[24..].to_vec())
         );
-        let typed = &copied_typed[&rid];
+        let named = format!("{:06X}:MoveFixture.esp", rid & 0x00ff_ffff);
+        let typed = copied_typed
+            .values()
+            .find(|row| row["form_id"] == named)
+            .unwrap();
         assert_eq!(
             typed["fields"][1]["value"],
             serde_json::json!({"LocalizedString":string_id})
@@ -871,7 +895,10 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
             serde_json::json!(string_id.to_le_bytes())
         );
         assert_eq!(typed["localization"]["1"]["status"], status);
-        assert_eq!(typed["localization"]["1"]["text"], serde_json::json!(text));
+        assert_eq!(
+            typed["localization"]["1"]["resolved_text"],
+            serde_json::json!(text)
+        );
         assert_eq!(
             typed["source_payload_sha256"],
             format!("{:x}", Sha256::digest(&message(rid, string_id)[24..]))

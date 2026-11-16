@@ -251,7 +251,7 @@ fn canonical_fields(output: &Path, form_id: u32) -> Vec<([u8; 4], Vec<u8>)> {
 /// Interpret certified sites only for existing runtime behavior assertions; opaque bytes stay native.
 fn runtime_fields(output: &Path, form_id: u32) -> Vec<([u8; 4], Vec<u8>)> {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    common::runtime_record(&db, form_id)
+    common::canonical_record(&db, form_id)
         .subrecords
         .into_iter()
         .map(|field| (field.tag, field.data))
@@ -335,10 +335,15 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
         assert!(integration.bounds_updated >= 8);
         assert!(integration.statics_with_models >= 8);
         let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let identity = shared::pack_identity::PackIdentity::read_sql(&database).unwrap();
         let recovered_ids = expected
             .iter()
             .map(|(_, invalid_id, _, _)| {
-                format!("{:016X}", common::stored_key(&database, *invalid_id))
+                identity
+                    .table()
+                    .named(identity.runtime_key(*invalid_id).unwrap().unwrap())
+                    .unwrap()
+                    .to_string()
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -372,10 +377,13 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
             assert!(archived.contains(&(*b"MODL", invalid_model.clone())));
             assert!(integration.issues.iter().any(|issue| {
                 issue.contains("plugin Skyrim.esm")
-                    && issue.contains(&format!(
-                        "{:016X}",
-                        common::stored_key(&database, *invalid_id)
-                    ))
+                    && issue.contains(
+                        &identity
+                            .table()
+                            .named(identity.runtime_key(*invalid_id).unwrap().unwrap())
+                            .unwrap()
+                            .to_string(),
+                    )
                     && issue.contains("../bad.nif")
             }));
         }
@@ -1262,14 +1270,27 @@ async fn malformed_addon_fields_preserve_valid_neighbors_through_publication() {
         &(*b"XEND", vec![0xD7, 0x21, 0x93, 0, 0x45])
     );
     for id in [0x0300_1823, 0x0300_1824] {
-        // History decodes source versions before final winner target clearing;
-        // published canonical bytes below prove the actual recovery action.
+        // History decodes source versions before final winner target clearing.
+        // Canonical bytes retain the original native word; the authenticated
+        // semantic-site interpretation proves the runtime recovery action.
         assert_eq!(
             field_value(&history_record(&output, id), b"XLNK"),
             Value::FormId(if id == 0x0300_1823 { 0 } else { 0x0200_1817 })
         );
         assert_eq!(
             canonical_fields(&output, id)
+                .into_iter()
+                .find(|(tag, _)| tag == b"XLNK")
+                .unwrap()
+                .1,
+            if id == 0x0300_1823 {
+                0x0200_1801u32.to_le_bytes().to_vec()
+            } else {
+                0x1817u32.to_le_bytes().to_vec()
+            }
+        );
+        assert_eq!(
+            runtime_fields(&output, id)
                 .into_iter()
                 .find(|(tag, _)| tag == b"XLNK")
                 .unwrap()
@@ -1815,7 +1836,8 @@ async fn database_cache_keys_and_restores_by_schema_addon_bytes() {
     assert_ne!(stamp(&output)["schema_sha256"], base_stamp["schema_sha256"]);
     let typed_stamp = stamp(&output);
     assert!(stamp(&output)["schema_addons"].is_array());
-    assert_eq!(canonical_fields(&output, 0x0300_1820), remapped);
+    assert_eq!(canonical_fields(&output, 0x0300_1820), original);
+    assert_eq!(runtime_fields(&output, 0x0300_1820), remapped);
     assert!(history_record(&output, 0x0300_1820).supported);
 
     let typed_warm = run_config(mod_config(&data, &output, &[&addon]))
@@ -1825,7 +1847,8 @@ async fn database_cache_keys_and_restores_by_schema_addon_bytes() {
         typed_warm.database_cache_hit,
         "unchanged add-on bundle restores"
     );
-    assert_eq!(canonical_fields(&output, 0x0300_1820), remapped);
+    assert_eq!(canonical_fields(&output, 0x0300_1820), original);
+    assert_eq!(runtime_fields(&output, 0x0300_1820), remapped);
     assert_eq!(stamp(&output), typed_stamp);
     assert_eq!(typed_warm.warnings, typed.warnings);
 

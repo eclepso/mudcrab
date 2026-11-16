@@ -2616,9 +2616,20 @@ mod tests {
         assert!(
             portable_worldspace(&EngineConfig {
                 bound_identity: None,
+                synthetic_instances: 0,
                 ..EngineConfig::default()
             })
             .is_err()
+        );
+        assert_eq!(
+            portable_worldspace(&EngineConfig {
+                bound_identity: None,
+                synthetic_instances: 1,
+                ..EngineConfig::default()
+            })
+            .unwrap(),
+            shared::form_key::NamedFormKey::Null,
+            "a synthetic-only run has no world identity to invent"
         );
     }
 

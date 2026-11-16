@@ -32,6 +32,98 @@ struct SourceFact {
     text_fields: BTreeMap<usize, TextFact>,
 }
 
+/// Apply the same text interpretation as runtime publication before selecting a winner.
+/// This temporary view never changes native source words or canonical archived bytes.
+fn validate_native_candidate(
+    native: &records::NativeRecord,
+    order: &FormKeyOrder,
+    paths: &[PathBuf],
+    strings: StringSources<'_>,
+    tables: &mut HashMap<(usize, String), Option<super::inhouse::ParsedTextTable>>,
+) -> std::result::Result<(), String> {
+    let decoded = &native.decoded;
+    if decoded.record_type == *b"LAND" {
+        if !decoded.payload_complete {
+            return Err("incomplete terrain payload".into());
+        }
+        if let Some(signature) = decoded
+            .rejected_fields
+            .iter()
+            .find(|signature| matches!(*signature, b"VHGT" | b"BTXT" | b"ATXT" | b"VTXT"))
+        {
+            return Err(format!(
+                "rejected authored terrain field {}",
+                String::from_utf8_lossy(signature)
+            ));
+        }
+        // Recovering an invalid texture anchor must not admit a partial LAND over a
+        // usable predecessor. Validate its complete authored terrain as a unit.
+        return super::cell_cache::validate_inhouse_land(&native.source)
+            .map_err(|error| error.to_string());
+    }
+    if !matches!(&decoded.record_type, b"GMST" | b"RACE" | b"MOVT") {
+        return Ok(());
+    }
+    let mut selected = decoded.to_raw_record();
+    if decoded.record_type == *b"MOVT" {
+        let key = order
+            .resolve(
+                decoded.load_order as usize,
+                native.source.form_id,
+                shared::source_form_id::ZeroPolicy::Null,
+            )
+            .map_err(|error| error.to_string())?;
+        if !key.is_some_and(|key| {
+            key.local() == 0x3580d
+                && order
+                    .table()
+                    .entry(key.plugin())
+                    .is_some_and(|entry| entry.normalized_name == "skyrim.esm")
+        }) {
+            return Ok(());
+        }
+        selected.form_id = 0x3580d;
+    }
+    for (index, field) in decoded.fields.iter().enumerate() {
+        let bytes = &mut selected.subrecords[index].1;
+        match &field.value {
+            Value::String(text) => {
+                // Fixed-width ASCII names are valid without a terminator. Other
+                // decoded text uses the normalized UTF-8 representation at runtime.
+                if !(text.is_ascii() && bytes.as_slice() == text.as_bytes()) {
+                    *bytes = super::inhouse::runtime_string(text);
+                }
+            }
+            Value::LocalizedString(id) => {
+                let text = if *id == 0 {
+                    None
+                } else {
+                    let supplier = decoded.load_order as usize;
+                    let bank = field.localized_bank.as_deref().unwrap_or("strings");
+                    tables
+                        .entry((supplier, bank.to_owned()))
+                        .or_insert_with(|| {
+                            read_plugin_strings(&paths[supplier], strings, bank)
+                                .ok()
+                                .flatten()
+                        })
+                        .as_ref()
+                        .and_then(|table| table.values.get(id))
+                };
+                *bytes = super::inhouse::runtime_string(text.map(String::as_str).unwrap_or(""));
+            }
+            _ => {}
+        }
+    }
+    if decoded.supported {
+        let mut fields = decoded.fields.iter();
+        selected
+            .subrecords
+            .retain(|_| !fields.next().expect("decoded field").opaque);
+    }
+    super::exporter::validate_inhouse_record(&selected).map_err(|error| error.to_string())
+}
+
 /// Build and publish a complete SQL generation with the selected independent field decoder.
 pub(crate) fn convert(
     paths: &[PathBuf],
@@ -78,42 +170,10 @@ pub(crate) fn convert_with_dump(
     let mut facts = HashMap::new();
     let mut conversion = if reader == RecordReader::Inhouse {
         let order = FormKeyOrder::read(&paths)?;
+        let mut admission_tables = HashMap::new();
         let mut read =
             records::read_plugins_form_keys_with_validation(&paths, &order, schemas, |native| {
-                let scalar = &native.canonical;
-                if matches!(&scalar.record_type, b"GMST" | b"RACE") {
-                    super::exporter::validate_inhouse_record(scalar)
-                        .map_err(|error| error.to_string())?;
-                }
-                if scalar.record_type == *b"MOVT" {
-                    let key = order
-                        .resolve(
-                            scalar.load_order as usize,
-                            native.source.form_id,
-                            shared::source_form_id::ZeroPolicy::Null,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    if key.is_some_and(|key| {
-                        key.local() == 0x3580d
-                            && order
-                                .table()
-                                .entry(key.plugin())
-                                .is_some_and(|entry| entry.normalized_name == "skyrim.esm")
-                    }) {
-                        let mut selected = scalar.clone();
-                        selected.form_id = 0x3580d;
-                        super::exporter::validate_inhouse_record(&selected)
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-                if scalar.record_type == *b"LAND" {
-                    // Recovery can already have dropped an unusable texture anchor or
-                    // weight. Validate authored LAND as a unit before it replaces a
-                    // usable predecessor with a deceptively valid partial heightmap.
-                    super::cell_cache::validate_inhouse_land(&native.source)
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(())
+                validate_native_candidate(native, &order, &paths, strings, &mut admission_tables)
             })?;
         let warnings = read.warnings();
         let notices = read.notices();
@@ -633,6 +693,11 @@ fn write_world(output: &mut Connection, snapshot: WorldSnapshot<'_, '_>) -> Resu
     }
     super::exporter::replace_complete_snapshot(&tx)?;
     for (name, sql) in &definitions {
+        // This table belongs to the caller's asset cache, not the record snapshot.
+        // replace_complete_snapshot already creates it when absent and preserves its rows.
+        if name == "conversion_cache" {
+            continue;
+        }
         if name != "schema_info" {
             tx.execute_batch(&format!("DROP TABLE IF EXISTS \"{name}\"; {sql}"))?;
         } else {
@@ -654,7 +719,10 @@ fn write_world(output: &mut Connection, snapshot: WorldSnapshot<'_, '_>) -> Resu
        CREATE TABLE IF NOT EXISTS inhouse_terrain_source_order(form_id INTEGER PRIMARY KEY,source_record_offset INTEGER NOT NULL); DELETE FROM inhouse_terrain_source_order;")?;
     let mut projection_warnings = Vec::new();
     for (table, _) in &definitions {
-        if matches!(table.as_str(), "records" | "schema_info" | "plugins") {
+        if matches!(
+            table.as_str(),
+            "records" | "schema_info" | "plugins" | "conversion_cache"
+        ) {
             continue;
         }
         if mode == super::inhouse::RecordBundleMode::Full || table == "formid_map" {
@@ -828,6 +896,9 @@ fn write_world(output: &mut Connection, snapshot: WorldSnapshot<'_, '_>) -> Resu
             params![cell.to_sql_i64(), land.to_sql_i64()],
         )?;
     }
+    if mode == super::inhouse::RecordBundleMode::Full {
+        write_native_lock_keys(&tx, conversion)?;
+    }
     super::insert_plugins(&tx, paths)?;
     if let Some(read) = typed {
         records::history::write_native_tables(&tx, read, &identity, paths, schemas)?;
@@ -840,6 +911,52 @@ fn write_world(output: &mut Connection, snapshot: WorldSnapshot<'_, '_>) -> Resu
     )?;
     tx.commit()?;
     Ok(projection_warnings)
+}
+
+/// XLOC remains an opaque byte field; its established lock-key projection needs
+/// the supplying plugin's authenticated native context rather than CPU indices.
+fn write_native_lock_keys(tx: &Transaction<'_>, conversion: &FormKeyConversion) -> Result<()> {
+    let skyrim = conversion.order.table().id("Skyrim.esm");
+    let mut update =
+        tx.prepare_cached("UPDATE reference_details SET lock_key_id=?1 WHERE reference_id=?2")?;
+    for (&owner, record) in &conversion.records {
+        let Some((ordinal, (_, bytes))) = record
+            .canonical_record()
+            .subrecords
+            .iter()
+            .enumerate()
+            .find(|(_, (signature, _))| signature == b"XLOC")
+        else {
+            continue;
+        };
+        if record
+            .runtime_omitted
+            .contains(&record.source_ordinal(ordinal)?)
+        {
+            continue;
+        }
+        let key = bytes
+            .get(4..8)
+            .and_then(|word| {
+                conversion
+                    .order
+                    .resolve(
+                        record.source.load_order as usize,
+                        u32::from_le_bytes(word.try_into().expect("four-byte lock key")),
+                        shared::source_form_id::ZeroPolicy::Null,
+                    )
+                    .ok()
+                    .flatten()
+            })
+            .filter(|key| {
+                conversion.records.get(key).map_or(
+                    Some(key.plugin()) == skyrim && key.local() < 0x800,
+                    |target| !target.source.is_deleted() && target.source.record_type == *b"KEYM",
+                )
+            });
+        update.execute(params![key.map(FormKey::to_sql_i64), owner.to_sql_i64()])?;
+    }
+    Ok(())
 }
 
 /// These diagnostic projections deliberately use zero when their target is unavailable.

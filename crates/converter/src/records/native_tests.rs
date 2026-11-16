@@ -206,10 +206,10 @@ fn native_broken_items_recover_locally_and_persist_loss_diagnostics() {
         result
             .warnings()
             .iter()
-            .any(|warning| warning.contains("Broken.esp"))
+            .any(|warning| warning.contains("broken.esp"))
     );
-    assert!(result.diagnostics["Broken.esp"].skipped_records >= 1);
-    assert!(result.diagnostics["Broken.esp"].invalid_links >= 1);
+    assert!(result.diagnostics["broken.esp"].skipped_records >= 1);
+    assert!(result.diagnostics["broken.esp"].invalid_links >= 1);
 }
 
 /// A catalogue-rejected deferred override exposes its predecessor unless a tombstone intervened.
@@ -256,9 +256,346 @@ fn native_deferred_replay_retains_predecessors_and_respects_deletion_barriers() 
             result
                 .warnings()
                 .iter()
-                .any(|warning| warning.contains("Patch.esp"))
+                .any(|warning| warning.contains("patch.esp"))
         );
+        let failed = result
+            .history
+            .iter()
+            .find(|entry| entry.supplier == 2 && entry.signature == *b"TEST")
+            .unwrap();
+        assert!(!failed.accepted);
+        let reason = failed.reason.as_deref().unwrap();
+        assert!(reason.contains("deferred"), "{reason}");
+        assert!(reason.contains("form_id"), "{reason}");
     }
+}
+
+/// A failed root omits canonical fields while original bytes and neighboring sites stay exact.
+#[test]
+fn native_deferred_first_definition_preserves_safe_fields_source_and_live_sites() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = plugin(
+        root.path(),
+        "Owner.esm",
+        &[],
+        0,
+        &record(b"FACT", 0x880, 0, &sub(b"EDID", b"RankOwner\0")),
+    );
+    let gap = plugin(root.path(), "Gap.esm", &[], 0, &[]);
+    let rank = [0x880u32.to_le_bytes(), 0x1379_2468u32.to_le_bytes()].concat();
+    let payload = [
+        sub(b"EDID", b"RetainedFirstDefinition\0"),
+        sub(b"LINK", &0x880u32.to_le_bytes()),
+        sub(b"COED", &rank),
+        sub(b"ZRAW", &[0xA7, 0x31, 0xFF, 0x00, 0x58]),
+        sub(b"LINK", &0xFF00_9999u32.to_le_bytes()),
+    ]
+    .concat();
+    let broken = plugin(
+        root.path(),
+        "Broken.esp",
+        &["Owner.esm"],
+        0,
+        &[
+            record(b"TEST", 0x0100_0811, 0, &payload),
+            record(b"STAT", 0x0100_0812, 0, &sub(b"EDID", b"Neighbor\0")),
+        ]
+        .concat(),
+    );
+    let paths = [owner, gap, broken];
+    let order = FormKeyOrder::read(&paths).unwrap();
+    let result = read_plugins_form_keys(&paths, &order, &schemas()).unwrap();
+    let key = order
+        .resolve(2, 0x0100_0811, ZeroPolicy::Null)
+        .unwrap()
+        .unwrap();
+    let owner = order.resolve(2, 0x880, ZeroPolicy::Null).unwrap().unwrap();
+    let neighbor = order
+        .resolve(2, 0x0100_0812, ZeroPolicy::Null)
+        .unwrap()
+        .unwrap();
+    let retained = &result.records[&key];
+    assert!(result.records.contains_key(&neighbor));
+    assert_eq!(retained.source.form_id, 0x0100_0811);
+    assert_eq!(retained.source.load_order, 2);
+    assert_eq!(
+        retained.source.subrecords,
+        decoder::native_source_fields(&payload)
+    );
+    assert_eq!(retained.decoded.raw_payload, payload);
+    assert_eq!(retained.canonical_ordinals, [0, 1, 3, 4]);
+    assert_eq!(
+        retained
+            .canonical
+            .subrecords
+            .iter()
+            .map(|(tag, _)| tag.as_slice())
+            .collect::<Vec<_>>(),
+        [b"EDID".as_slice(), b"LINK", b"ZRAW", b"LINK"]
+    );
+    assert_eq!(
+        retained.canonical.subrecords[2].1,
+        [0xA7, 0x31, 0xFF, 0x00, 0x58]
+    );
+    assert_eq!(
+        retained
+            .links
+            .iter()
+            .map(|site| (site.subrecord, site.source_word, site.key, site.outcome))
+            .collect::<Vec<_>>(),
+        [
+            (1, 0x880, Some(owner), LinkOutcome::Resolved),
+            (4, 0xFF00_9999, None, LinkOutcome::Cleared)
+        ]
+    );
+    assert!(!decoder::record_contains_deferred(&retained.decoded));
+    assert_eq!(retained.decoded.rejected_fields, [*b"COED"]);
+    let diagnostic = &result.diagnostics["broken.esp"];
+    assert_eq!(
+        (
+            diagnostic.skipped_records,
+            diagnostic.skipped_fields,
+            diagnostic.invalid_links,
+            diagnostic.compatibility_headers
+        ),
+        (0, 1, 1, 0)
+    );
+    let history = result
+        .history
+        .iter()
+        .find(|entry| entry.supplier == 2 && entry.source_word == 0x0100_0811)
+        .unwrap();
+    assert!(history.accepted);
+    let reason = history.reason.as_deref().unwrap();
+    assert!(
+        reason.contains("deferred recovery omitted COED[source:2]"),
+        "{reason}"
+    );
+    assert!(reason.contains("i32"), "{reason}");
+    let mut typed = Vec::new();
+    retained
+        .write_typed(&mut typed, key, order.table(), &BTreeMap::new())
+        .unwrap();
+    let typed = String::from_utf8(typed).unwrap();
+    assert!(!typed.contains("Deferred"));
+    assert!(typed.contains("RetainedFirstDefinition"));
+}
+
+/// Rejection of one repeated deferred root cannot erase an independently valid same-tag root.
+#[test]
+fn native_deferred_recovery_keeps_independent_same_tag_root_and_physical_sites() {
+    let schemas = RuntimeSchemas::from_addon_bytes(&[br#"{
+        "version":1,"name":"selective-deferred-probe","records":[
+            {"signature":"PRUF","allow_unordered":true,"fields":[
+                {"signature":"EDID","name":"editor_id","kind":"zstring"},
+                {"signature":"COED","name":"ownership","kind":"struct","size":8,
+                 "repeat":true,"reject_record_on_error":true,"members":[
+                    {"name":"owner","kind":"form_id","offset":0,"targets":["NPC_","FACT"]},
+                    {"name":"dependent","kind":"union","offset":4,"size":4,
+                     "decider":"inventory_owner_condition","fields":[
+                        {"name":"unused","kind":"bytes","size":4},
+                        {"name":"global","kind":"form_id","targets":["GLOB"]}
+                     ]}
+                 ]}
+            ]}
+        ]
+    }"#])
+    .unwrap();
+    for bad_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let owner = plugin(
+            root.path(),
+            "Owner.esm",
+            &[],
+            0,
+            &[
+                record(b"FACT", 0x880, 0, &sub(b"EDID", b"UnsupportedRankOwner\0")),
+                record(b"NPC_", 0x881, 0, &sub(b"EDID", b"SupportedGlobalOwner\0")),
+                record(b"GLOB", 0x882, 0, &sub(b"EDID", b"IndependentGlobal\0")),
+            ]
+            .concat(),
+        );
+        let gap = plugin(root.path(), "Gap.esm", &[], 0, &[]);
+        let bad = [0x880u32.to_le_bytes(), 0x1379_2468u32.to_le_bytes()].concat();
+        let good = [0x881u32.to_le_bytes(), 0x882u32.to_le_bytes()].concat();
+        let opaque = [0x81, 0x88, 0x00, 0x00, 0x82, 0x88, 0x00, 0x00, 0xA7];
+        let payload = [
+            sub(b"EDID", b"IndependentDeferredRoots\0"),
+            sub(b"COED", if bad_first { &bad } else { &good }),
+            sub(b"ZRAW", &opaque),
+            sub(b"COED", if bad_first { &good } else { &bad }),
+        ]
+        .concat();
+        let path = plugin(
+            root.path(),
+            "Patch.esp",
+            &["Owner.esm"],
+            0,
+            &record(b"PRUF", 0x0100_0811, 0, &payload),
+        );
+        let paths = [owner, gap, path];
+        let order = FormKeyOrder::read(&paths).unwrap();
+        let result = read_plugins_form_keys(&paths, &order, &schemas).unwrap();
+        let key = order
+            .resolve(2, 0x0100_0811, ZeroPolicy::Null)
+            .unwrap()
+            .unwrap();
+        let owner = order.resolve(2, 0x881, ZeroPolicy::Null).unwrap().unwrap();
+        let global = order.resolve(2, 0x882, ZeroPolicy::Null).unwrap().unwrap();
+        let good_position = if bad_first { 3 } else { 1 };
+        let bad_position = if bad_first { 1 } else { 3 };
+        let retained = &result.records[&key];
+        assert_eq!(
+            retained.source.subrecords,
+            decoder::native_source_fields(&payload)
+        );
+        assert_eq!(retained.decoded.raw_payload, payload);
+        assert_eq!(
+            retained.canonical_ordinals,
+            if bad_first {
+                vec![0, 2, 3]
+            } else {
+                vec![0, 1, 2]
+            }
+        );
+        let good_index = retained
+            .canonical_ordinals
+            .iter()
+            .position(|&position| position == good_position)
+            .unwrap();
+        assert_eq!(
+            retained.canonical.subrecords[good_index],
+            (b"COED".to_vec(), good)
+        );
+        assert_eq!(
+            retained.decoded.fields[good_index].value,
+            Value::Struct(vec![
+                (
+                    "owner".into(),
+                    Value::NativeFormKey(order.table().named(owner).unwrap())
+                ),
+                (
+                    "dependent".into(),
+                    Value::NativeFormKey(order.table().named(global).unwrap())
+                ),
+            ])
+        );
+        let opaque_index = retained
+            .canonical_ordinals
+            .iter()
+            .position(|&position| position == 2)
+            .unwrap();
+        assert_eq!(
+            retained.canonical.subrecords[opaque_index],
+            (b"ZRAW".to_vec(), opaque.to_vec())
+        );
+        assert_eq!(
+            retained
+                .links
+                .iter()
+                .map(|site| (
+                    site.subrecord,
+                    site.byte_offset,
+                    site.source_word,
+                    site.key,
+                    site.outcome
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (good_position, 0, 0x881, Some(owner), LinkOutcome::Resolved),
+                (good_position, 4, 0x882, Some(global), LinkOutcome::Resolved),
+            ]
+        );
+        assert!(!decoder::record_contains_deferred(&retained.decoded));
+        let diagnostics = &result.diagnostics["patch.esp"];
+        assert_eq!(
+            (
+                diagnostics.skipped_records,
+                diagnostics.skipped_fields,
+                diagnostics.invalid_links
+            ),
+            (0, 1, 0)
+        );
+        let history = result
+            .history
+            .iter()
+            .find(|entry| entry.supplier == 2 && entry.source_word == 0x0100_0811)
+            .unwrap();
+        assert!(history.accepted);
+        let reason = history.reason.as_deref().unwrap();
+        assert!(
+            reason.contains(&format!(
+                "deferred recovery omitted COED[source:{bad_position}]"
+            )),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(&format!("COED[source:{good_position}]")),
+            "{reason}"
+        );
+        let mut typed = Vec::new();
+        retained
+            .write_typed(&mut typed, key, order.table(), &BTreeMap::new())
+            .unwrap();
+        let typed = String::from_utf8(typed).unwrap();
+        assert!(!typed.contains("Deferred"));
+        assert!(typed.contains(&order.table().named(owner).unwrap().to_string()));
+        assert!(typed.contains(&order.table().named(global).unwrap().to_string()));
+    }
+}
+
+/// GMST's EditorID convention and body-link clearing are separate from header compatibility.
+#[test]
+fn native_compatibility_counts_only_non_gmst_headers() {
+    let root = tempfile::tempdir().unwrap();
+    let body = [
+        record(
+            b"STAT",
+            0x0700_0811,
+            0,
+            &sub(b"EDID", b"CompatibleHeader\0"),
+        ),
+        record(b"STAT", 0x812, 0, &sub(b"EDID", b"Target\0")),
+        record(
+            b"TEST",
+            0x814,
+            0,
+            &sub(b"LINK", &0x0800_0812u32.to_le_bytes()),
+        ),
+        record(
+            b"GMST",
+            0x0600_0813,
+            0,
+            &[
+                sub(b"EDID", b"fNativeConvention\0"),
+                sub(b"DATA", &3.75f32.to_le_bytes()),
+            ]
+            .concat(),
+        ),
+    ]
+    .concat();
+    let paths = [plugin(root.path(), "Scope.esm", &[], 0, &body)];
+    let order = FormKeyOrder::read(&paths).unwrap();
+    let result = read_plugins_form_keys(&paths, &order, &schemas()).unwrap();
+    assert_eq!(result.records.len(), 4);
+    let diagnostic = &result.diagnostics["scope.esm"];
+    assert_eq!(diagnostic.compatibility_headers, 1);
+    assert!(diagnostic.first_by_category["compatibility"].contains("07000811"));
+    assert_eq!(
+        result
+            .notices()
+            .iter()
+            .filter(|notice| notice.contains("supplier-self runtime compatibility"))
+            .count(),
+        1
+    );
+    let gmst = result
+        .history
+        .iter()
+        .find(|entry| entry.signature == *b"GMST")
+        .unwrap();
+    assert!(gmst.accepted);
+    assert_eq!(gmst.source_word, 0x0600_0813);
 }
 
 /// Native low and wide light locals never pass through a legacy width/header check.
@@ -552,6 +889,87 @@ fn native_typed_storage_retains_255_full_and_4097_light_owners() {
         .unwrap();
     let portable: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(portable["form_id"], "000ABC:Light4096.esl");
+}
+
+/// Lazy typed history remains available when its owner has no legacy full-plugin slot.
+#[test]
+fn native_named_history_decodes_beyond_full_slot_limit_and_guards_source_hash() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("Data");
+    fs::create_dir(&data).unwrap();
+    let mut names = String::new();
+    let mut last = PathBuf::new();
+    for index in 0..255 {
+        let name = format!("Full{index:04}.esm");
+        let body = if index == 254 {
+            [
+                record(b"KYWD", 0x831, 0, &sub(b"EDID", b"NativeTarget\0")),
+                record(
+                    b"FLST",
+                    0x832,
+                    0,
+                    &[
+                        sub(b"EDID", b"NativeHistory\0"),
+                        sub(b"LNAM", &0x831u32.to_le_bytes()),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat()
+        } else {
+            Vec::new()
+        };
+        last = plugin(&data, &name, &[], 0, &body);
+        names.push_str(&format!("*{name}\n"));
+    }
+    let list = root.path().join("plugins.txt");
+    fs::write(&list, names).unwrap();
+    let pack = root.path().join("pack");
+    crate::esm::inhouse::export_record_bundle_typed(&data, &list, &pack, &[*b"FLST"]).unwrap();
+    let named = "000832:Full0254.esm".parse().unwrap();
+    let conn = rusqlite::Connection::open(pack.join("skyrim_world.db")).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&conn).unwrap();
+    let key = identity.table().intern(&named).unwrap().unwrap();
+    assert!(
+        identity.runtime_id(key).is_err(),
+        "this proof requires an unrepresentable owner"
+    );
+    drop(conn);
+    let report = crate::records::history::read_named_history(&pack, Some(&data), &named).unwrap();
+    assert_eq!(report.form_id.to_string(), "000832:Full0254.esm");
+    assert_eq!(report.versions.len(), 1);
+    let version = &report.versions[0];
+    assert_eq!(version["decode_status"], "decoded", "{report:?}");
+    assert_eq!(version["record"]["form_id"], "000832:Full0254.esm");
+    let link = version["record"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["signature"] == serde_json::json!([76, 78, 65, 77]))
+        .unwrap();
+    assert!(
+        serde_json::to_string(&link["value"])
+            .unwrap()
+            .contains("000831:Full0254.esm")
+    );
+    assert_eq!(
+        link["canonical_bytes"],
+        serde_json::json!(0x831u32.to_le_bytes())
+    );
+    assert_eq!(version["diagnostics"]["invalid_links"], 0);
+    let mut changed = fs::read(&last).unwrap();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(&last, changed).unwrap();
+    let refused = crate::records::history::read_named_history(&pack, Some(&data), &named).unwrap();
+    assert_eq!(refused.versions.len(), 1);
+    assert_eq!(refused.versions[0]["decode_status"], "undecodable");
+    assert!(
+        refused.versions[0]["decode_reason"]
+            .as_str()
+            .unwrap()
+            .contains("source changed")
+    );
+    assert!(refused.versions[0]["record"].is_null());
 }
 
 #[test]

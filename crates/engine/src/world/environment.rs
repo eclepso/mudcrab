@@ -407,8 +407,8 @@ fn read_weathers(connection: &Connection) -> HashMap<u32, Weather> {
     let mut weathers = read(
         connection,
         "SELECT runtime_id_or_null(id), editor_id, fog_day_near, fog_day_far, fog_night_near, fog_night_far, \
-         fog_day_power, fog_night_power, fog_day_max, fog_night_max, image_space_sunrise_id, \
-         image_space_day_id, image_space_sunset_id, image_space_night_id FROM weathers",
+         fog_day_power, fog_night_power, fog_day_max, fog_night_max, runtime_id_or_null(image_space_sunrise_id), \
+         runtime_id_or_null(image_space_day_id), runtime_id_or_null(image_space_sunset_id), runtime_id_or_null(image_space_night_id) FROM weathers",
         "weathers",
         |row| {
             Ok((
@@ -496,7 +496,14 @@ fn read_rows<T>(
             "lighting_template_id",
             "music_id",
         ],
-        "lighting_templates" | "image_spaces" | "weathers" => &["id"],
+        "lighting_templates" | "image_spaces" => &["id"],
+        "weathers" => &[
+            "id",
+            "image_space_sunrise_id",
+            "image_space_day_id",
+            "image_space_sunset_id",
+            "image_space_night_id",
+        ],
         "climate_weathers" => &["climate_id", "weather_id", "chance_global_id"],
         "weather_colors" | "weather_directional_ambient" => &["weather_id"],
         _ => &[],
@@ -692,6 +699,35 @@ mod tests {
                 cases[index].0
             );
         }
+    }
+
+    /// Every weather slot exposes a checked runtime handle, independently of allocation order.
+    #[test]
+    fn native_weather_image_space_slots_translate_each_owner_independently() {
+        let connection = Connection::open_in_memory().unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+        let identity = crate::world::test_support::install_projection(&connection);
+        let requested = [0x0100_1234u32, 0x0700_0801, 0x5000];
+        assert_ne!(
+            crate::world::test_support::key(&identity, requested[0]),
+            i64::from(requested[0]),
+            "the first slot must distinguish allocation from runtime owner order"
+        );
+        connection.execute(
+            "INSERT INTO weathers(id,image_space_sunrise_id,image_space_day_id,image_space_sunset_id,image_space_night_id)
+             VALUES(stored_key(?1),stored_key(?2),stored_key(?3),stored_key(?4),NULL)",
+            rusqlite::params![0x81au32, requested[0], requested[1], requested[2]],
+        ).unwrap();
+        let catalog = EnvironmentCatalog::from_connection(&connection);
+        assert_eq!(
+            catalog.weather(0x81a).unwrap().image_spaces,
+            [
+                Some(requested[0]),
+                Some(requested[1]),
+                Some(requested[2]),
+                None
+            ]
+        );
     }
 
     /// The tables exactly as the converter creates them, read back through the catalog.

@@ -395,12 +395,16 @@ mod tests {
     fn authored_image_space_preserves_asymmetric_values_and_winner_identity() {
         let (directory, connection) = database();
         insert(&connection, 100, "IMGS", 7, fields());
+        let identity = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
         connection
-            .execute("INSERT INTO formid_map VALUES(100,'Origin.esm')", [])
+            .execute(
+                "INSERT INTO formid_map VALUES(?1,'Origin.esm')",
+                [crate::world::test_support::key(&identity, 100)],
+            )
             .unwrap();
         // Unsupported unrelated records must not prevent a selected record loading.
         connection
-            .execute("INSERT INTO records VALUES(999,'IMGS',7,x'ffff')", [])
+            .execute("INSERT INTO records(form_id,record_type,load_order,data) VALUES(?1,'IMGS',7,x'ffff')", [crate::world::test_support::key(&identity, 999)])
             .unwrap();
         let loaded = load_image_space(
             &directory.path().join("world.db"),

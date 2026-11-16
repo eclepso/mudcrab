@@ -46,7 +46,7 @@ async fn both_readers_publish_paired_terrain_with_exact_physical_link_oracles() 
         assert_eq!(land.source_header, 0x0100_0800);
         assert_eq!(land.source_cell, Some(0x0100_0700));
         assert_eq!(land.source_world, Some(0x0100_0600));
-        for source_ordinal in [1, 3, 5] {
+        for source_ordinal in [2, 4, 6] {
             let ordinal = land
                 .source_ordinals
                 .iter()
@@ -55,19 +55,19 @@ async fn both_readers_publish_paired_terrain_with_exact_physical_link_oracles() 
             assert_eq!(&land.subrecords[ordinal].data[..4], &0x855u32.to_le_bytes());
             assert_eq!(land.resolve_at(ordinal, 0).unwrap(), Some(key(0x0100_0855)));
         }
-        let opaque:i64=database.query_row("SELECT count(*) FROM resolved_links WHERE record_key=50333696 AND source_ordinal=2",[],|row|row.get(0)).unwrap();
+        let opaque:i64=database.query_row("SELECT count(*) FROM resolved_links WHERE record_key=50333696 AND source_ordinal=3",[],|row|row.get(0)).unwrap();
         assert_eq!(
             opaque, 0,
             "equal bytes in opaque ZZZZ must not create a recognized link site"
         );
-        let outcomes:Vec<(usize,u32,Option<i64>,String)>=database.prepare("SELECT source_ordinal,source_word,target_key,outcome FROM resolved_links WHERE record_key=50333696 AND source_ordinal IN (5,7,9) ORDER BY source_ordinal").unwrap()
+        let outcomes:Vec<(usize,u32,Option<i64>,String)>=database.prepare("SELECT source_ordinal,source_word,target_key,outcome FROM resolved_links WHERE record_key=50333696 AND source_ordinal IN (6,8,10) ORDER BY source_ordinal").unwrap()
             .query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(
             outcomes,
             vec![
-                (5, 0x855, Some(0x0100_0855), "resolved".into()),
-                (7, 0, None, "null".into()),
-                (9, 0x999, None, "cleared".into())
+                (6, 0x855, Some(0x0100_0855), "resolved".into()),
+                (8, 0, None, "null".into()),
+                (10, 0x999, None, "cleared".into())
             ]
         );
         let neighbor = context.record(key(0x0300_0801)).unwrap();

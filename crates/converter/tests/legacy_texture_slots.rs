@@ -507,7 +507,7 @@ async fn rv_c_damaged_optional_txst_flags_preserve_neighbors_and_publish() {
             assert_eq!(damaged["skipped_records"], 0);
             assert_eq!(damaged["skipped_fields"], 1);
             let example = damaged["first_by_category"]["field"].as_str().unwrap();
-            for expected in ["TXST", "020008D1", "DNAM"] {
+            for expected in ["TXST", "010008D1", "DNAM"] {
                 assert!(
                     example.contains(expected),
                     "missing skipped-field identity: {example}",

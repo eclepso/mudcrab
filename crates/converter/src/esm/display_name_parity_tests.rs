@@ -148,7 +148,7 @@ type Names = Vec<(String, i64, Option<String>)>;
 
 /// Rename.esp allocates owner1 and Skyrim.esm owner2, despite Skyrim supplying first.
 fn stored(local: u32) -> i64 {
-    0x0000_0002_0000_0000 | i64::from(local)
+    0x0000_0000_0200_0000 | i64::from(local)
 }
 
 /// Every display-name column, and the `FULL` bytes each reader stored in `records.data`.

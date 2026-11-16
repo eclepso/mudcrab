@@ -184,7 +184,7 @@ type Placed = (i64, i64, Option<String>, Option<String>);
 
 /// Fresh single-plugin allocation gives Skyrim.esm owner1; source words remain four bytes.
 fn stored(local: u32) -> i64 {
-    0x0000_0001_0000_0000 | i64::from(local)
+    0x0000_0000_0100_0000 | i64::from(local)
 }
 
 /// Every reference with its base's `statics` row, as the engine's `LEFT JOIN statics` sees it.

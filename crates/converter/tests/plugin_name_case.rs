@@ -64,11 +64,24 @@ fn fixture_with_spelling(root: &Path, owner_bytes: &[u8]) -> (PathBuf, PathBuf, 
         &frame(b"STAT", 0x1800, &sub(b"EDID", b"original\0")),
     );
     let mut patch_records = frame(b"STAT", 0x1800, &sub(b"EDID", b"override\0"));
-    patch_records.extend(frame(
+    patch_records.extend(frame(b"CELL", 0x0100_1802, &sub(b"DATA", &[1, 0])));
+    let reference = frame(
         b"REFR",
         0x0100_1801,
         &sub(b"NAME", &0x1800u32.to_le_bytes()),
-    ));
+    );
+    // A projected reference has a genuine authored parent rather than a fabricated null cell.
+    patch_records.extend(
+        [
+            b"GRUP".as_slice(),
+            &(reference.len() as u32 + 24).to_le_bytes(),
+            &0x0100_1802u32.to_le_bytes(),
+            &6u32.to_le_bytes(),
+            &[0; 8],
+            &reference,
+        ]
+        .concat(),
+    );
     let patch = plugin(&data, "Patch.esp", &[owner_bytes], &patch_records);
     let list = root.join("plugins.txt");
     let mut listed = b"*Leading.esm\n*".to_vec();

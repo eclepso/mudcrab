@@ -588,13 +588,16 @@ async fn readable_missing_id_and_failed_description_bank_keep_both_severities() 
         );
         let db = Connection::open(output.join("skyrim_world.db")).unwrap();
         type TextProvenance = (u32, String, String, u32, Option<String>, String);
-        let provenance: Vec<TextProvenance> = db
+        let mut provenance: Vec<TextProvenance> = db
             .prepare("SELECT form_id,signature,string_table,string_id,resolved_text,status FROM inhouse_localized_fields ORDER BY form_id,signature")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
+        for row in &mut provenance {
+            row.0 = common::runtime_id(&db, i64::from(row.0));
+        }
         assert_eq!(
             provenance,
             [

@@ -1,4 +1,6 @@
 //! Asset-only publications and their resumes obey the same native generation contract.
+mod common;
+
 use converter::{AssetPipeline, PipelineConfig, TextureEncoder, config::RecordReader};
 use std::{fs, path::Path};
 
@@ -70,6 +72,7 @@ async fn asset_only_world(reader: RecordReader) {
     validate();
     let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
     copy_current(&output, &staging);
+    common::current_staging_generation(&staging);
     config.resume_staging = Some(staging);
     publish(config).await;
     validate();

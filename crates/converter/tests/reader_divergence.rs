@@ -313,7 +313,7 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
     eprintln!("{}", converter::reader_diff::summary(&report));
 
     // Both current producers preserve original CP1252 bytes and record decoded text separately.
-    assert!(any_field_keys(&report, "STAT EDID").is_empty());
+    assert!(!any_field_keys(&report, "STAT EDID").contains(&id(TEXT)));
     for path in [
         root.path().join("legacy.db"),
         root.path().join("inhouse/skyrim_world.db"),

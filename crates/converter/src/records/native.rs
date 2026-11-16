@@ -119,13 +119,14 @@ pub(crate) struct DecodeContext<'a> {
     pub source_ids: &'a HashSet<FormKey>,
     pub kinds: Option<&'a HashMap<FormKey, [u8; 4]>>,
     span: Cell<FieldSpan>,
+    failed_root: Cell<Option<usize>>,
     links: RefCell<Vec<ResolvedLink>>,
     origins: RefCell<Vec<usize>>,
 }
 
 impl<'a> DecodeContext<'a> {
     /// Begin one native decode without allocating any runtime identifiers.
-    fn new(
+    pub(crate) fn new(
         order: &'a FormKeyOrder,
         supplier: usize,
         source_ids: &'a HashSet<FormKey>,
@@ -137,6 +138,7 @@ impl<'a> DecodeContext<'a> {
             source_ids,
             kinds,
             span: Cell::new(FieldSpan::default()),
+            failed_root: Cell::new(None),
             links: RefCell::new(Vec::new()),
             origins: RefCell::new(Vec::new()),
         }
@@ -162,6 +164,11 @@ impl<'a> DecodeContext<'a> {
             ordinal,
             signature,
         });
+    }
+
+    /// A mandatory root failure keeps an exact occurrence, independent of nested diagnostic paths.
+    pub(super) fn reject_root(&self, ordinal: usize) {
+        self.failed_root.set(Some(ordinal));
     }
 
     /// Drop captures from rejected occurrences and map surviving canonical fields explicitly.
@@ -286,16 +293,45 @@ struct ReadContext<'a> {
     source_ids: &'a HashSet<FormKey>,
 }
 
+/// Catalogue replay can reject canonical roots without rewriting their physical source bytes.
+#[derive(Clone, Copy, Default)]
+struct ReplayContext<'a> {
+    kinds: Option<&'a HashMap<FormKey, [u8; 4]>>,
+    omitted: &'a [usize],
+}
+
+/// Candidate failure may identify a physical deferred root that can be omitted locally.
+#[derive(Debug, Clone)]
+struct CandidateFailure {
+    reason: String,
+    failed_root: Option<usize>,
+}
+
+impl From<String> for CandidateFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            failed_root: None,
+        }
+    }
+}
+
+impl std::fmt::Display for CandidateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
 /// Decode source bytes and typed values using one prepared schema and native catalogue.
 fn decode_candidate(
     scanned: scanner::ScannedRecord,
     supplier: usize,
     localized: bool,
     read: &ReadContext<'_>,
-    kinds: Option<&HashMap<FormKey, [u8; 4]>>,
+    replay: ReplayContext<'_>,
     diagnostics: &mut PluginDiagnostics,
     editor_id: &mut Option<String>,
-) -> std::result::Result<NativeRecord, String> {
+) -> std::result::Result<NativeRecord, CandidateFailure> {
     let source = RawRecord {
         form_id: scanned.source_form_id,
         record_type: scanned.record_type,
@@ -305,7 +341,7 @@ fn decode_candidate(
         worldspace_form_id: scanned.worldspace_form_id,
         load_order: supplier as u32,
     };
-    let capture = DecodeContext::new(read.order, supplier, read.source_ids, kinds);
+    let capture = DecodeContext::new(read.order, supplier, read.source_ids, replay.kinds);
     let marker = HashMap::new();
     let context = decoder::Context {
         order: None,
@@ -313,17 +349,29 @@ fn decode_candidate(
         plugin_index: supplier,
         localized,
         source_ids: None,
-        winning_types: kinds.map(|_| &marker),
+        winning_types: replay.kinds.map(|_| &marker),
     };
     // Localization is represented by original string IDs here; publication supplies resolved text.
-    let decoded = decoder::decode_with_identity(
+    let decoded = decoder::decode_with_identity_omitting(
         scanned,
         read.schemas.schema(),
         read.prepared,
         &context,
         diagnostics,
         &mut |name| *editor_id = Some(name.to_ascii_lowercase()),
-    )?;
+        replay.omitted,
+    )
+    .map_err(|reason| CandidateFailure {
+        reason,
+        failed_root: capture.failed_root.get(),
+    })?;
+    if replay.kinds.is_some() && decoder::record_contains_deferred(&decoded) {
+        return Err(
+            "native catalogue replay retained unresolved deferred values"
+                .to_owned()
+                .into(),
+        );
+    }
     let canonical = decoded.to_raw_record();
     let cell = source
         .cell_form_id
@@ -375,6 +423,24 @@ fn scanned_again(record: &NativeRecord) -> scanner::ScannedRecord {
 struct Candidate {
     record: NativeRecord,
     diagnostics: PluginDiagnostics,
+    deferred: Vec<usize>,
+    omitted: Vec<usize>,
+}
+
+/// Change only the physical occurrence admitted or rejected by catalogue replay.
+fn set_replay_history(
+    result: &mut NativeReadResult,
+    record: &NativeRecord,
+    accepted: bool,
+    reason: String,
+) {
+    if let Some(entry) = result.history.iter_mut().find(|entry| {
+        entry.supplier == record.source.load_order as usize
+            && entry.source_offset == record.decoded.source_record_offset
+    }) {
+        entry.accepted = accepted;
+        entry.reason = Some(reason);
+    }
 }
 
 /// Decode and merge cap-free native typed identities using the production schema.
@@ -484,7 +550,7 @@ pub fn read_plugins_form_keys_with_validation(
                     supplier,
                     localized_plugins[supplier],
                     &read,
-                    None,
+                    ReplayContext::default(),
                     &mut diagnostics,
                     &mut observed_editor,
                 )
@@ -508,9 +574,9 @@ pub fn read_plugins_form_keys_with_validation(
                 let mut record = match decoded {
                     Ok(record) => record,
                     Err(error) => {
-                        diagnostics.note("record", || error.clone());
+                        diagnostics.note("record", || error.reason.clone());
                         if let Some(last) = history.borrow_mut().last_mut() {
-                            last.reason = Some(error);
+                            last.reason = Some(error.reason);
                         }
                         merge_diagnostics(global, &diagnostics);
                         return;
@@ -529,7 +595,9 @@ pub fn read_plugins_form_keys_with_validation(
                 let deleted = record.source.is_deleted();
                 let mut gmst_update = None;
                 let mut gmst_alias_update = None;
+                let mut identity_failure = "record has a null or unusable native identity";
                 if record.source.record_type == *b"GMST" {
+                    identity_failure = "GMST has no usable native identity or EditorID";
                     let editor = record
                         .decoded
                         .fields
@@ -559,6 +627,7 @@ pub fn read_plugins_form_keys_with_validation(
                                     .is_some_and(|old| old.record.source.record_type != *b"GMST")
                             {
                                 key = None;
+                                identity_failure = "GMST has a colliding identity";
                             } else {
                                 gmst_alias_update = Some((source, canonical));
                             }
@@ -568,17 +637,19 @@ pub fn read_plugins_form_keys_with_validation(
                         }
                     } else if deleted {
                         key = native_key.and_then(|key| gmst_aliases.get(&key).copied());
+                        identity_failure = "deleted GMST has no known identity";
                     } else {
                         key = None;
                     }
                 } else if native_key.is_some_and(|key| gmst_aliases.contains_key(&key)) {
                     key = None;
+                    identity_failure = "record has a colliding identity";
                 }
                 let duplicate_key = native_key.or(key);
                 let reason = match key {
-                    None => Some("record has a null, colliding or unusable native identity"),
+                    None => Some(identity_failure),
                     Some(_) if duplicate_key.is_some_and(|key| seen.contains(&key)) => {
-                        Some("duplicate native record candidate in one supplier")
+                        Some("duplicate/colliding native record candidate in one supplier")
                     }
                     Some(key)
                         if !deleted
@@ -626,6 +697,7 @@ pub fn read_plugins_form_keys_with_validation(
                     // Native semantic identities never overwrite the original header word.
                     record.canonical.form_id = raw;
                     let pending = decoder::record_contains_deferred(&record.decoded);
+                    let deferred = decoder::deferred_source_positions(&record.decoded);
                     let chain = candidates.entry(key).or_default();
                     if !pending {
                         for previous in chain.drain(..) {
@@ -635,6 +707,8 @@ pub fn read_plugins_form_keys_with_validation(
                     chain.push(Candidate {
                         record,
                         diagnostics,
+                        deferred,
+                        omitted: Vec::new(),
                     });
                 }
             },
@@ -654,7 +728,13 @@ pub fn read_plugins_form_keys_with_validation(
             })
             .collect();
         let mut rejected = false;
-        for (key, chain) in &mut candidates {
+        let mut keys: Vec<_> = candidates.keys().copied().collect();
+        keys.sort_unstable();
+        'keys: for key in keys {
+            let chain = candidates
+                .get_mut(&key)
+                .expect("catalogued candidate chain");
+            let first_definition = chain.len() == 1;
             let Some(candidate) = chain.last_mut() else {
                 continue;
             };
@@ -666,7 +746,10 @@ pub fn read_plugins_form_keys_with_validation(
                 supplier,
                 candidate.record.localized,
                 &read,
-                Some(&kinds),
+                ReplayContext {
+                    kinds: Some(&kinds),
+                    omitted: &candidate.omitted,
+                },
                 &mut diagnostics,
                 &mut observed_editor,
             )
@@ -679,9 +762,86 @@ pub fn read_plugins_form_keys_with_validation(
                     candidate.diagnostics = diagnostics;
                 }
                 Err(error) => {
-                    diagnostics.note("record", || {
+                    let deferred = !candidate.deferred.is_empty();
+                    let mut reason = if deferred {
+                        format!("deferred native catalogue replay rejected {key:?}: {error}")
+                    } else {
                         format!("native catalogue replay rejected {key:?}: {error}")
-                    });
+                    };
+                    if first_definition && deferred {
+                        let mut omitted = candidate.omitted.clone();
+                        let mut failure = error;
+                        while let Some(position) = failure.failed_root.filter(|position| {
+                            candidate.deferred.contains(position) && !omitted.contains(position)
+                        }) {
+                            omitted.push(position);
+                            omitted.sort_unstable();
+                            let mut recovered_diagnostics = PluginDiagnostics::default();
+                            let recovered = decode_candidate(
+                                scanned_again(&candidate.record),
+                                supplier,
+                                candidate.record.localized,
+                                &read,
+                                ReplayContext {
+                                    kinds: Some(&kinds),
+                                    omitted: &omitted,
+                                },
+                                &mut recovered_diagnostics,
+                                &mut observed_editor,
+                            )
+                            .and_then(|record| {
+                                if record.decoded.fields.is_empty() {
+                                    return Err("no safe fields remain after deferred recovery"
+                                        .to_owned()
+                                        .into());
+                                }
+                                validate(&record)?;
+                                Ok(record)
+                            });
+                            match recovered {
+                                Ok(record) => {
+                                    let fields = omitted
+                                        .iter()
+                                        .filter_map(|&position| {
+                                            candidate.record.source.subrecords.get(position).map(
+                                                |(signature, _)| {
+                                                    format!(
+                                                        "{}[source:{position}]",
+                                                        String::from_utf8_lossy(signature)
+                                                    )
+                                                },
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    set_replay_history(
+                                        &mut result,
+                                        &record,
+                                        true,
+                                        format!("deferred recovery omitted {fields}: {reason}"),
+                                    );
+                                    candidate.record = record;
+                                    candidate.diagnostics = recovered_diagnostics;
+                                    candidate.omitted = omitted;
+                                    rejected = true;
+                                    break 'keys;
+                                }
+                                Err(error) => {
+                                    reason =
+                                        format!("{reason}; deferred recovery unusable: {error}");
+                                    failure = error;
+                                }
+                            }
+                        }
+                    }
+                    diagnostics.set_record(
+                        candidate.record.decoded.source_record_offset,
+                        Some(candidate.record.source.record_type),
+                        Some(candidate.record.source.form_id),
+                        Some(candidate.record.decoded.form_id),
+                        "admission",
+                    );
+                    diagnostics.note("record", || reason.clone());
                     let name = &order
                         .table()
                         .entry(order.plugin_order()[supplier])
@@ -692,14 +852,10 @@ pub fn read_plugins_form_keys_with_validation(
                         &diagnostics,
                     );
                     let removed = chain.pop().expect("selected candidate");
-                    if let Some(entry) = result.history.iter_mut().find(|entry| {
-                        entry.supplier == supplier
-                            && entry.source_offset == removed.record.decoded.source_record_offset
-                    }) {
-                        entry.accepted = false;
-                        entry.reason = Some(error);
-                    }
+                    set_replay_history(&mut result, &removed.record, false, reason);
                     rejected = true;
+                    // Later dependents must not replay against a rejected winner's old kind.
+                    break;
                 }
             }
         }
@@ -711,10 +867,7 @@ pub fn read_plugins_form_keys_with_validation(
         let Some(winner) = chain.pop() else {
             continue;
         };
-        for candidate in chain.into_iter().chain(std::iter::once(Candidate {
-            record: winner.record,
-            diagnostics: winner.diagnostics,
-        })) {
+        for candidate in chain.into_iter().chain(std::iter::once(winner)) {
             let name = &order
                 .table()
                 .entry(order.plugin_order()[candidate.record.source.load_order as usize])

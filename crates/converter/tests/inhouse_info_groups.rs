@@ -439,19 +439,34 @@ async fn grouped_info_metadata_exports_and_broken_owners_still_publish_neighbors
     let decoded = read_plugins(&paths, &LoadOrder::read(&paths).unwrap()).unwrap();
     let bundle = temp.path().join("bundle");
     export_record_bundle_typed(&data, &plugins, &bundle, &[*b"INFO"]).unwrap();
+    let bundle_db = Connection::open(bundle.join("skyrim_world.db")).unwrap();
+    let identity = shared::pack_identity::PackIdentity::read_sql(&bundle_db).unwrap();
+    let mut headers = 0;
     let rows: HashMap<u32, Json> = fs::read_to_string(bundle.join("typed-records.jsonl"))
         .unwrap()
         .lines()
-        .map(|line| {
+        .filter_map(|line| {
             let row: Json = serde_json::from_str(line).unwrap();
-            (
-                u32::try_from(row["form_id"].as_u64().unwrap()).unwrap(),
-                row,
-            )
+            let named = serde_json::from_value(row["form_id"].clone()).unwrap();
+            let Some(key) = identity.table().intern(&named).unwrap() else {
+                assert_eq!(row["record_type"], serde_json::json!(*b"TES4"));
+                headers += 1;
+                return None;
+            };
+            Some((identity.runtime_id(key).unwrap(), row))
         })
         .collect();
+    assert_eq!(headers, 0, "the INFO selection must not dump TES4 headers");
     for (&id, row) in &rows {
-        let native = metadata(&decoded.records[&id]);
+        let mut native = metadata(&decoded.records[&id]);
+        let topic = decoded.records[&id]
+            .topic_form_id
+            .and_then(|id| identity.runtime_key(id).unwrap());
+        native["topic_form_id"] =
+            serde_json::to_value(topic.map_or(shared::form_key::NamedFormKey::Null, |key| {
+                identity.table().named(key).unwrap()
+            }))
+            .unwrap();
         for key in [
             "topic_form_id",
             "source_topic_form_id",

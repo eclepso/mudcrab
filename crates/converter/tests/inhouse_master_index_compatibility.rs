@@ -270,7 +270,7 @@ fn normal_full24_and_unknown_signature_preserve_generic_archive_without_typed_cl
 }
 
 #[test]
-fn narrow_light_projection_and_wide_failure_never_alias_adjacent_owner() {
+fn narrow_and_wide_native_light_identities_never_alias_adjacent_owner() {
     let (_fixture, data) = test_data();
     plugin(&data, "Base.esm", &[], 0, &[]);
     let narrow = sub(b"EDID", b"first_light\0");
@@ -290,8 +290,33 @@ fn narrow_light_projection_and_wide_failure_never_alias_adjacent_owner() {
     let db = database(&output);
     assert_eq!(source_body(&db, 0xfe00_0234), narrow);
     assert_eq!(source_body(&db, 0xfe00_1234), neighbor);
-    assert_eq!(diagnostic(&output, "a.esl", "compatibility_headers"), 1);
-    assert_eq!(diagnostic(&output, "a.esl", "skipped_records"), 1);
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let wide_key =
+        shared::form_key::FormKey::new(identity.table().id("A.esl").unwrap(), 0x1234).unwrap();
+    assert_eq!(identity.runtime_id_if_available(wide_key).unwrap(), None);
+    assert_ne!(
+        wide_key,
+        identity.runtime_key(0xfe00_1234).unwrap().unwrap()
+    );
+    let wide_stored: Vec<u8> = db
+        .query_row(
+            "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [wide_key.to_sql_i64()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wide_stored, wide);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM records WHERE form_id=?1",
+            [wide_key.to_sql_i64()],
+            |row| row.get::<_, usize>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(diagnostic(&output, "a.esl", "compatibility_headers"), 2);
+    assert_eq!(diagnostic(&output, "a.esl", "skipped_records"), 0);
     assert_eq!(diagnostic(&output, "a.esl", "invalid_links"), 0);
     unknown_source(
         &output,
@@ -301,7 +326,7 @@ fn narrow_light_projection_and_wide_failure_never_alias_adjacent_owner() {
         "accepted",
         &narrow,
     );
-    unknown_source(&output, 1, 0x0200_1234, None, "skipped", &wide);
+    unknown_source(&output, 1, 0x0200_1234, None, "accepted", &wide);
 }
 
 #[test]
@@ -448,15 +473,28 @@ fn malformed_body_and_unusable_candidate_counts_do_not_masquerade_as_winners() {
     let mut body = frame(b"STAT", 0x0100_1800, 0x40000, &compressed);
     body.extend(frame(b"MOVT", 0x0103_580d, 0, &movt)); // Projects to the actual own required MOVT validator key.
     body.extend(frame(b"STAT", 0x0100_1810, 0, &neighbor));
-    plugin(&data, "Base.esm", &[], 0, &body);
-    let output = export(&data, &["Base.esm"], "malformed", &[*b"STAT", *b"MOVT"]);
+    plugin(&data, "Skyrim.esm", &[], 0, &body);
+    let output = export(&data, &["Skyrim.esm"], "malformed", &[*b"STAT", *b"MOVT"]);
     let db = database(&output);
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    assert_eq!(
+        identity
+            .table()
+            .named(identity.runtime_key(0x3580D).unwrap().unwrap())
+            .unwrap()
+            .to_string(),
+        "03580D:Skyrim.esm",
+        "the builtin MOVT validator is qualified by its original named owner"
+    );
     assert_eq!(runtime_count(&db, 0x1800), 0);
     assert_eq!(runtime_count(&db, 0x3580d), 0);
     assert_eq!(source_body(&db, 0x1810), neighbor);
-    assert_eq!(diagnostic(&output, "base.esm", "compatibility_headers"), 2); // MOVT remaps before candidate rejection; compressed body never reaches remap.
-    assert_eq!(diagnostic(&output, "base.esm", "skipped_records"), 2);
-    assert_eq!(diagnostic(&output, "base.esm", "invalid_links"), 0);
+    assert_eq!(
+        diagnostic(&output, "skyrim.esm", "compatibility_headers"),
+        2
+    ); // MOVT remaps before candidate rejection; compressed body never reaches remap.
+    assert_eq!(diagnostic(&output, "skyrim.esm", "skipped_records"), 2);
+    assert_eq!(diagnostic(&output, "skyrim.esm", "invalid_links"), 0);
     unknown_source(
         &output,
         0,
@@ -842,8 +880,17 @@ fn actual_runtime_null_checks_do_not_invent_a_local_zero_rejection() {
     assert_eq!(runtime_count(&db, 0), 0);
     assert_eq!(source_body(&db, 0x0100_0000), body);
     assert_eq!(source_body(&db, 0xfe00_0000), body);
-    assert_eq!(diagnostic(&output, "base.esm", "skipped_records"), 2);
-    assert_eq!(diagnostic(&output, "base.esm", "compatibility_headers"), 0);
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let base_zero =
+        shared::form_key::FormKey::new(identity.table().id("Base.esm").unwrap(), 0).unwrap();
+    assert_eq!(identity.runtime_id_if_available(base_zero).unwrap(), None);
+    let context = shared::records::RecordContextReader::new(&db).unwrap();
+    assert_eq!(
+        context.record(base_zero).unwrap().source_header,
+        0x0100_0000
+    );
+    assert_eq!(diagnostic(&output, "base.esm", "skipped_records"), 1);
+    assert_eq!(diagnostic(&output, "base.esm", "compatibility_headers"), 1);
     // Resolved supplier ordinals and normal/light runtime slots are distinct namespaces.
     unknown_source(
         &output,
