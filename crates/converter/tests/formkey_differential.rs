@@ -437,6 +437,10 @@ fn identity_columns(table: &str) -> &'static str {
         "projection_omission_samples" => "form_id",
         "lod" => "cell_id",
         "lod_chunks" | "lod_chunks_spatial" => "worldspace_id",
+        // RTree auxiliary columns live in its rowid shadow, not in node payloads.
+        // Exterior rowids are reference FormKeys; LOD rowids are independent index IDs.
+        "exterior_spatial_rowid" => "rowid a0 a1",
+        "lod_chunks_spatial_rowid" => "a0",
         "schema_info"
         | "plugins"
         | "conversion_cache"
@@ -444,8 +448,9 @@ fn identity_columns(table: &str) -> &'static str {
         | "projection_omission_stats"
         | "lod_build"
         | "exterior_spatial_node"
-        | "exterior_spatial_rowid"
-        | "exterior_spatial_parent" => "",
+        | "exterior_spatial_parent"
+        | "lod_chunks_spatial_node"
+        | "lod_chunks_spatial_parent" => "",
         other => panic!("unreviewed scalar table {other}; extend the closed differential contract"),
     }
 }
@@ -458,6 +463,94 @@ fn rows(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Va
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap()
+}
+
+/// Independently audit both inherited RTrees and their exact empty physical representation.
+/// SQLite's rowid shadows store auxiliary values; node/parent numbers are tree-local IDs.
+/// The fixture has only an interior CELL, so neither tree may contain an indexed row.
+fn assert_empty_spatial_contract(conn: &rusqlite::Connection) {
+    use rusqlite::types::Value;
+    for (name, ddl) in [
+        (
+            "exterior_spatial",
+            "CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id)",
+        ),
+        (
+            "lod_chunks_spatial",
+            "CREATE VIRTUAL TABLE lod_chunks_spatial USING rtree(id,minX,maxX,minY,maxY,+worldspace_id,+tier,+anchor_x,+anchor_y)",
+        ),
+        (
+            "exterior_spatial_node",
+            "CREATE TABLE \"exterior_spatial_node\"(nodeno INTEGER PRIMARY KEY,data)",
+        ),
+        (
+            "exterior_spatial_parent",
+            "CREATE TABLE \"exterior_spatial_parent\"(nodeno INTEGER PRIMARY KEY,parentnode)",
+        ),
+        (
+            "exterior_spatial_rowid",
+            "CREATE TABLE \"exterior_spatial_rowid\"(rowid INTEGER PRIMARY KEY,nodeno,a0,a1)",
+        ),
+        (
+            "lod_chunks_spatial_node",
+            "CREATE TABLE \"lod_chunks_spatial_node\"(nodeno INTEGER PRIMARY KEY,data)",
+        ),
+        (
+            "lod_chunks_spatial_parent",
+            "CREATE TABLE \"lod_chunks_spatial_parent\"(nodeno INTEGER PRIMARY KEY,parentnode)",
+        ),
+        (
+            "lod_chunks_spatial_rowid",
+            "CREATE TABLE \"lod_chunks_spatial_rowid\"(rowid INTEGER PRIMARY KEY,nodeno,a0,a1,a2,a3)",
+        ),
+    ] {
+        let actual: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compact = |sql: &str| {
+            sql.chars()
+                .filter(|ch| !ch.is_ascii_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(&actual),
+            compact(ddl),
+            "independent spatial DDL {name}"
+        );
+    }
+    for name in [
+        "exterior_spatial",
+        "exterior_spatial_rowid",
+        "exterior_spatial_parent",
+        "lod",
+        "lod_chunks",
+        "lod_chunks_spatial",
+        "lod_chunks_spatial_rowid",
+        "lod_chunks_spatial_parent",
+        "lod_build",
+    ] {
+        assert!(
+            rows(conn, name).is_empty(),
+            "interior-only fixture must leave {name} empty"
+        );
+    }
+    let page_size: usize = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .unwrap();
+    // Bundled SQLite 3: four header bytes, an eight-byte row ID and two f32 bounds
+    // per dimension per cell, at most 51 cells, capped by page size minus 64 bytes.
+    for (name, dimensions) in [("exterior_spatial_node", 3), ("lod_chunks_spatial_node", 2)] {
+        let bytes = (page_size - 64).min(4 + 51 * (8 + 8 * dimensions));
+        assert_eq!(
+            rows(conn, name),
+            vec![vec![Value::Integer(1), Value::Blob(vec![0; bytes])]],
+            "independent empty root {name}"
+        );
+    }
 }
 
 /// Compare all inherited schema/rows, while proving each intentional native-format addition.
@@ -722,14 +815,10 @@ fn native_logical_dump(
             );
         }
     }
-    // No R-Tree node encodes a hidden identity in this interior-only fixture; still compare
-    // every virtual/shadow row and BLOB exactly, including the empty root node.
-    assert_eq!(
-        new.query_row("SELECT count(*) FROM exterior_spatial", [], |row| row
-            .get::<_, usize>(0))
-            .unwrap(),
-        0
-    );
+    // Independently establish the rows before the complete old/new schema-and-row comparison.
+    // In particular, no exterior node BLOB may hide an unnormalized reference FormKey.
+    assert_empty_spatial_contract(old);
+    assert_empty_spatial_contract(new);
     let mut dump = Vec::new();
     for (kind, name, _, sql) in old_schema {
         let actual = new_schema

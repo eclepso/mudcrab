@@ -6394,7 +6394,7 @@ fn validate_publication_package(backup: &Path) -> Result<()> {
             database.query_row("SELECT version FROM schema_info", [], |row| row.get(0))?;
         ensure!(
             shared::supports_runtime_world_database_schema(version),
-            "backup database schema {version} is unsupported"
+            "backup database schema {version} is unsupported; convert again from the original plugins"
         );
         ensure!(
             version >= shared::WORLD_DATABASE_LOD_SCHEMA_VERSION

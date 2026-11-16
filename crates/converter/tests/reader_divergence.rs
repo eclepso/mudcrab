@@ -314,9 +314,9 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
 
     // Both current producers preserve original CP1252 bytes and record decoded text separately.
     assert!(!any_field_keys(&report, "STAT EDID").contains(&id(TEXT)));
-    for path in [
-        root.path().join("legacy.db"),
-        root.path().join("inhouse/skyrim_world.db"),
+    for (legacy, path) in [
+        (true, root.path().join("legacy.db")),
+        (false, root.path().join("inhouse/skyrim_world.db")),
     ] {
         let connection = rusqlite::Connection::open(path).unwrap();
         assert_eq!(
@@ -341,7 +341,56 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
             .record(reader.identity().runtime_key(DANGLING).unwrap().unwrap())
             .unwrap();
         assert_eq!(reference.bytes(*b"XEMI").unwrap(), 0xDEADu32.to_le_bytes());
-        assert_eq!(reference.first_link(*b"XEMI", 0).unwrap(), None);
+        let absent = reader.identity().runtime_key(0xDEAD).unwrap().unwrap();
+        assert_eq!(
+            reader.identity().table().named(absent).unwrap().to_string(),
+            "00DEAD:Skyrim.esm"
+        );
+        assert_eq!(reader.identity().runtime_id(absent).unwrap(), 0xDEAD);
+        // Step 2 deliberately retains ordinary missing self targets in the handwritten reader.
+        // The typed reader clears missing targets after its complete live catalogue is built.
+        let expected = legacy.then_some(absent);
+        assert_eq!(reference.first_link(*b"XEMI", 0).unwrap(), expected);
+        let reference_key = reader.identity().runtime_key(DANGLING).unwrap().unwrap();
+        let site: (u32, u32, u32, Option<i64>, String) = connection.query_row(
+            "SELECT source_ordinal,byte_offset,source_word,target_key,outcome FROM resolved_links WHERE record_key=?1 AND source_ordinal=1 AND byte_offset=0",
+            [reference_key.to_sql_i64()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            site,
+            (
+                1,
+                0,
+                0xDEAD,
+                expected.map(shared::form_key::FormKey::to_sql_i64),
+                if legacy { "resolved" } else { "cleared" }.into()
+            )
+        );
+        let projected: Option<i64> = connection
+            .query_row(
+                "SELECT emittance_id FROM \"references\" WHERE id=?1",
+                [reference_key.to_sql_i64()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            projected,
+            expected.map(shared::form_key::FormKey::to_sql_i64)
+        );
+        for (table, column) in [("records", "form_id"), ("emittance", "id")] {
+            let count: u32 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+                    [absent.to_sql_i64()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "an absent target has no source record or runtime colour"
+            );
+        }
     }
     // A known subrecord out of the schema's order is dropped by the in-house decoder.
     assert_eq!(
@@ -357,7 +406,7 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
         field_keys(&report, "omitted_by_inhouse", "LIGH FNAM"),
         [id(NAN_LIGHT)]
     );
-    // Both readers retain the same native word and separately certify its cleared outcome.
+    // Native bytes agree even when the readers deliberately certify different target outcomes.
     assert!(any_field_keys(&report, "REFR XEMI").is_empty());
     // Current main remaps this typed link in both readers, so it converges.
     assert!(any_field_keys(&report, "WTHR IMSP").is_empty());
@@ -370,6 +419,66 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
         report.tables["statics"].columns["model_path"].samples[0].legacy,
         "\"mod_chest.nif\""
     );
+}
+
+/// A genuinely out-of-range source selector retains its word while both readers clear absence.
+#[test]
+fn past_master_absent_xemi_clears_in_both_readers_without_losing_native_bytes_or_neighbors() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, plugins) = write_inputs(root.path());
+    let word = 0x0100_DEADu32; // Skyrim.esm has no MAST entries: selector one is past the list.
+    fs::write(
+        data.join("Skyrim.esm"),
+        master_plugin_with_bytes(b"Caf\xe9\0", word),
+    )
+    .unwrap();
+    let paths = converter::esm::read_plugins_txt(&plugins, &data).unwrap();
+    let legacy = root.path().join("legacy.db");
+    converter::esm::EsmParser::convert_plugins(&paths, &legacy).unwrap();
+    let inhouse = root.path().join("inhouse");
+    converter::esm::inhouse::export_record_bundle(&data, &plugins, &inhouse).unwrap();
+    for database in [legacy, inhouse.join("skyrim_world.db")] {
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let reader = shared::records::RecordContextReader::new(&connection).unwrap();
+        let key = reader.identity().runtime_key(DANGLING).unwrap().unwrap();
+        let reference = reader.record(key).unwrap();
+        assert_eq!(reference.bytes(*b"XEMI").unwrap(), word.to_le_bytes());
+        assert_eq!(reference.first_link(*b"XEMI", 0).unwrap(), None);
+        let site: (u32, u32, u32, Option<i64>, String) = connection.query_row(
+            "SELECT source_ordinal,byte_offset,source_word,target_key,outcome FROM resolved_links WHERE record_key=?1 AND source_ordinal=1 AND byte_offset=0",
+            [key.to_sql_i64()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(site, (1, 0, word, None, "cleared".into()));
+        let projected: Option<i64> = connection
+            .query_row(
+                "SELECT emittance_id FROM \"references\" WHERE id=?1",
+                [key.to_sql_i64()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected, None);
+        let colors: u32 = connection
+            .query_row("SELECT COUNT(*) FROM emittance", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(colors, 0);
+        let model: String = connection
+            .query_row(
+                "SELECT model_path FROM statics WHERE id=?1",
+                [common::stored_key(&connection, TEXT)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "a.nif");
+        assert_eq!(
+            common::native_fields(&connection, TEXT, b"EDID"),
+            [b"Caf\xe9\0".to_vec()]
+        );
+        assert_eq!(
+            common::native_fields(&connection, DANGLING, b"XEMI"),
+            [word.to_le_bytes().to_vec()]
+        );
+    }
 }
 
 /// Separate authored inputs retain the conservative byte/length labels without inventing
