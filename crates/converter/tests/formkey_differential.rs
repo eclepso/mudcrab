@@ -844,7 +844,6 @@ fn native_logical_dump(
             .prepare(&format!("SELECT * FROM \"{name}\""))
             .unwrap()
             .column_names()
-            .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let mut data = rows(new, &name);
@@ -860,7 +859,6 @@ fn native_logical_dump(
                 .prepare(&format!("SELECT * FROM \"{name}\""))
                 .unwrap()
                 .column_names()
-                .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             assert_eq!(columns, native_columns, "all columns {name}");
