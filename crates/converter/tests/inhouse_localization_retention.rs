@@ -912,6 +912,29 @@ fn runtime_string_for_move_test(text: &str) -> Vec<u8> {
 fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer() {
     use converter::esm::inhouse::RecordBundleMode;
     use sha2::{Digest, Sha256};
+    use shared::{form_key::FormKey, pack_identity::PackIdentity, records::RecordContextReader};
+
+    /// Retain typed line/field order while authenticating named identities and explicit headers.
+    fn native_typed_rows(path: &Path) -> Vec<serde_json::Value> {
+        let mut identities = std::collections::BTreeSet::new();
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                let identity = if let Some(name) = row["form_id"].as_str() {
+                    name.to_owned()
+                } else {
+                    assert!(row["form_id"].is_null());
+                    assert_eq!(row["record_type"], serde_json::json!(b"TES4"));
+                    format!("TES4:{}", row["load_order"].as_u64().unwrap())
+                };
+                assert!(identities.insert(identity), "duplicate typed identity");
+                row
+            })
+            .collect()
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let retained = temp.path();
     let data = retained.join("original-data");
@@ -949,7 +972,7 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
     );
     body.extend(before);
     body.extend(broken);
-    body.extend(after);
+    body.extend(after.iter().copied());
     // Remove the otherwise available terrain texture. Preserved ID4 versus runtime placeholder0
     // forces the test to exercise the canonical LTEX lookup and both distinct cache policies.
     body.extend(native::record(b"LTEX", 4, 0x20, &[]));
@@ -1010,6 +1033,17 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
         );
         let full_db = Connection::open(full.join("skyrim_world.db")).unwrap();
         let archive_db = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let identity = PackIdentity::read_sql(&full_db).unwrap();
+        assert_eq!(identity.table().id("ArchiveProbe.esp").unwrap().get(), 1);
+        assert_eq!(identity.table().id("Skyrim.esm").unwrap().get(), 2);
+        assert_eq!(
+            identity
+                .table()
+                .named(FormKey::from_packed(0x0100_5602).unwrap())
+                .unwrap()
+                .to_string(),
+            "005602:ArchiveProbe.esp"
+        );
         let (full_schema, full_tables) = move_sql_snapshot(&full_db);
         let (archive_schema, archive_tables) = move_sql_snapshot(&archive_db);
         assert_eq!(
@@ -1023,7 +1057,7 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
                 MoveSqlCell::Integer(0),
                 MoveSqlCell::Text(b"ArchiveShape".to_vec()),
                 MoveSqlCell::Integer(0),
-                // The in-house reader clears links to absent TXST records before projection.
+                // Cleared TXST remains a diagnostic zero target, with the complete row retained.
                 MoveSqlCell::Integer(0),
                 MoveSqlCell::Text(b"missing_texture_set".to_vec()),
             ]],
@@ -1119,19 +1153,25 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
                 "asymmetric full fixture must populate {table}"
             );
         }
-        let full_typed = move_typed_snapshot(&full.join("typed-records.jsonl"));
-        let archive_typed = move_typed_snapshot(&output.join("typed-records.jsonl"));
+        let full_typed = native_typed_rows(&full.join("typed-records.jsonl"));
+        let archive_typed = native_typed_rows(&output.join("typed-records.jsonl"));
         assert_eq!(
             full_typed, archive_typed,
             "entire typed DOM, occurrence order and all metadata"
         );
         assert!(
             archive_typed
-                .values()
+                .iter()
                 .all(|row| row.as_object().unwrap().len() == 20)
         );
-        for id in [0x0100_5600u32, 0x0100_5602] {
-            assert!(archive_typed.contains_key(&id), "broken-mod neighbor lost");
+        for (id, name) in [
+            (0x0100_5600u64, "005600:ArchiveProbe.esp"),
+            (0x0100_5602, "005602:ArchiveProbe.esp"),
+        ] {
+            assert!(
+                archive_typed.iter().any(|row| row["form_id"] == name),
+                "broken-mod neighbor lost"
+            );
             let present: bool = archive_db
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM records WHERE form_id=?1)",
@@ -1141,6 +1181,23 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
                 .unwrap();
             assert!(present, "canonical neighbor lost");
         }
+        let context = RecordContextReader::new(&archive_db).unwrap();
+        assert_eq!(context.identity().digest(), identity.digest());
+        let material_key = FormKey::from_packed(0x0100_5602).unwrap();
+        let material = context.record(material_key).unwrap();
+        assert_eq!(material.source_header, 0x0100_5602);
+        assert_eq!(material.supplier.get(), 1);
+        assert_eq!(material.bytes(*b"MODS"), Some(swaps.as_slice()));
+        assert_eq!(material.resolve_at(2, 20).unwrap(), None);
+        assert_eq!(
+            source(&archive_db, 0x0100_5602),
+            (0x0100_5602, 1, after[24..].to_vec())
+        );
+        let target: (u32, Option<i64>, String) = archive_db.query_row(
+            "SELECT source_word,target_key,outcome FROM resolved_links WHERE record_key=?1 AND source_ordinal=2 AND byte_offset=20",
+            [material_key.to_sql_i64()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(target, (0x0100_5700, None, "cleared".into()));
         let broken_count: (u32, u32) = archive_db.query_row(
             "SELECT count(*),sum(status='skipped') FROM record_overrides WHERE source_form_id=?1",
             [0x0100_5601u32], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
@@ -1175,6 +1232,38 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             fs::read(output.join("cell_cache.rkyv")).unwrap(),
             fs::read(output.join("cell_cache_preserved.rkyv")).unwrap(),
             "missing LTEX must retain distinct preserved/runtime policies"
+        );
+        let runtime =
+            converter::esm::cell_cache::read_form_key_cell_cache(&output.join("cell_cache.rkyv"))
+                .unwrap();
+        let preserved_cache = converter::esm::cell_cache::read_form_key_cell_cache(
+            &output.join("cell_cache_preserved.rkyv"),
+        )
+        .unwrap();
+        assert!(
+            !runtime.cells.is_empty(),
+            "actual paired terrain cache is required"
+        );
+        assert!(
+            preserved_cache
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.layers)
+                .any(|layer| layer.texture_form_id == 0x0200_0004)
+        );
+        assert!(
+            runtime
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.layers)
+                .all(|layer| layer.texture_form_id != 0x0200_0004)
+        );
+        assert!(
+            runtime
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.layers)
+                .any(|layer| layer.texture_form_id == 0)
         );
         let scope: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("record-bundle-scope.json")).unwrap())

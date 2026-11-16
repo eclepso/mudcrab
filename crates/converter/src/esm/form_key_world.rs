@@ -779,6 +779,15 @@ fn write_world(output: &mut Connection, snapshot: WorldSnapshot<'_, '_>) -> Resu
     Ok(projection_warnings)
 }
 
+/// These diagnostic projections deliberately use zero when their target is unavailable.
+/// Their row owner is still required; the reason/resolution makes the absent target explicit.
+fn preserves_zero_target(table: &str, column: &str) -> bool {
+    matches!(
+        (table, column),
+        ("base_texture_swaps", "texture_set_id") | ("actor_models", "race_id")
+    )
+}
+
 /// Copy scalar results with checked identity bindings; compact indices never enter the pack.
 fn copy_projection(
     tx: &Transaction<'_>,
@@ -832,6 +841,11 @@ fn copy_projection(
                             .map_err(|_| eyre!("invalid CPU projection index"))?;
                         let key = stage.key(handle)?;
                         if key.is_none() && *required {
+                            if preserves_zero_target(table, column) {
+                                // Zero is an explicit diagnostic sentinel, never an owner key.
+                                values[index] = SqlValue::Integer(0);
+                                continue;
+                            }
                             unusable = true;
                             break;
                         }
@@ -898,4 +912,160 @@ fn copy_projection(
         insert.execute(rusqlite::params_from_iter(values))?;
     }
     Ok(skipped)
+}
+
+#[cfg(test)]
+mod projection_copy_tests {
+    use super::*;
+    use crate::esm::records::RawRecord;
+    use shared::plugin_table::PluginFacts;
+
+    /// One authenticated source record gives the SQL copier a nonidentity CPU index.
+    fn fixture() -> (FormKeyConversion, FormKey) {
+        let order = FormKeyOrder::from_facts(vec![(
+            "Fixture.esm".into(),
+            PluginFacts {
+                content_hash: Some([0x5A; 32]),
+                ..Default::default()
+            },
+        )])
+        .unwrap();
+        let key = FormKey::new(order.table().id("Fixture.esm").unwrap(), 0x1234).unwrap();
+        let record = FormKeyRecord {
+            source: RawRecord {
+                form_id: 0x1234,
+                record_type: *b"STAT",
+                flags: 0,
+                subrecords: Vec::new(),
+                cell_form_id: None,
+                worldspace_form_id: None,
+                load_order: 0,
+            },
+            canonical: None,
+            canonical_ordinals: Vec::new(),
+            localized_text: Default::default(),
+            runtime_omitted: Default::default(),
+            cell: None,
+            worldspace: None,
+            links: Vec::new(),
+        };
+        (
+            FormKeyConversion {
+                order,
+                records: [(key, record)].into(),
+                warnings: Vec::new(),
+                notices: Vec::new(),
+            },
+            key,
+        )
+    }
+
+    /// Missing materials and unresolved actor races retain their owner and diagnostic state.
+    #[test]
+    fn diagnostic_zero_targets_preserve_material_and_unresolved_actor_rows() {
+        let (conversion, key) = fixture();
+        let stage = ProjectionStage::build(&conversion).unwrap();
+        let identity = conversion.order.pack_identity().unwrap();
+        let handle = stage.handle(key).unwrap();
+        assert_ne!(u64::from(handle), key.to_packed());
+        let source = Connection::open_in_memory().unwrap();
+        let mut output = Connection::open_in_memory().unwrap();
+        let schema = "CREATE TABLE base_texture_swaps(base_id INTEGER NOT NULL,position INTEGER NOT NULL,shape_name TEXT NOT NULL,shape_index INTEGER NOT NULL,texture_set_id INTEGER NOT NULL,disposition TEXT NOT NULL,PRIMARY KEY(base_id,position));
+            CREATE TABLE actor_models(id INTEGER PRIMARY KEY,race_id INTEGER NOT NULL,resolution TEXT NOT NULL);";
+        source.execute_batch(schema).unwrap();
+        output.execute_batch(schema).unwrap();
+        source.execute("INSERT INTO base_texture_swaps VALUES(?1,0,'ArchiveShape',0,0,'missing_texture_set')",[handle]).unwrap();
+        source
+            .execute(
+                "INSERT INTO actor_models VALUES(?1,0,'unresolved')",
+                [handle],
+            )
+            .unwrap();
+        let tx = output.transaction().unwrap();
+        for table in ["base_texture_swaps", "actor_models"] {
+            assert_eq!(
+                copy_projection(&tx, &source, table, &stage, &identity).unwrap(),
+                0
+            );
+        }
+        let material: (i64, u32, String, i32, u32, String) = tx
+            .query_row("SELECT * FROM base_texture_swaps", [], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            material,
+            (
+                key.to_sql_i64(),
+                0,
+                "ArchiveShape".into(),
+                0,
+                0,
+                "missing_texture_set".into()
+            )
+        );
+        let actor: (i64, u32, String) = tx
+            .query_row("SELECT * FROM actor_models", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(actor, (key.to_sql_i64(), 0, "unresolved".into()));
+    }
+
+    /// Diagnostic exceptions never turn owner/edge zero into a key or change nullable targets.
+    #[test]
+    fn zero_owners_and_required_edges_still_omit_while_nullable_targets_become_null() {
+        let (conversion, key) = fixture();
+        let stage = ProjectionStage::build(&conversion).unwrap();
+        let identity = conversion.order.pack_identity().unwrap();
+        let handle = stage.handle(key).unwrap();
+        let source = Connection::open_in_memory().unwrap();
+        let mut output = Connection::open_in_memory().unwrap();
+        let schema = "CREATE TABLE base_texture_swaps(base_id INTEGER NOT NULL,texture_set_id INTEGER NOT NULL);
+            CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL);
+            CREATE TABLE reference_details(reference_id INTEGER PRIMARY KEY,owner_id INTEGER);";
+        source.execute_batch(schema).unwrap();
+        output.execute_batch(schema).unwrap();
+        source
+            .execute("INSERT INTO base_texture_swaps VALUES(0,0)", [])
+            .unwrap();
+        source
+            .execute("INSERT INTO door_links VALUES(?1,0)", [handle])
+            .unwrap();
+        source
+            .execute("INSERT INTO reference_details VALUES(?1,0)", [handle])
+            .unwrap();
+        let tx = output.transaction().unwrap();
+        for table in ["base_texture_swaps", "door_links"] {
+            assert_eq!(
+                copy_projection(&tx, &source, table, &stage, &identity).unwrap(),
+                1
+            );
+            assert_eq!(
+                tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            copy_projection(&tx, &source, "reference_details", &stage, &identity).unwrap(),
+            0
+        );
+        let row: (i64, Option<i64>) = tx
+            .query_row(
+                "SELECT reference_id,owner_id FROM reference_details",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (key.to_sql_i64(), None));
+    }
 }
