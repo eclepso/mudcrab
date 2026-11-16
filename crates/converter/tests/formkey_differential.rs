@@ -1065,32 +1065,77 @@ fn synthetic_publication_matches_independent_old_packer_and_cell_cache() {
     let actual = EsmParser::merge_plugins(&paths).unwrap();
     let old_cache = root.path().join("old.rkyv");
     let new_cache = root.path().join("new.rkyv");
-    converter::esm::cell_cache::write_cell_cache(&expected, &old_cache).unwrap();
-    converter::esm::cell_cache::write_cell_cache(&actual, &new_cache).unwrap();
-    assert_eq!(
-        std::fs::read(&old_cache).unwrap(),
-        std::fs::read(&new_cache).unwrap()
-    );
+    // This interior-only fixture never had LAND, geometry, layers or water in its
+    // cache. Establish that precondition independently instead of publishing an
+    // unauthenticated scalar map through the current native cache API.
+    for (records, path) in [(&expected, &old_cache), (&actual, &new_cache)] {
+        assert!(
+            records
+                .values()
+                .all(|record| record.record_type != *b"LAND")
+        );
+        let error = converter::esm::cell_cache::write_cell_cache(records, path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native FormKey context is required")
+        );
+        assert!(error.to_string().contains("convert again"));
+        assert!(
+            !path.exists(),
+            "refused unbound publication must not create a cache"
+        );
+    }
+    let expected_cache = shared::CellCache {
+        version: 4,
+        cells: Vec::new(),
+    };
+    let expected_payload = rkyv::to_bytes::<rkyv::rancor::Error>(&expected_cache).unwrap();
     // The genuine native writer adds an authenticated envelope and native identities.
     // After that explicit representation transition, every payload byte must still agree.
     let native = EsmParser::merge_plugins_form_keys(&paths).unwrap();
+    assert!(
+        native
+            .records
+            .values()
+            .all(|record| record.source.record_type != *b"LAND")
+    );
     let native_cache = root.path().join("native.rkyv");
-    converter::esm::cell_cache::write_form_key_cell_cache(
+    let (count, warnings) = converter::esm::cell_cache::write_form_key_cell_cache(
         &native,
         &Default::default(),
         &native_cache,
         false,
     )
     .unwrap();
+    assert_eq!(count, 0);
+    assert!(warnings.is_empty(), "{warnings:?}");
     let identity = shared::pack_identity::PackIdentity::read_sql(&new).unwrap();
     assert_eq!(
         native.order.pack_identity().unwrap().digest(),
         identity.digest()
     );
+    let file_bytes = std::fs::read(native_cache).unwrap();
+    // Independent envelope oracle: do not use the production encoder to construct
+    // its expected magic/kind/format/identity/reserved/length/hash/payload bytes.
+    let mut expected_file = b"MCFKPACK".to_vec();
+    expected_file.extend_from_slice(&0x4345_4c52u32.to_le_bytes());
+    expected_file.extend_from_slice(&4u32.to_le_bytes());
+    expected_file.extend_from_slice(&1u32.to_le_bytes());
+    expected_file.extend_from_slice(&[0; 4]);
+    expected_file.extend_from_slice(&identity.digest());
+    expected_file.extend_from_slice(&(expected_payload.len() as u64).to_le_bytes());
+    expected_file.extend_from_slice(&Sha256::digest(expected_payload.as_slice()));
+    expected_file.extend_from_slice(&expected_payload);
+    assert_eq!(
+        file_bytes, expected_file,
+        "entire native cache envelope and payload"
+    );
     let mut aligned = rkyv::util::AlignedVec::<16>::new();
-    aligned.extend_from_slice(&std::fs::read(native_cache).unwrap());
+    aligned.extend_from_slice(&file_bytes);
     let payload = shared::cache_identity::cell_cache_payload(&identity, &aligned, false).unwrap();
     let mut cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(payload).unwrap();
+    assert_eq!(cache, expected_cache);
     for cell in &mut cache.cells {
         cell.cell_id = u64::from(old_key(&identity, &plugins, cell.cell_id as i64));
         cell.water_type_form_id = cell
@@ -1107,7 +1152,7 @@ fn synthetic_publication_matches_independent_old_packer_and_cell_cache() {
         rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
             .unwrap()
             .as_slice(),
-        std::fs::read(old_cache).unwrap(),
+        expected_payload.as_slice(),
         "entire normalized native cache payload, no skipped fields or float tolerances"
     );
 }

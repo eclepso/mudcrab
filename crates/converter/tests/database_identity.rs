@@ -346,7 +346,8 @@ fn database_identities_survive_slot_changes_and_keep_override_provenance() {
             .unwrap(),
             0
         );
-        assert_eq!(read(full_id), ("Base.esm".into(), 0x800, priority));
+        assert_eq!(read(full_id), ("base.esm".into(), 0x800, priority));
+        assert_eq!(read(light_id), ("light.esl".into(), 0x810, priority));
     }
 }
 
