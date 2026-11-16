@@ -427,7 +427,8 @@ pub fn output_readiness(output: &Path) -> Result<(), String> {
 }
 
 /// Whether the selected output passes the runtime's authenticated startup contract.
-pub fn output_is_complete(output: &Path) -> bool {
+#[cfg(test)]
+fn output_is_complete(output: &Path) -> bool {
     output_readiness(output).is_ok()
 }
 
