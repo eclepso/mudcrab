@@ -186,6 +186,7 @@ pub fn write_terrain_chunks(
 }
 
 /// Publish chunks bound to the same immutable plugin allocation as their world database.
+/// Cells and worldspace reports retain original full/light owner order, not allocation order.
 pub fn write_form_key_terrain_chunks(
     output_root: &Path,
     identity: &shared::pack_identity::PackIdentity,
@@ -233,23 +234,21 @@ pub fn write_form_key_terrain_chunks(
         cells: 0,
         bytes: 0,
     };
-    for ((worldspace_id, chunk_x, chunk_y), mut chunk_cells) in by_chunk {
+    let mut ordered_chunks = by_chunk.into_iter().collect::<Vec<_>>();
+    ordered_chunks.sort_unstable_by_key(|((world, chunk_x, chunk_y), _)| {
+        let key =
+            shared::cache_identity::required(identity, *world).expect("validated worldspace key");
+        (
+            shared::cache_identity::owner_order(identity, key),
+            *chunk_x,
+            *chunk_y,
+        )
+    });
+    for ((worldspace_id, chunk_x, chunk_y), mut chunk_cells) in ordered_chunks {
         chunk_cells.sort_unstable_by_key(|mesh| {
             let key = shared::cache_identity::required(identity, mesh.cell_id)
                 .expect("validated CELL key");
-            let entry = identity
-                .table()
-                .entry(key.plugin())
-                .expect("allocated CELL owner");
-            (
-                u8::from(entry.facts.flags.light),
-                identity
-                    .order()
-                    .iter()
-                    .position(|owner| *owner == key.plugin())
-                    .unwrap_or(usize::MAX),
-                key.local(),
-            )
+            shared::cache_identity::owner_order(identity, key)
         });
         let cell_count = chunk_cells.len();
         // The path is derived from a cell of the chunk's south-west corner, the one coordinate
