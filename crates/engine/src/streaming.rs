@@ -3756,7 +3756,7 @@ fn settle_cell_terrain(
     let mut merged = merged;
     if let Some(spawn) = &mut merged {
         let weld_started = Instant::now();
-        let welded = weld_merged_cell(key, &mut spawn.cell, continuity, metrics);
+        let welded = weld_merged_cell(key, cell_id, &mut spawn.cell, continuity, metrics);
         profiler.record_elapsed("streaming/terrain_seam_weld", weld_started);
         if let Err(reason) = welded {
             merged = None;
@@ -3785,16 +3785,18 @@ fn settle_cell_terrain(
 /// uses. The cell's 33 x 33 height and normal grid goes through
 /// [`validate_and_register_terrain_edges`] unchanged, and the welded grid is written back to every
 /// vertex, seam duplicates included, so the two paths agree sample for sample and either can be
-/// the neighbour of the other.
+/// the neighbour of the other. The temporary snapshot uses the authenticated runtime handle;
+/// the mesh retains its stored FormKey.
 fn weld_merged_cell(
     key: CellKey,
+    runtime_cell_id: u32,
     cell: &mut TerrainCellMesh,
     continuity: &mut TerrainContinuity,
     metrics: &mut StreamingMetrics,
 ) -> Result<(), String> {
     let (heights, normals) = crate::terrain_merge::mesh::cell_to_grid(cell)?;
     let mut grid = TerrainSnapshot {
-        cell_id: cell.cell_id,
+        cell_id: runtime_cell_id,
         width: shared::LAND_SIDE,
         height: shared::LAND_SIDE,
         heights,

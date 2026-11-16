@@ -253,7 +253,10 @@ fn the_merged_mesh_reproduces_todays_four_quadrant_meshes_vertex_for_vertex() {
                 let weight = slot_weights(&merged, slot / 4)[vertex][slot % 4];
                 match layers.get(slot) {
                     Some(layer) => {
-                        assert_eq!(id, classes.ids_by_form_id[&layer.texture_form_id]);
+                        assert_eq!(
+                            id,
+                            classes.ids_by_form_id[&u64::from(layer.texture_form_id)]
+                        );
                         let wanted = if slot == 0 {
                             0.0
                         } else {
@@ -457,6 +460,7 @@ fn the_weld_on_merged_cells_matches_the_weld_on_todays_snapshots() {
     let before_b = cell_b.clone();
     weld_merged_cell(
         key(0),
+        record_a.cell_form_id.unwrap(),
         &mut cell_a,
         &mut continuity_merged,
         &mut metrics_merged,
@@ -464,6 +468,7 @@ fn the_weld_on_merged_cells_matches_the_weld_on_todays_snapshots() {
     .unwrap();
     weld_merged_cell(
         key(1),
+        record_b.cell_form_id.unwrap(),
         &mut cell_b,
         &mut continuity_merged,
         &mut metrics_merged,
@@ -536,7 +541,14 @@ fn a_merged_cell_welds_onto_a_quadrant_path_neighbour_and_the_reverse() {
     validate_and_register_terrain_edges(key(0), &mut snapshot_a, &mut continuity, &mut metrics)
         .unwrap();
     let mut cell_b = merged_cell(&record_b);
-    weld_merged_cell(key(1), &mut cell_b, &mut continuity, &mut metrics).unwrap();
+    weld_merged_cell(
+        key(1),
+        record_b.cell_form_id.unwrap(),
+        &mut cell_b,
+        &mut continuity,
+        &mut metrics,
+    )
+    .unwrap();
     for y in 0..usize::from(LAND_SIDE) {
         let east_of_a = snapshot_a.heights[y * usize::from(LAND_SIDE) + 32];
         let (quadrant, local_y) = if y < 16 { (0, y) } else { (2, y - 16) };
@@ -552,7 +564,14 @@ fn a_merged_cell_welds_onto_a_quadrant_path_neighbour_and_the_reverse() {
     validate_and_register_terrain_edges(key(1), &mut snapshot_b, &mut continuity, &mut metrics)
         .unwrap();
     let mut cell_a = merged_cell(&record_a);
-    weld_merged_cell(key(0), &mut cell_a, &mut continuity, &mut metrics).unwrap();
+    weld_merged_cell(
+        key(0),
+        record_a.cell_form_id.unwrap(),
+        &mut cell_a,
+        &mut continuity,
+        &mut metrics,
+    )
+    .unwrap();
     for y in 0..usize::from(LAND_SIDE) {
         let west_of_b = snapshot_b.heights[y * usize::from(LAND_SIDE)];
         let (quadrant, local_y) = if y < 16 { (1, y) } else { (3, y - 16) };

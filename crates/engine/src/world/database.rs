@@ -432,6 +432,7 @@ fn is_safe_relative_asset_path(path: &str) -> bool {
 }
 
 impl WorldDatabase {
+    /// Creates worker-free channels with a fresh authenticated synthetic pack identity.
     #[cfg(test)]
     pub(crate) fn channel_fixture(
         capacity: usize,
@@ -439,8 +440,11 @@ impl WorldDatabase {
         let (requests, request_rx) = bounded(capacity);
         let (response_tx, responses) = unbounded();
         let (_lod_tx, lod_responses) = unbounded();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let identity = Arc::new(crate::world::test_support::install(&mut connection));
         (
             Self {
+                identity,
                 requests,
                 responses,
                 lod_responses,
