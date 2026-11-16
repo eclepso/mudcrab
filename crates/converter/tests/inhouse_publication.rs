@@ -897,7 +897,7 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
     let heightless = cache
         .cells
         .iter()
-        .find(|cell| cell.cell_id == heightless_cell)
+        .find(|cell| cell.cell_id == u64::from(heightless_cell))
         .unwrap();
     assert_eq!(heightless.heights, vec![0.0; 33 * 33]);
     assert_eq!(heightless.vertex_colors, vec![111; 33 * 33 * 3]);
