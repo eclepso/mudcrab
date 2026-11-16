@@ -12,10 +12,15 @@ use crate::terrain_merge::{
     },
 };
 use converter::esm::{
-    cell_cache::write_cell_cache, records::RawRecord, terrain_mesh::build_cell_mesh,
+    cell_cache::write_form_key_cell_cache,
+    form_key_merge::{FormKeyConversion, FormKeyRecord, LinkOutcome, ResolvedLink},
+    form_keys::FormKeyOrder,
+    records::RawRecord,
+    terrain_mesh::build_cell_mesh,
 };
 use shared::{
     LAND_SIDE,
+    plugin_table::PluginFacts,
     terrain_mesh::{
         CELL_MESH_VERTICES, CellEdge, QUADRANT_SIDE, QUADRANT_VERTICES,
         TERRAIN_MESH_FORMAT_VERSION, TerrainChunkFile, edge_vertices, grid_position,
@@ -116,18 +121,85 @@ fn known_ltex() -> std::collections::HashSet<u32> {
         .collect()
 }
 
-/// Today's snapshot of `record` as the converter's cell cache and the engine's cache read it.
+/// Give generated runtime-local geometry inputs a fresh, explicit native owner allocation.
+fn fixture_order() -> FormKeyOrder {
+    FormKeyOrder::from_facts(vec![(
+        "Fixture.esm".into(),
+        PluginFacts {
+            content_hash: Some([0x49; 32]),
+            ..Default::default()
+        },
+    )])
+    .unwrap()
+}
+
+/// Read the production native cache through its paired engine reader, then compare geometry.
 fn cached_snapshot(record: &RawRecord) -> TerrainSnapshot {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cell_cache.rkyv");
-    let records = HashMap::from([(record.form_id, record.clone())]);
-    write_cell_cache(&records, &path).unwrap();
-    CellCache::open(&path)
+    let order = fixture_order();
+    let identity = order.pack_identity().unwrap();
+    let stored = |runtime| identity.runtime_key(runtime).unwrap().unwrap();
+    let links = record
+        .subrecords
+        .iter()
+        .enumerate()
+        .filter_map(|(subrecord, (tag, data))| {
+            let signature = match tag.as_slice() {
+                b"BTXT" => *b"BTXT",
+                b"ATXT" => *b"ATXT",
+                _ => return None,
+            };
+            let source_word = u32::from_le_bytes(data[..4].try_into().unwrap());
+            let key = identity.runtime_key(source_word).unwrap();
+            Some(ResolvedLink {
+                subrecord,
+                signature,
+                byte_offset: 0,
+                source_word,
+                key,
+                outcome: if key.is_some() {
+                    LinkOutcome::Resolved
+                } else {
+                    LinkOutcome::Null
+                },
+            })
+        })
+        .collect();
+    let native = FormKeyRecord {
+        source: record.clone(),
+        canonical: None,
+        canonical_ordinals: Vec::new(),
+        localized_text: Default::default(),
+        runtime_omitted: Default::default(),
+        cell: Some(stored(record.cell_form_id.unwrap())),
+        worldspace: None,
+        links,
+    };
+    let records = HashMap::from([(stored(record.form_id), native)]);
+    let conversion = FormKeyConversion {
+        order,
+        records,
+        warnings: Vec::new(),
+        notices: Vec::new(),
+    };
+    let (written, warnings) =
+        write_form_key_cell_cache(&conversion, &HashMap::new(), &path, false).unwrap();
+    assert_eq!(
+        written, 1,
+        "native LAND fixture was not published: {warnings:?}"
+    );
+    assert!(
+        warnings.is_empty(),
+        "native LAND fixture warnings: {warnings:?}"
+    );
+    CellCache::open_with_identity(&path, identity)
         .unwrap()
         .terrain(record.cell_form_id.unwrap())
         .expect("the cache holds the cell")
 }
 
+/// Build only CPU geometry from generated local inputs; persisted caches bind their keys above.
 fn merged_cell(record: &RawRecord) -> TerrainCellMesh {
     build_cell_mesh(record.cell_form_id.unwrap(), record, &known_ltex(), [0; 32])
         .unwrap()
@@ -457,6 +529,21 @@ fn the_weld_on_merged_cells_matches_the_weld_on_todays_snapshots() {
     let mut metrics_merged = StreamingMetrics::default();
     let mut cell_a = merged_cell(&record_a);
     let mut cell_b = merged_cell(&record_b);
+    let identity = fixture_order().pack_identity().unwrap();
+    let stored_a = identity
+        .runtime_key(record_a.cell_form_id.unwrap())
+        .unwrap()
+        .unwrap()
+        .to_packed();
+    let stored_b = identity
+        .runtime_key(record_b.cell_form_id.unwrap())
+        .unwrap()
+        .unwrap()
+        .to_packed();
+    assert_eq!(stored_a, 0x0100_0010);
+    assert_eq!(stored_b, 0x0100_0011);
+    cell_a.cell_id = stored_a;
+    cell_b.cell_id = stored_b;
     let before_b = cell_b.clone();
     weld_merged_cell(
         key(0),
@@ -474,6 +561,15 @@ fn the_weld_on_merged_cells_matches_the_weld_on_todays_snapshots() {
         &mut metrics_merged,
     )
     .unwrap();
+
+    assert_eq!(
+        cell_a.cell_id, stored_a,
+        "welding must preserve the stored native key"
+    );
+    assert_eq!(
+        cell_b.cell_id, stored_b,
+        "welding must preserve the stored native key"
+    );
 
     assert!(
         metrics_today.terrain_seam_points_welded > 0,
@@ -620,20 +716,109 @@ fn one_collider_per_merged_cell_is_the_render_mesh() {
     }
 }
 
+/// Install only a fresh generated world's native allocation, or authenticate that same fixture.
+fn chunk_identity(root: &std::path::Path) -> shared::pack_identity::PackIdentity {
+    let identity = fixture_order().pack_identity().unwrap();
+    let path = root.join("skyrim_world.db");
+    if path.exists() {
+        shared::world_assets::validate_world_database(&path).unwrap();
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let existing = shared::pack_identity::PackIdentity::read_sql(&connection).unwrap();
+        assert_eq!(existing.digest_hex(), identity.digest_hex());
+        return existing;
+    }
+    let mut connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL)")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_info(version) VALUES (?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    identity.write_sql(&transaction).unwrap();
+    transaction.commit().unwrap();
+    identity
+}
+
+/// Bind generated CPU-mesh locals before they enter a persisted native fixture.
+fn native_mesh(
+    identity: &shared::pack_identity::PackIdentity,
+    mut cell: TerrainCellMesh,
+) -> TerrainCellMesh {
+    let stored = |local| {
+        identity
+            .runtime_key(u32::try_from(local).unwrap())
+            .unwrap()
+            .unwrap()
+            .to_packed()
+    };
+    cell.cell_id = stored(cell.cell_id);
+    for slot in &mut cell.quadrant_slots {
+        if *slot != 0 {
+            *slot = stored(*slot);
+        }
+    }
+    cell
+}
+
+/// Give every generated material class the same native owner as the persisted chunk slots.
+fn native_table(
+    identity: &shared::pack_identity::PackIdentity,
+) -> shared::terrain_mesh::LandTextureTable {
+    let mut table = vanilla_table(9);
+    for entry in &mut table.entries {
+        if entry.ltex_form_id != 0 {
+            entry.ltex_form_id = identity
+                .runtime_key(u32::try_from(entry.ltex_form_id).unwrap())
+                .unwrap()
+                .unwrap()
+                .to_packed();
+        }
+    }
+    table
+}
+
+/// Keep malformed geometry intentional while authenticating every stored chunk identity.
 fn chunk_with(root: &std::path::Path, cell: TerrainCellMesh, grid_x: i32) {
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&TerrainChunkFile {
-        format_version: TERRAIN_MESH_FORMAT_VERSION,
-        worldspace_id: 60,
-        cells: vec![cell],
-    })
+    let identity = chunk_identity(root);
+    let world = identity.runtime_key(60).unwrap().unwrap().to_packed();
+    let bytes = shared::cache_identity::encode_terrain_chunk(
+        &identity,
+        &TerrainChunkFile {
+            format_version: TERRAIN_MESH_FORMAT_VERSION,
+            worldspace_id: world,
+            cells: vec![native_mesh(&identity, cell)],
+        },
+    )
     .unwrap();
-    let path = root.join(terrain_chunk_path(60, grid_x, 0));
+    let path = root.join(terrain_chunk_path(world, grid_x, 0));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Use a portable material table authenticated against the fresh world's allocation.
 fn ready_merge(root: &std::path::Path) -> TerrainMerge {
-    let classes = Arc::new(TerrainClasses::from_table(vanilla_table(9)).unwrap());
+    let identity = chunk_identity(root);
+    let table = native_table(&identity);
+    let path = root.join(shared::terrain_mesh::LAND_TEXTURE_TABLE_PATH);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if !path.exists() {
+        std::fs::write(&path, table.to_portable_json(&identity).unwrap()).unwrap();
+    }
+    let decoded = shared::terrain_mesh::LandTextureTable::from_portable_json(
+        &std::fs::read(path).unwrap(),
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(decoded, table);
+    let classes = Arc::new(TerrainClasses::from_table(decoded).unwrap());
     TerrainMerge::with_state(
         MergeState::Ready {
             classes,
@@ -1039,10 +1224,11 @@ fn payload_for(key: CellKey, cell_id: u32) -> Result<CellPayload, String> {
 
 #[test]
 fn only_loaded_exterior_cells_with_terrain_are_held_while_the_setup_runs() {
+    let directory = tempfile::tempdir().unwrap();
     let classes = Arc::new(TerrainClasses::from_table(vanilla_table(9)).unwrap());
     let mut waiting = TerrainMerge::with_state(
         MergeState::AwaitingDevice(classes),
-        std::path::PathBuf::new(),
+        directory.path().to_path_buf(),
     );
     assert!(should_hold_response(
         &mut waiting,
@@ -1064,7 +1250,7 @@ fn only_loaded_exterior_cells_with_terrain_are_held_while_the_setup_runs() {
         "a failed load has nothing to wait for"
     );
     // Once the setup is over (ready here) nothing is held.
-    let mut ready = ready_merge(std::path::Path::new(""));
+    let mut ready = ready_merge(directory.path());
     assert!(!should_hold_response(
         &mut ready,
         &payload_for(key(0), 1),
@@ -1072,30 +1258,42 @@ fn only_loaded_exterior_cells_with_terrain_are_held_while_the_setup_runs() {
     ));
 }
 
-/// A chunk file as the converter's own writer produces it (Phase 1's `write_terrain_chunks`) is
-/// read through the store: three cells in two chunk files, one of them west of the origin. The
-/// store memory-maps the whole file, so the archive starts on a page boundary, which is what
-/// rkyv's alignment needs; no sub-slice of a chunk is ever read.
+/// Read the converter's paired native chunks through the store: three cells in two chunk files,
+/// one west of the origin. The store maps each whole file and reads the aligned archive after
+/// its authenticated fixed envelope.
 #[test]
 fn chunk_files_written_by_the_converter_are_read_through_the_store() {
-    use converter::terrain_chunks::{PlacedCellMesh, write_terrain_chunks};
+    use converter::terrain_chunks::{PlacedCellMesh, write_form_key_terrain_chunks};
     let directory = tempfile::tempdir().unwrap();
-    let a = merged_cell(&land(0x10, rolling, [0x100; 4], &atxt_layers(), true));
-    let b = merged_cell(&land(0x11, rolling, [0x101; 4], &[], false));
-    let c = merged_cell(&land(0x12, rolling, [0x102; 4], &[], true));
+    let identity = chunk_identity(directory.path());
+    let world = identity.runtime_key(60).unwrap().unwrap().to_packed();
+    let a = native_mesh(
+        &identity,
+        merged_cell(&land(0x10, rolling, [0x100; 4], &atxt_layers(), true)),
+    );
+    let b = native_mesh(
+        &identity,
+        merged_cell(&land(0x11, rolling, [0x101; 4], &[], false)),
+    );
+    let c = native_mesh(
+        &identity,
+        merged_cell(&land(0x12, rolling, [0x102; 4], &[], true)),
+    );
     let placed = |grid_x, grid_y, mesh: &TerrainCellMesh| PlacedCellMesh {
-        worldspace_id: 60,
+        worldspace_id: world,
         grid_x,
         grid_y,
         mesh: mesh.clone(),
     };
-    let report = write_terrain_chunks(
+    let report = write_form_key_terrain_chunks(
         directory.path(),
+        &identity,
         vec![placed(1, 1, &a), placed(2, 3, &b), placed(-1, 0, &c)],
     )
     .unwrap();
     assert_eq!(report.cells, 3);
     assert_eq!(report.worldspaces[0].files, 2);
+    assert_eq!(report.worldspaces[0].worldspace_id, 0x0100_003C);
 
     let mut merge = ready_merge(directory.path());
     let exterior = |grid_x, grid_y| CellKey::Exterior {
