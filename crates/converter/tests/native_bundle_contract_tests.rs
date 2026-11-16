@@ -96,6 +96,11 @@ struct Fixture {
 
 /// Explicit supplier order Zulu/Alpha/Patch/Light differs from alphabetic owner allocation.
 fn fixture(mode: RecordBundleMode) -> Fixture {
+    fixture_with_vmad_owner(mode, false)
+}
+
+/// Keep the shared scope/order fixtures unchanged; the byte witness uses authored ACTI VMAD.
+fn fixture_with_vmad_owner(mode: RecordBundleMode, script_on_acti: bool) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("Data");
     fs::create_dir(&data).unwrap();
@@ -122,27 +127,34 @@ fn fixture(mode: RecordBundleMode) -> Fixture {
         .concat(),
     );
     let (script, sites) = vmad();
+    let mut list_fields = [
+        sub(b"EDID", b"Caf\xE9\x80\0"),
+        sub(b"LNAM", &0x0000_0810u32.to_le_bytes()),
+    ]
+    .concat();
+    if !script_on_acti {
+        list_fields.extend(sub(b"VMAD", &script));
+    }
+    let mut patch_records = [
+        record(b"STAT", 0x0100_0820, 0, &sub(b"EDID", b"ZuluOverride\0")),
+        record(b"STAT", 0x0200_0900, 0, &sub(b"EDID", b"Patch\0")),
+        record(b"FLST", 0x0200_0901, 0, &list_fields),
+    ]
+    .concat();
+    if script_on_acti {
+        patch_records.extend(record(
+            b"ACTI",
+            0x0200_0902,
+            0,
+            &[sub(b"EDID", b"Caf\xE9\x80\0"), sub(b"VMAD", &script)].concat(),
+        ));
+    }
     plugin(
         &data,
         "Patch.esp",
         &["Alpha.esm", "Zulu.esm"],
         0,
-        &[
-            record(b"STAT", 0x0100_0820, 0, &sub(b"EDID", b"ZuluOverride\0")),
-            record(b"STAT", 0x0200_0900, 0, &sub(b"EDID", b"Patch\0")),
-            record(
-                b"FLST",
-                0x0200_0901,
-                0,
-                &[
-                    sub(b"EDID", b"Caf\xE9\x80\0"),
-                    sub(b"LNAM", &0x0000_0810u32.to_le_bytes()),
-                    sub(b"VMAD", &script),
-                ]
-                .concat(),
-            ),
-        ]
-        .concat(),
+        &patch_records,
     );
     plugin(
         &data,
@@ -154,15 +166,12 @@ fn fixture(mode: RecordBundleMode) -> Fixture {
     let list = data.join("plugins.txt");
     fs::write(&list, "*Zulu.esm\n*Alpha.esm\n*Patch.esp\n*Light.esl\n").unwrap();
     let output = root.path().join("bundle");
-    export_record_bundle_typed_with_options(
-        &data,
-        &list,
-        &output,
-        &[*b"TES4", *b"FLST", *b"KYWD", *b"STAT"],
-        None,
-        mode,
-    )
-    .unwrap();
+    let mut signatures = vec![*b"TES4", *b"FLST", *b"KYWD", *b"STAT"];
+    if script_on_acti {
+        signatures.push(*b"ACTI");
+    }
+    export_record_bundle_typed_with_options(&data, &list, &output, &signatures, None, mode)
+        .unwrap();
     Fixture {
         _root: root,
         output,
@@ -312,9 +321,13 @@ fn typed_bundle_orders_headers_then_types_then_original_full_light_owners() {
 
 #[test]
 fn nested_typed_ids_are_named_while_native_bytes_aliases_and_text_stay_explicit() {
-    let fixture = fixture(RecordBundleMode::RecordArchiveOnly);
+    let fixture = fixture_with_vmad_owner(RecordBundleMode::RecordArchiveOnly, true);
     let rows = rows(&fixture.output);
     let row = rows
+        .iter()
+        .find(|row| row["form_id"] == "000902:Patch.esp")
+        .unwrap();
+    let list_row = rows
         .iter()
         .find(|row| row["form_id"] == "000901:Patch.esp")
         .unwrap();
@@ -354,7 +367,7 @@ fn nested_typed_ids_are_named_while_native_bytes_aliases_and_text_stay_explicit(
     assert_eq!(member(&objects[2], "alias")["Signed"], 7);
     assert_eq!(script["canonical_bytes"], json!(fixture.vmad));
     assert_eq!(
-        field(row, b"LNAM")["canonical_bytes"],
+        field(list_row, b"LNAM")["canonical_bytes"],
         json!(0x0000_0810u32.to_le_bytes())
     );
     assert_eq!(field(row, b"EDID")["value"]["String"], "Caf\u{e9}\u{20ac}");
@@ -367,11 +380,11 @@ fn nested_typed_ids_are_named_while_native_bytes_aliases_and_text_stay_explicit(
     let key = context
         .identity()
         .table()
-        .intern(&"000901:Patch.esp".parse().unwrap())
+        .intern(&"000902:Patch.esp".parse().unwrap())
         .unwrap()
         .unwrap();
     let record = context.record(key).unwrap();
-    assert_eq!(record.source_header, 0x0200_0901);
+    assert_eq!(record.source_header, 0x0200_0902);
     assert_eq!(
         context
             .identity()
@@ -385,11 +398,11 @@ fn nested_typed_ids_are_named_while_native_bytes_aliases_and_text_stay_explicit(
     assert_eq!(record.text(*b"EDID").as_deref(), Some("Caf\u{e9}\u{20ac}"));
     assert_eq!(record.bytes(*b"VMAD"), Some(fixture.vmad.as_slice()));
     for &(offset, word, expected) in &fixture.sites {
-        let resolved = record.resolve_at(2, offset).unwrap();
+        let resolved = record.resolve_at(1, offset).unwrap();
         let actual = resolved.map(|key| context.identity().table().named(key).unwrap().to_string());
         assert_eq!(actual.as_deref(), expected);
         let (source, outcome): (u32, String) = db.query_row(
-            "SELECT source_word,outcome FROM resolved_links WHERE record_key=?1 AND source_ordinal=2 AND byte_offset=?2",
+            "SELECT source_word,outcome FROM resolved_links WHERE record_key=?1 AND source_ordinal=1 AND byte_offset=?2",
             (key.to_sql_i64(), offset as u64), |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(source, word);
