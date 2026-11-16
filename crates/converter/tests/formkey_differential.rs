@@ -565,6 +565,13 @@ fn native_logical_dump(
     let identity = context.identity();
     assert_eq!(identity.order().len(), 3);
     assert_eq!(
+        old.query_row("SELECT version FROM schema_info", [], |row| row
+            .get::<_, u32>(0))
+            .unwrap(),
+        shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "the memory-only scalar oracle and current native writer use the same explicit floor"
+    );
+    assert_eq!(
         new.query_row("SELECT version FROM schema_info", [], |row| row
             .get::<_, u32>(0))
             .unwrap(),
@@ -893,9 +900,6 @@ fn native_logical_dump(
                                     .collect::<Vec<_>>(),
                             )
                         });
-                    }
-                    if name == "schema_info" && column == "version" {
-                        row[index] = Value::Integer(0);
                     }
                 }
             }

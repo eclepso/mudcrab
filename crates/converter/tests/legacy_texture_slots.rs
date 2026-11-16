@@ -218,10 +218,7 @@ fn assert_owner(database: &Connection, id: u32, plugin: &str, local: u32) {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(
-        (stored.0.to_lowercase(), stored.1),
-        (plugin.to_lowercase(), local)
-    );
+    assert_eq!(stored, (plugin.to_owned(), local));
 }
 
 /// Generate identical native sources for the separate SQL regressions and asset-byte control.

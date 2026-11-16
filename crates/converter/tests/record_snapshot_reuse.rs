@@ -96,7 +96,7 @@ fn complete_public_exports_replace_prior_records_plugins_and_lod() {
     let owner: String = db
         .query_row("SELECT plugin_name FROM formid_map", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(owner, "Base.esm");
+    assert_eq!(owner, "base.esm");
     assert_eq!(count(&db, "lod"), 0);
     assert_eq!(count(&db, "caller_notes"), 1);
     assert_eq!(count(&db, "conversion_cache"), 1);

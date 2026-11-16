@@ -133,6 +133,22 @@ fn player_selection_master_remap_and_stable_owner_agree_on_case_pairs() {
     assert_eq!(history.versions[1].plugin, "Patch.esp");
     assert!(history.versions[1].winner);
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let stable_owner: (String, u32, u32) = db.query_row(
+        "SELECT plugin_name,internal_id,load_order FROM formid_map JOIN records USING(form_id) WHERE form_id=?1",
+        [common::stored_key(&db, 0x0100_1800)], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    assert_eq!(stable_owner, (LOWER.to_owned(), 0x1800, 2));
+    let identity = shared::pack_identity::PackIdentity::read_sql(&db).unwrap();
+    let owner_key = identity.runtime_key(0x0100_1800).unwrap().unwrap();
+    let entry = identity.table().entry(owner_key.plugin()).unwrap();
+    assert_eq!(
+        entry.display_name, UPPER,
+        "portable display spelling is retained separately"
+    );
+    assert_eq!(
+        entry.normalized_name, LOWER,
+        "stored owner key uses shared Unicode lowercase"
+    );
     let owner: String = db
         .query_row(
             "SELECT original_owner FROM record_overrides WHERE record_type='STAT' AND plugin_id=1",

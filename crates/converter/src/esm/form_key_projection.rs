@@ -89,7 +89,7 @@ impl<'a> ProjectionStage<'a> {
             plugin_ids.insert(
                 handle,
                 StableId {
-                    plugin: owner.display_name.clone(),
+                    plugin: owner.normalized_name.clone(),
                     local_id: key.local(),
                 },
             );
@@ -284,7 +284,16 @@ mod tests {
             stage.original(handle).unwrap().source.subrecords[0].1,
             0x0100_0912u32.to_le_bytes()
         );
-        assert_eq!(stage.plugin_ids[&handle].plugin, "Alpha.esp");
+        assert_eq!(stage.plugin_ids[&handle].plugin, "alpha.esp");
+        assert_eq!(
+            conversion
+                .order
+                .table()
+                .entry(key.plugin())
+                .unwrap()
+                .display_name,
+            "Alpha.esp"
+        );
         assert_eq!(stage.plugin_ids[&handle].local_id, 0x811);
         assert!(stage.original(target).is_err());
         assert_eq!(stage.key(0).unwrap(), None);

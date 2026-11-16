@@ -321,14 +321,14 @@ fn database_identities_survive_slot_changes_and_keep_override_provenance() {
             [common::stored_key(&conn, id)], |row| Ok((row.get::<_,String>(0)?, row.get::<_,u32>(1)?, row.get::<_,u32>(2)?))).unwrap()
         };
         let priority = paths.len() as u32 - 1;
-        assert_eq!(read(full_id), ("Base.esm".into(), 0x800, priority));
-        assert_eq!(read(light_id), ("Light.esl".into(), 0x810, priority));
+        assert_eq!(read(full_id), ("base.esm".into(), 0x800, priority));
+        assert_eq!(read(light_id), ("light.esl".into(), 0x810, priority));
         // An unbound scalar subset may not overwrite an authenticated native generation.
         let mut records = EsmParser::merge_plugins(&paths).unwrap();
         let error = export_to_db(&conn, &records).unwrap_err();
         assert!(error.to_string().contains("convert again"));
-        assert_eq!(read(full_id), ("Base.esm".into(), 0x800, priority));
-        assert_eq!(read(light_id), ("Light.esl".into(), 0x810, priority));
+        assert_eq!(read(full_id), ("base.esm".into(), 0x800, priority));
+        assert_eq!(read(light_id), ("light.esl".into(), 0x810, priority));
         // Unresolved ownership is an error, and rolls back the whole export.
         let mut invalid = records[&full_id].clone();
         invalid.form_id = 0xff000999;
@@ -426,7 +426,7 @@ fn game_settings_override_by_editor_id_with_deletion_restoration_and_null_overri
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
-                "Base.esm"
+                "base.esm"
             );
         } else {
             assert_eq!(
@@ -548,7 +548,7 @@ fn header_only_setting_deletions_resolve_original_override_and_light_aliases() {
             let value: (String, u32, f64) = conn.query_row(
                 "SELECT plugin_name,internal_id,value FROM formid_map JOIN movement_game_settings ON formid_map.form_id=movement_game_settings.id", [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
-            assert_eq!(value, ("Base.esm".into(), 0x800, 120.0));
+            assert_eq!(value, ("base.esm".into(), 0x800, 120.0));
         }
     }
 }
