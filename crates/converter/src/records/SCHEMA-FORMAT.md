@@ -248,8 +248,9 @@ as an override winner. An unusable candidate leaves its earlier usable
 predecessor. Short summaries remain bounded; every distinct recovery event is
 spooled to disk and published in the scalar `record_diagnostics` table as
 described in [the diagnostic contract](../../../../docs/specs/converters/record-diagnostics.md).
-`typed-records.jsonl` writes selected winning records in ascending record-type
-signature byte order, then ascending unsigned canonical FormID. The adapter
+`typed-records.jsonl` writes selected TES4 headers first in supplier order, then
+winning records in ascending record-type signature byte order and original-owner
+full/light ordinal/local order. Pack plugin allocation never defines line order. The adapter
 sorts only these compact keys and streams each record before moving its field
 buffers into runtime projection; field, component and array order stay intact.
 The same traversal gives localized provenance rows a reproducible insertion
@@ -290,7 +291,9 @@ the hook must not treat a missing or malformed entry as a whole-run error. VMAD
 uses the independently authored bounded `records/vmad.rs` hook and returns a
 typed struct while retaining its canonical byte representation. Script/property
 names and values use the native UTF-8 encoding. Primary and alias objects retain
-their signed alias numbers and unused words; only FormIDs are rewritten. The
+their signed alias numbers and unused words. Native output names semantic
+FormIDs and retains their original four-byte supplier-relative words in canonical
+bytes; the bundle scope binds their SQL context and byte namespaces. The
 shared `vmad` definition applies to explicit VMAD occurrences and to the
 top-level `common_fields` occurrence on otherwise opaque record types. That
 fallback preserves the existing generic script consumer contract; it does not

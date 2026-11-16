@@ -323,9 +323,7 @@ pub fn export_record_bundle_typed_with_options(
     let plugins =
         super::plugins_txt::read_form_key_plugins_with_options(plugins_file, data, None, None)?;
     fs::create_dir(output)?;
-    if mode == RecordBundleMode::RecordArchiveOnly {
-        write_record_archive_scope(output, false, signatures)?;
-    }
+    write_record_bundle_scope(output, mode, false, signatures)?;
     if let Some(work) = separate_work {
         // Exclusive creation: failures retain the new output; existing paths are never reused.
         fs::create_dir(work)?;
@@ -421,42 +419,166 @@ pub fn export_record_bundle_typed_with_options(
             output.join("record-reader.json"),
             serde_json::to_vec_pretty(&identity)?,
         )?;
-        write_record_archive_scope(output, true, signatures)?;
     }
+    write_record_bundle_scope(output, mode, true, signatures)?;
     bundle_stage.finish(record_count);
     Ok(count)
 }
 
-/// Declare incomplete/completed diagnostic scope without claiming runtime readiness.
-fn write_record_archive_scope(output: &Path, complete: bool, signatures: &[[u8; 4]]) -> Result<()> {
-    // This manifest is owned by this invocation in its exclusively created fresh output.
+/// Native link words remain supplier-relative in both canonical byte representations.
+const BUNDLE_SCOPE_SCHEMA: &str = "inhouse-diagnostic-record-bundle-scope-v2";
+const SOURCE_CONTEXT_TABLES: &[&str] = &[
+    "pack_identity",
+    "pack_plugins",
+    "canonical_record_contract",
+    "record_context",
+    "record_source_fields",
+    "record_field_origins",
+    "resolved_links",
+];
+
+/// Describe the diagnostic byte namespaces and bind completed metadata to one pack allocation.
+fn record_bundle_scope_value(
+    mode: RecordBundleMode,
+    complete: bool,
+    typed_signatures: &[String],
+    identity: Option<&shared::pack_identity::PackIdentity>,
+) -> serde_json::Value {
+    let archive = mode == RecordBundleMode::RecordArchiveOnly;
+    let deferred: &[&str] = if archive {
+        DEFERRED_RUNTIME_TABLES
+    } else {
+        &[]
+    };
+    serde_json::json!({
+        "schema": BUNDLE_SCOPE_SCHEMA,
+        "mode": if archive { "record_archive_only" } else { "full" },
+        "status": if !complete { "INCOMPLETE" } else if archive {
+            "COMPLETE_DIAGNOSTIC_ARCHIVE_RUNTIME_VIEWS_DEFERRED"
+        } else { "COMPLETE_DIAGNOSTIC_BUNDLE_RUNTIME_VIEWS_MATERIALIZED" },
+        "runtime_ready": false,
+        "runtime_views_materialized": complete && !archive,
+        "plugin_table_digest": identity.map(shared::pack_identity::PackIdentity::digest_hex),
+        "canonical_context_version": shared::records::RECORD_CONTEXT_VERSION,
+        "native_source_word_namespace": "supplier-mast-relative-u32",
+        "source_context_database": "skyrim_world.db",
+        "source_context_tables": SOURCE_CONTEXT_TABLES,
+        "byte_contract": {
+            "sql_records_data": "rkyv-canonical-subrecords-with-source-relative-links",
+            "typed_field_canonical_bytes": "bounded-decoder-canonical-fields-with-source-relative-links",
+            "original_payload": "inhouse_source_records.payload",
+            "text_values": "decoded-unicode-not-native-byte-arrays"
+        },
+        "preserved_sql_tables": ["schema_info", "plugins", "records", "formid_map",
+            "inhouse_source_records", "inhouse_localized_fields", "inhouse_terrain_source_order",
+            "inhouse_terrain_layers", "inhouse_unresolved_terrain_textures", "record_overrides",
+            "inhouse_plugin_masters", "inhouse_schema_addons", "record_diagnostics",
+            "pack_identity", "pack_plugins", "canonical_record_contract", "record_context",
+            "record_source_fields", "record_field_origins", "resolved_links", "record_text", "land_context"],
+        "deferred_runtime_tables": deferred,
+        "unchanged_auxiliary_tables": ["conversion_cache", "lod", "lod_chunks", "lod_build",
+            "lod_chunks_spatial", "lod_chunks_spatial_node", "lod_chunks_spatial_parent", "lod_chunks_spatial_rowid"],
+        "preserved_cache_files": ["cell_cache.rkyv", "cell_cache_preserved.rkyv"],
+        "typed_signatures": typed_signatures,
+        "typed_selection_changed": false,
+        "asset_conversion": false,
+        "no_lod": true,
+        "whole_runtime_SQL_equivalence_claim": false,
+    })
+}
+
+/// Bind completed bundle metadata to the published SQL, never to a static cache-input identity.
+fn write_record_bundle_scope(
+    output: &Path,
+    mode: RecordBundleMode,
+    complete: bool,
+    signatures: &[[u8; 4]],
+) -> Result<()> {
     let typed_signatures = signatures
         .iter()
         .map(|tag| String::from_utf8_lossy(tag).into_owned())
         .collect::<Vec<_>>();
+    let identity = if complete {
+        let connection = Connection::open_with_flags(
+            output.join("skyrim_world.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        shared::world_assets::validate_world_database(&output.join("skyrim_world.db"))?;
+        Some(
+            shared::records::RecordContextReader::new(&connection)?
+                .identity()
+                .clone(),
+        )
+    } else {
+        None
+    };
     fs::write(
         output.join("record-bundle-scope.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "inhouse-diagnostic-record-bundle-scope-v1",
-            "mode": "record_archive_only",
-            "status": if complete { "COMPLETE_DIAGNOSTIC_ARCHIVE_RUNTIME_VIEWS_DEFERRED" } else { "INCOMPLETE" },
-            "runtime_ready": false,
-            "runtime_views_materialized": false,
-            "preserved_sql_tables": ["schema_info", "plugins", "records", "formid_map",
-                "inhouse_source_records", "inhouse_localized_fields", "inhouse_terrain_source_order",
-                "inhouse_terrain_layers", "inhouse_unresolved_terrain_textures", "record_overrides", "inhouse_plugin_masters", "inhouse_schema_addons", "record_diagnostics"],
-        "deferred_runtime_tables": DEFERRED_RUNTIME_TABLES,
-        "unchanged_auxiliary_tables": ["conversion_cache", "lod", "lod_chunks", "lod_build",
-            "lod_chunks_spatial", "lod_chunks_spatial_node", "lod_chunks_spatial_parent", "lod_chunks_spatial_rowid"],
-            "preserved_cache_files": ["cell_cache.rkyv", "cell_cache_preserved.rkyv"],
-            "typed_signatures": typed_signatures,
-            "typed_selection_changed": false,
-            "asset_conversion": false,
-            "no_lod": true,
-            "whole_runtime_SQL_equivalence_claim": false,
-        }))?,
+        serde_json::to_vec_pretty(&record_bundle_scope_value(
+            mode,
+            complete,
+            &typed_signatures,
+            identity.as_ref(),
+        ))?,
     )?;
     Ok(())
+}
+
+/// Validate optional diagnostic bundle metadata before keys or payloads are consumed.
+/// Ordinary current worlds need no scope. A typed/schema member or archive marker requires it;
+/// removing the scope from a diagnostic bundle cannot make that bundle an ordinary world.
+/// Returned bytes let immutable audit callers guard the same metadata again after reading.
+pub fn validate_record_bundle_scope(
+    database: &Path,
+    connection: &Connection,
+) -> Result<Option<Vec<u8>>> {
+    use color_eyre::eyre::{WrapErr, ensure};
+    shared::world_assets::validate_world_database(database)?;
+    let context = shared::records::RecordContextReader::new(connection)?;
+    let root = database.parent().unwrap_or_else(|| Path::new("."));
+    let path = root.join("record-bundle-scope.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let reader_marks_bundle = match fs::read(root.join("record-reader.json")) {
+                Ok(bytes) => {
+                    let reader: serde_json::Value = serde_json::from_slice(&bytes)
+                        .wrap_err("invalid record reader metadata; convert again")?;
+                    reader.get("bundle_mode").is_some() || reader["runtime_ready"] == false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(error).wrap_err("cannot read record reader metadata; convert again");
+                }
+            };
+            ensure!(
+                !root.join("typed-records.jsonl").exists()
+                    && !root.join("records-schema.json").exists()
+                    && !reader_marks_bundle,
+                "typed record bundle has no bound scope metadata; convert again"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error).wrap_err("cannot read record bundle scope; convert again"),
+    };
+    let scope: serde_json::Value =
+        serde_json::from_slice(&bytes).wrap_err("invalid record bundle scope; convert again")?;
+    ensure!(
+        scope["schema"] == BUNDLE_SCOPE_SCHEMA,
+        "old record bundle scope; convert again"
+    );
+    let mode = match scope["mode"].as_str() {
+        Some("full") => RecordBundleMode::Full,
+        Some("record_archive_only") => RecordBundleMode::RecordArchiveOnly,
+        _ => color_eyre::eyre::bail!("unknown record bundle scope mode; convert again"),
+    };
+    let signatures: Vec<String> = serde_json::from_value(scope["typed_signatures"].clone())
+        .wrap_err("invalid typed record selection in bundle scope; convert again")?;
+    ensure!(
+        scope == record_bundle_scope_value(mode, true, &signatures, Some(context.identity())),
+        "record bundle scope does not match its current SQL identity/context; convert again"
+    );
+    Ok(Some(bytes))
 }
 
 /// Resolve a fresh leaf through its existing parent, rejecting files, directories and symlinks.

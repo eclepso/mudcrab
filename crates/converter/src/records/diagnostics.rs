@@ -605,6 +605,7 @@ pub fn read_native_for_form(
     form: &shared::form_key::NamedFormKey,
 ) -> Result<NativeDiagnosticReport> {
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = crate::esm::inhouse::validate_record_bundle_scope(path, &connection)?;
     let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
     let key = identity
         .table()

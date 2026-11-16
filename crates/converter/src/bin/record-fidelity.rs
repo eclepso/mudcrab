@@ -100,6 +100,7 @@ fn audit_before_final_check(
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    let bundle_scope = converter::esm::inhouse::validate_record_bundle_scope(&database, &conn)?;
     let reader_bytes = std::fs::read(pack.join("record-reader.json"))?;
     let reader: serde_json::Value = serde_json::from_slice(&reader_bytes)?;
     ensure!(
@@ -127,6 +128,10 @@ fn audit_before_final_check(
     );
     before_final_check();
     ensure!(
+        bundle_scope == converter::esm::inhouse::validate_record_bundle_scope(&database, &conn)?,
+        "record bundle scope changed during audit"
+    );
+    ensure!(
         before == hash_file(&database)?,
         "database changed during audit"
     );
@@ -147,6 +152,7 @@ fn audit_before_final_check(
         "database_sha256": before,
         "reader": reader,
         "reader_identity_sha256": hash_bytes(&reader_bytes),
+        "record_bundle_scope_sha256": bundle_scope.as_ref().map(|bytes| hash_bytes(bytes)),
         "audit_binary_sha256": audit_binary_sha256,
         "schema_sha256": schemas.schema_sha256(),
         "builtin_schema_sha256": hash_bytes(schema_bytes),

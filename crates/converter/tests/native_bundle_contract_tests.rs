@@ -1,5 +1,4 @@
-//! Generated bundle-contract assertions. Copy to converter/tests before applying the follow-up.
-//! These tests use existing public APIs so the unfixed source can produce assertion reds.
+//! Native bundle scope, ordering and byte contracts from independently framed plugin inputs.
 use converter::{
     esm::inhouse::{RecordBundleMode, export_record_bundle_typed_with_options},
     records::{diagnostics::read_native_for_form, history::read_native_chain},

@@ -403,6 +403,7 @@ pub fn read_native_chain(
     form: &shared::form_key::NamedFormKey,
 ) -> Result<NativeHistoryReport> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = crate::esm::inhouse::validate_record_bundle_scope(path, &connection)?;
     let identity = shared::pack_identity::PackIdentity::read_sql(&connection)?;
     let key = identity
         .table()

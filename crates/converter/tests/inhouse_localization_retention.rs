@@ -1245,10 +1245,15 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
         assert_eq!(identity["bundle_mode"], "record_archive_only");
         assert_eq!(identity["runtime_ready"], false);
     }
-    assert!(
-        !full.join("record-bundle-scope.json").exists(),
-        "default API output contract changed"
+    let full_scope: serde_json::Value =
+        serde_json::from_slice(&fs::read(full.join("record-bundle-scope.json")).unwrap()).unwrap();
+    assert_eq!(
+        full_scope["schema"],
+        "inhouse-diagnostic-record-bundle-scope-v2"
     );
+    assert_eq!(full_scope["mode"], "full");
+    assert_eq!(full_scope["runtime_views_materialized"], true);
+    assert_eq!(full_scope["runtime_ready"], false);
     for name in ["skyrim_world.db", "inhouse-reader-diagnostics.json"] {
         let working = fs::read(work.join(name)).unwrap();
         let published = fs::read(copied.join(name)).unwrap();

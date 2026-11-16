@@ -231,9 +231,22 @@ pub(crate) fn convert_with_dump(
                 writer.write_all(b"\n")?;
             }
         }
-        let mut ordered = read.records.keys().copied().collect::<Vec<_>>();
-        ordered.sort_unstable();
-        for key in ordered {
+        // TES4 headers remain first in supplier order. Winner ordering retains the
+        // original record-type/full/light owner order, independent of pack allocation.
+        let mut ordered = read
+            .records
+            .iter()
+            .map(|(key, native)| {
+                Ok((
+                    native.source.record_type,
+                    conversion.order.identity_sort_tuple(*key)?,
+                    *key,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered
+            .sort_unstable_by_key(|(signature, original_order, _)| (*signature, *original_order));
+        for (_, _, key) in ordered {
             let native = &read.records[&key];
             if !wanted(&native.source.record_type) {
                 continue;

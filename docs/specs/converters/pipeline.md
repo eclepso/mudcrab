@@ -165,7 +165,14 @@ selection, canonical `records` and `formid_map`, original source payloads, physi
 override history, localized keys/text/status, terrain layers/source order and both
 terrain caches. It defers runtime materialized tables, script indexing and the
 exterior spatial index. Script bytes and typed VMAD fields remain in the records.
-`record-bundle-scope.json` begins with `INCOMPLETE` and declares completion only
+Both full and archive-only diagnostic bundles write version-2
+`record-bundle-scope.json`, bound to the published SQL plugin-table digest and
+canonical-context version. It distinguishes source-relative native link words,
+bounded canonical byte arrays, decoded Unicode text and retained original payloads.
+Typed/schema bundle members require this metadata; native history, diagnostics,
+source-history and fidelity readers refuse missing, old or mismatched scope with
+`convert again`. Ordinary current worlds without diagnostic bundle members need
+no scope file. The scope begins with `INCOMPLETE` and declares completion only
 after all retained artifacts and any database copy finish. It lists preserved and
 deferred tables and stamps `runtime_ready=false`, as does `record-reader.json`.
 This option does not produce a runnable pack or claim whole runtime SQL

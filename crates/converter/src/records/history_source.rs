@@ -424,7 +424,8 @@ pub fn visit_native_source_history(
     } else {
         pack.join("skyrim_world.db")
     };
-    let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = crate::esm::inhouse::validate_record_bundle_scope(&database, &conn)?;
     let pack_identity = shared::pack_identity::PackIdentity::read_sql(&conn)?;
     let mut sources = Vec::with_capacity(pack_identity.order().len());
     for (priority, &plugin) in pack_identity.order().iter().enumerate() {
