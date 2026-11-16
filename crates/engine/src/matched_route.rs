@@ -56,11 +56,6 @@ impl MatchedRoute {
             &serde_json::to_string(&document).map_err(|error| ShotsError(error.to_string()))?,
         )
     }
-    pub(crate) fn load(path: &Path) -> Result<Self, ShotsError> {
-        let text = fs::read_to_string(path).map_err(|e| ShotsError(e.to_string()))?;
-        Self::parse(&text)
-    }
-
     #[cfg(test)]
     pub(crate) fn parse_for_test(text: &str) -> (ShotsFile, BTreeSet<usize>) {
         Self::parse(text).unwrap().expand().unwrap()
