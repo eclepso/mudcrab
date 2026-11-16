@@ -742,10 +742,13 @@ mod tests {
         assert_eq!(typed.len(), 2);
         let mut typed_ids = typed
             .iter()
-            .map(|record| record["form_id"].as_u64().unwrap())
+            .map(|record| record["form_id"].as_str().unwrap())
             .collect::<Vec<_>>();
         typed_ids.sort_unstable();
-        assert_eq!(typed_ids, [0x810, 0x811]);
+        assert_eq!(
+            typed_ids,
+            ["000810:ArrayNeighbors.esp", "000811:ArrayNeighbors.esp"]
+        );
         assert!(
             typed
                 .iter()

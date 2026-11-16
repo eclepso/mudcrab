@@ -322,6 +322,66 @@ impl std::fmt::Display for CandidateFailure {
     }
 }
 
+/// Admission failures retain their stage and physical source without granting recovery authority.
+fn validate_candidate(
+    record: &NativeRecord,
+    stage: &str,
+    validate: &mut impl FnMut(&NativeRecord) -> std::result::Result<(), String>,
+) -> std::result::Result<(), CandidateFailure> {
+    validate(record).map_err(|reason| {
+        format!(
+            "unusable runtime candidate during {stage}: {} source {:08X}: {reason}",
+            String::from_utf8_lossy(&record.source.record_type),
+            record.source.form_id,
+        )
+        .into()
+    })
+}
+
+/// INFO's semantic group owner requires a live DIAL; its physical group facts stay unchanged.
+fn resolve_topic(
+    decoded: &mut DecodedRecord,
+    capture: &DecodeContext<'_>,
+    diagnostics: &mut PluginDiagnostics,
+) -> std::result::Result<Option<FormKey>, String> {
+    let topic = decoded
+        .topic_form_id
+        .map(|word| capture.resolve_word(word))
+        .transpose()?
+        .flatten();
+    let invalid = decoded.record_type == *b"INFO"
+        && capture.kinds.is_some_and(|kinds| {
+            topic.map_or(decoded.source_topic_form_id == Some(0), |key| {
+                kinds.get(&key) != Some(b"DIAL")
+            })
+        });
+    if !invalid {
+        return Ok(topic);
+    }
+    diagnostics.set_record(
+        decoded.source_record_offset,
+        Some(decoded.record_type),
+        Some(decoded.source_form_id),
+        Some(decoded.form_id),
+        "targets",
+    );
+    diagnostics.set_field("GRUP7".into());
+    let source_word = decoded.source_topic_form_id.unwrap_or(0);
+    diagnostics.link(source_word);
+    diagnostics.note("link", || {
+        if source_word == 0 {
+            format!("INFO {:08X} GRUP7 has a null owner", decoded.source_form_id)
+        } else {
+            format!(
+                "INFO {:08X} GRUP7 owner {source_word:08X} is absent or is not DIAL",
+                decoded.source_form_id,
+            )
+        }
+    });
+    decoded.topic_form_id = None;
+    Ok(None)
+}
+
 /// Decode source bytes and typed values using one prepared schema and native catalogue.
 fn decode_candidate(
     scanned: scanner::ScannedRecord,
@@ -352,7 +412,7 @@ fn decode_candidate(
         winning_types: replay.kinds.map(|_| &marker),
     };
     // Localization is represented by original string IDs here; publication supplies resolved text.
-    let decoded = decoder::decode_with_identity_omitting(
+    let mut decoded = decoder::decode_with_identity_omitting(
         scanned,
         read.schemas.schema(),
         read.prepared,
@@ -383,11 +443,7 @@ fn decode_candidate(
         .map(|word| capture.resolve_word(word))
         .transpose()?
         .flatten();
-    let topic = decoded
-        .source_topic_form_id
-        .map(|word| capture.resolve_word(word))
-        .transpose()?
-        .flatten();
+    let topic = resolve_topic(&mut decoded, &capture, diagnostics)?;
     Ok(NativeRecord {
         source,
         canonical,
@@ -556,7 +612,7 @@ pub fn read_plugins_form_keys_with_validation(
                 )
                 .and_then(|record| {
                     if !record.source.is_deleted() && record.source.record_type != *b"TES4" {
-                        validate(&record)?;
+                        validate_candidate(&record, "initial native admission", &mut validate)?;
                     }
                     Ok(record)
                 });
@@ -754,7 +810,7 @@ pub fn read_plugins_form_keys_with_validation(
                 &mut observed_editor,
             )
             .and_then(|record| {
-                validate(&record)?;
+                validate_candidate(&record, "native catalogue replay", &mut validate)?;
                 Ok(record)
             }) {
                 Ok(record) => {
@@ -795,7 +851,11 @@ pub fn read_plugins_form_keys_with_validation(
                                         .to_owned()
                                         .into());
                                 }
-                                validate(&record)?;
+                                validate_candidate(
+                                    &record,
+                                    "deferred native recovery",
+                                    &mut validate,
+                                )?;
                                 Ok(record)
                             });
                             match recovered {

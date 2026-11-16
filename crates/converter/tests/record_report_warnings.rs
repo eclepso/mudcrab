@@ -341,8 +341,13 @@ fn incomplete(report: &PipelineReport, output: &Path, warning_count: usize) {
 }
 
 /// Match a compatibility category without confusing it with a data-loss summary.
-fn compatibility_kind(_reader: RecordReader) -> &'static str {
-    "supplier-self runtime compatibility"
+fn compatibility_kind(reader: RecordReader) -> &'static str {
+    match reader {
+        RecordReader::Legacy => {
+            "FormID occurrence(s) past the original master list resolved to self"
+        }
+        RecordReader::Inhouse => "supplier-self runtime compatibility",
+    }
 }
 
 /// Require one counted compatibility notice while retaining unrelated metadata advisories.
@@ -361,12 +366,13 @@ fn compatibility_notice(report: &PipelineReport, reader: RecordReader) {
     );
     let message = messages[0];
     assert!(message.starts_with("notice:"), "{message}");
-    let count = if reader == RecordReader::Legacy { 2 } else { 1 };
-    assert!(
-        message.contains(&format!("compatibility for {count} headers")),
-        "{message}"
-    );
-    assert!(message.contains("original owners unresolved"), "{message}");
+    match reader {
+        RecordReader::Legacy => assert!(message.contains("2 FormID occurrence(s)"), "{message}"),
+        RecordReader::Inhouse => {
+            assert!(message.contains("compatibility for 1 headers"), "{message}");
+            assert!(message.contains("original owners unresolved"), "{message}");
+        }
+    }
     assert!(message.contains("first:"), "{message}");
     assert!(message.contains("07000810"), "{message}");
 }

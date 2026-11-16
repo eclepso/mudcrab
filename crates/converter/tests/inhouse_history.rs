@@ -177,8 +177,11 @@ async fn history_rejects_bad_stored_masters_cleanly() {
         .arg("00001800")
         .output()
         .unwrap();
-    assert!(cli.status.success());
-    let message = String::from_utf8(cli.stdout).unwrap();
+    assert!(
+        !cli.status.success(),
+        "edited original master metadata must refuse history decoding"
+    );
+    let message = String::from_utf8(cli.stderr).unwrap();
     assert!(message.contains("Absent.esm") && message.contains("must precede"));
 }
 
@@ -266,9 +269,12 @@ async fn history_keeps_duplicate_unmappable_and_truncated_headers() {
         |version| {
             assert_eq!(
                 version.identity.state,
-                converter::records::source_identity::SourceIdentityState::MasterIndexOutOfRange
+                converter::records::source_identity::SourceIdentityState::Resolved
             );
-            assert_eq!(version.identity.original_owner, None);
+            assert_eq!(
+                version.identity.original_owner.as_deref(),
+                Some("light.esp")
+            );
             assert_eq!(version.identity.full_local, Some(0x1880));
             assert_eq!(version.runtime_form_id, None);
             assert!(version.runtime_record_present);

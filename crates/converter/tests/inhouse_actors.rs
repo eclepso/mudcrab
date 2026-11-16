@@ -996,6 +996,6 @@ fn typed_actor_export_uses_strings_and_dlstrings_without_conflating_ids() {
         ]
     );
     for value in localization.values() {
-        assert_eq!(value["id"], 17);
+        assert_eq!(value["string_id"], 17);
     }
 }

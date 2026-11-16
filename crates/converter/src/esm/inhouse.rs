@@ -2714,6 +2714,25 @@ mod runtime_move_tests {
                 )
                 .unwrap();
             assert_eq!(localized, (8, 1, "Q7z".into()));
+            let movement: (Option<i64>, Option<i64>) = conn.query_row(
+                "SELECT walk_movt_id,run_movt_id FROM race_movement_links WHERE id=stored_key(?1)",
+                [runtime_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(
+                movement,
+                (None, None),
+                "localized scalar bytes are not semantic movement links"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM resolved_links WHERE record_key=stored_key(?1)",
+                    [runtime_id],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+                0,
+                "the authored text schema certifies no movement link sites"
+            );
         }
         let versions = conn
             .prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=stored_key(?1) ORDER BY plugin_id")
@@ -2937,6 +2956,7 @@ mod runtime_move_tests {
             )
             .unwrap();
         assert_eq!(accepted, ("skipped".into(), race_offset));
+        let neighbor_key = test_named_key(&conn, neighbor_id);
         drop(conn);
         let typed = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
         let typed = typed
@@ -2944,7 +2964,7 @@ mod runtime_move_tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(typed.len(), 1);
-        assert_eq!(typed[0]["form_id"], neighbor_id);
+        assert_eq!(typed[0]["form_id"], neighbor_key);
         assert_eq!(
             typed[0]["source_payload_sha256"],
             crate::cache::hash_bytes(&neighbor_payload)

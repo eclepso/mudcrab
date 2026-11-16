@@ -648,11 +648,25 @@ async fn ai_families_publish_prior_winners_and_neighbors_after_bad_compression()
         )
         .unwrap();
     assert_eq!(source, recovered_package);
-    let types = canonical
+    let native_types = canonical
         .subrecords
         .iter()
         .filter(|field| field.tag == *b"ANAM")
         .collect::<Vec<_>>();
+    assert_eq!(native_types.len(), 3);
+    assert_eq!(native_types[0].data.as_slice(), b"Bool\0\0");
+    assert_eq!(
+        native_types[1].data.as_slice(),
+        b"Float\0publication-padding"
+    );
+    assert_eq!(native_types[2].data.as_slice(), b"Int\0");
+    let runtime = common::runtime_record(&database, 0x01001E90);
+    let types = runtime
+        .subrecords
+        .iter()
+        .filter(|field| field.tag == *b"ANAM")
+        .collect::<Vec<_>>();
+    assert_eq!(types.len(), 3);
     // The existing runtime adapter emits UTF-8 strings with one NUL; provenance
     // above retains their complete native padding and the rejected value bytes.
     assert_eq!(types[0].data.as_slice(), b"Bool\0".as_slice());

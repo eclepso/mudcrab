@@ -420,7 +420,7 @@ fn native_deferred_recovery_keeps_independent_same_tag_root_and_physical_sites()
         let good = [0x881u32.to_le_bytes(), 0x882u32.to_le_bytes()].concat();
         let opaque = [0x81, 0x88, 0x00, 0x00, 0x82, 0x88, 0x00, 0x00, 0xA7];
         let payload = [
-            sub(b"EDID", b"IndependentDeferredRoots\0"),
+            sub(b"EDID", b"IndependentOwnershipRoots\0"),
             sub(b"COED", if bad_first { &bad } else { &good }),
             sub(b"ZRAW", &opaque),
             sub(b"COED", if bad_first { &good } else { &bad }),
@@ -539,6 +539,11 @@ fn native_deferred_recovery_keeps_independent_same_tag_root_and_physical_sites()
             .unwrap();
         let typed = String::from_utf8(typed).unwrap();
         assert!(!typed.contains("Deferred"));
+        let typed_json: serde_json::Value = serde_json::from_str(&typed).unwrap();
+        assert_eq!(
+            typed_json["fields"][0]["value"]["String"],
+            "IndependentOwnershipRoots"
+        );
         assert!(typed.contains(&order.table().named(owner).unwrap().to_string()));
         assert!(typed.contains(&order.table().named(global).unwrap().to_string()));
     }
@@ -740,7 +745,176 @@ fn native_admission_callback_retains_predecessor_and_valid_neighbor() {
     );
     assert!(result.history.iter().any(|entry| entry.source_word == 0x811
         && !entry.accepted
-        && entry.reason.as_deref() == Some("unusable scalar projection")));
+        && entry.reason.as_deref() == Some("unusable runtime candidate during initial native admission: TEST source 00000811: unusable scalar projection")));
+}
+
+/// Final-catalogue callback failures retain their native source and stage without a prefix adapter.
+#[test]
+fn native_final_callback_rejection_retains_stage_source_reason_and_neighbor() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = [plugin(
+        root.path(),
+        "Late.esm",
+        &[],
+        0,
+        &[
+            record(b"TEST", 0x811, 0, &sub(b"EDID", b"InitiallyAdmitted\0")),
+            record(b"STAT", 0x812, 0, &sub(b"EDID", b"Neighbor\0")),
+        ]
+        .concat(),
+    )];
+    let order = FormKeyOrder::read(&paths).unwrap();
+    let mut visits = 0;
+    let result = read_plugins_form_keys_with_validation(&paths, &order, &schemas(), |record| {
+        if record.source.form_id == 0x811 {
+            visits += 1;
+            if visits > 1 {
+                return Err("late scalar guard".into());
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(visits, 2);
+    let key = order.resolve(0, 0x811, ZeroPolicy::Null).unwrap().unwrap();
+    let neighbor = order.resolve(0, 0x812, ZeroPolicy::Null).unwrap().unwrap();
+    assert!(!result.records.contains_key(&key));
+    assert!(result.records.contains_key(&neighbor));
+    let rejected = result
+        .history
+        .iter()
+        .find(|entry| entry.source_word == 0x811)
+        .unwrap();
+    assert!(!rejected.accepted);
+    let reason = rejected.reason.as_deref().unwrap();
+    assert!(
+        reason.contains("native catalogue replay rejected"),
+        "{reason}"
+    );
+    assert!(reason.contains("unusable runtime candidate during native catalogue replay: TEST source 00000811: late scalar guard"), "{reason}");
+    assert_eq!(result.diagnostics["late.esm"].skipped_records, 1);
+}
+
+/// INFO owner clearing changes semantic metadata only, retaining exact physical source coordinates.
+#[test]
+fn native_info_topic_validation_preserves_source_groups_and_non_info_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = plugin(
+        root.path(),
+        "Owner.esm",
+        &[],
+        0,
+        &[
+            record(b"DIAL", 0x880, 0, &sub(b"EDID", b"LiveTopic\0")),
+            record(b"DIAL", 0x881, 0, &sub(b"EDID", b"DeletedTopic\0")),
+            record(b"NPC_", 0x882, 0, &sub(b"EDID", b"WrongKind\0")),
+        ]
+        .concat(),
+    );
+    let group = |label: u32, payload: &[u8]| {
+        [
+            b"GRUP".as_slice(),
+            &(24 + u32::try_from(payload.len()).unwrap()).to_le_bytes(),
+            &label.to_le_bytes(),
+            &7u32.to_le_bytes(),
+            &0x1739_5b7du32.to_le_bytes(),
+            &0xa571u16.to_le_bytes(),
+            &0x2943u16.to_le_bytes(),
+            payload,
+        ]
+        .concat()
+    };
+    let mut body = Vec::new();
+    let mut offsets = Vec::new();
+    for (index, label) in [0x880, 0x881, 0x882, 0x883, 0].into_iter().enumerate() {
+        let word = 0x0100_0900 + u32::try_from(index).unwrap();
+        let payload = sub(b"EDID", format!("Info{index}\0").as_bytes());
+        offsets.push((word, label, body.len(), payload.clone()));
+        body.extend(group(label, &record(b"INFO", word, 0, &payload)));
+    }
+    body.extend(group(
+        0x880,
+        &record(b"TEST", 0x0100_0905, 0, &sub(b"EDID", b"OtherType\0")),
+    ));
+    let patch = plugin(root.path(), "Patch.esp", &["Owner.esm"], 0, &body);
+    let patch_bytes = fs::read(&patch).unwrap();
+    let header_size = 24 + u32::from_le_bytes(patch_bytes[4..8].try_into().unwrap()) as usize;
+    let deletion = plugin(
+        root.path(),
+        "Delete.esp",
+        &["Owner.esm"],
+        0,
+        &record(b"DIAL", 0x881, 0x20, &[]),
+    );
+    let paths = [owner, patch, deletion];
+    let order = FormKeyOrder::read(&paths).unwrap();
+    let result = read_plugins_form_keys(&paths, &order, &schemas()).unwrap();
+    let live = order.resolve(1, 0x880, ZeroPolicy::Null).unwrap().unwrap();
+    for (index, (word, label, offset, payload)) in offsets.into_iter().enumerate() {
+        let key = order.resolve(1, word, ZeroPolicy::Null).unwrap().unwrap();
+        let record = &result.records[&key];
+        assert_eq!(record.topic, if index == 0 { Some(live) } else { None });
+        assert_eq!(
+            record.decoded.topic_form_id,
+            if index == 0 { Some(label) } else { None }
+        );
+        assert_eq!(record.decoded.source_topic_form_id, Some(label));
+        assert_eq!(
+            record.decoded.topic_group_offset,
+            Some((header_size + offset) as u64)
+        );
+        assert_eq!(
+            record.decoded.source_record_offset,
+            (header_size + offset + 24) as u64
+        );
+        assert_eq!(record.decoded.raw_payload, payload);
+        let history = result
+            .history
+            .iter()
+            .find(|entry| entry.supplier == 1 && entry.source_word == word)
+            .unwrap();
+        assert!(history.accepted);
+        assert_eq!(history.source_topic_form_id, Some(label));
+        assert_eq!(
+            history.topic_group_offset,
+            record.decoded.topic_group_offset
+        );
+        let mut typed = Vec::new();
+        record
+            .write_typed(&mut typed, key, order.table(), &BTreeMap::new())
+            .unwrap();
+        let typed: serde_json::Value = serde_json::from_slice(&typed).unwrap();
+        assert_eq!(typed["source_topic_form_id"], label);
+        assert_eq!(
+            typed["topic_form_id"],
+            serde_json::to_value(if index == 0 {
+                order.table().named(live).unwrap()
+            } else {
+                NamedFormKey::Null
+            })
+            .unwrap()
+        );
+    }
+    let other = order
+        .resolve(1, 0x0100_0905, ZeroPolicy::Null)
+        .unwrap()
+        .unwrap();
+    let other = &result.records[&other];
+    assert_eq!(other.topic, None);
+    assert_eq!(other.decoded.topic_form_id, None);
+    assert_eq!(other.decoded.source_topic_form_id, None);
+    assert_eq!(other.decoded.topic_group_offset, None);
+    let diagnostic = &result.diagnostics["patch.esp"];
+    assert_eq!(
+        (
+            diagnostic.skipped_records,
+            diagnostic.skipped_fields,
+            diagnostic.invalid_links
+        ),
+        (0, 0, 4)
+    );
+    assert_eq!(result.notices().len(), 1);
+    assert!(result.warnings().is_empty());
 }
 
 /// Native history/diagnostics retain scalar source facts and exact high semantic keys together.
@@ -1038,10 +1212,22 @@ fn native_navm_onam_keeps_scoped_null_projection_and_valid_neighbor() {
         .unwrap();
     assert_eq!(neighbor.links.len(), 1);
     assert_eq!(neighbor.links[0].key.unwrap().local(), 0x810);
-    assert!(
-        result
-            .warnings()
-            .iter()
-            .any(|line| line.to_ascii_lowercase().contains("navmsource.esm"))
+    let diagnostic = &result.diagnostics["navmsource.esm"];
+    assert_eq!(
+        (
+            diagnostic.skipped_records,
+            diagnostic.skipped_fields,
+            diagnostic.unexpected_subrecords,
+            diagnostic.invalid_links,
+            diagnostic.compatibility_headers,
+        ),
+        (0, 0, 0, 2, 0)
     );
+    assert!(diagnostic.first_by_category["link"].contains("3F00003F"));
+    assert!(result.warnings().is_empty());
+    let notices = result.notices();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].starts_with("notice: navmsource.esm:"));
+    assert!(notices[0].contains("cleared 2 links"));
+    assert!(notices[0].contains("3F00003F"));
 }

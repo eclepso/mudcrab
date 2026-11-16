@@ -281,9 +281,11 @@ async fn reader_switch_reuses_archives_and_assets_but_rebuilds_database_and_cell
         "malformed authored bounds must be omitted from canonical publication"
     );
     let neighbor: String = database
-        .query_row("SELECT editor_id FROM statics WHERE id=24577", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT editor_id FROM statics WHERE id=?1",
+            [0x0100_6001i64],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(neighbor, "ReviewUsableNeighbor");
     let diagnostics = json_artifact(&fixture.output, "inhouse-reader-diagnostics.json");

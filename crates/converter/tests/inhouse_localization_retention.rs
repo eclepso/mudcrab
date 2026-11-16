@@ -312,7 +312,7 @@ fn localized_fields_preserve_zero_missing_resolved_and_repeated_keys() {
         serde_json::from_slice(&fs::read(output.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
     assert!(
-        localized_summary(&diagnostics, "warnings", "localizedfields.esp", 4)
+        localized_summary(&diagnostics, "warnings", "localizedfields.esp", 2)
             .contains("malformed strings entry for localized ID 42")
     );
     assert!(
@@ -661,7 +661,7 @@ async fn winning_full_and_light_banks_preserve_ids_and_bound_missing_text_notice
             .iter()
             .filter(|notice| {
                 notice.to_ascii_lowercase().contains(plugin)
-                    && notice.contains("localized IDs missing from readable tables")
+                    && notice.contains("localized IDs missing from readable string tables")
             })
             .collect();
         assert_eq!(notices.len(), 1, "{:?}", report.notices);
@@ -941,7 +941,7 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
     );
     assert!(
         localized_summary(&diagnostics, "notices", "movefixture.esp", 1)
-            .contains("localized ID Some(17)")
+            .contains("missing localized ID 17")
     );
     assert!(!work.join("typed-records.jsonl").exists());
     assert!(!work.join("cell_cache.rkyv").exists());

@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_body_paths_are_unresolved_without_fail_fast_and_fatal_with_it() {
+    fn invalid_body_paths_are_unresolved_under_both_asset_fail_fast_settings() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("skyrim_world.db");
         actor_contract_fixture(&[(4, 7, "male", "../escape.nif")])
@@ -1025,6 +1025,198 @@ mod tests {
                 None::<fn(rusqlite::backup::Progress)>,
             )
             .unwrap();
+        let mut manifest = ConversionManifest::default();
+        // A malformed mod-authored record is local recovery under the FormKey brief;
+        // asset fail-fast applies to actual asset conversion failures, tested separately.
+        for fail_fast in [false, true] {
+            let mut report = PipelineReport::default();
+            convert(
+                directory.path(),
+                &BTreeMap::new(),
+                fail_fast,
+                &mut report,
+                &mut manifest,
+            )
+            .unwrap();
+            let catalog: ActorIdleCatalog =
+                serde_json::from_slice(&fs::read(directory.path().join(PATH)).unwrap()).unwrap();
+            let connection = Connection::open(&database).unwrap();
+            catalog
+                .validate_for(&PackIdentity::read_sql(&connection).unwrap())
+                .unwrap();
+            assert!(catalog.bindings.is_empty());
+            assert_eq!(catalog.unresolved.len(), 1);
+            assert_eq!(
+                catalog.unresolved[0].race_id.to_string(),
+                "000007:Fixture.esm"
+            );
+            assert_eq!(catalog.unresolved[0].body_scene, "../escape.nif");
+            assert!(
+                catalog.unresolved[0]
+                    .reason
+                    .contains("invalid authored body path")
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT model_path FROM actor_model_parts", [], |row| row
+                        .get::<_, String>(
+                        0
+                    ))
+                    .unwrap(),
+                "../escape.nif"
+            );
+            assert_eq!(report.warnings.len(), 1);
+            assert!(report.warnings[0].contains("1 unresolved bodies"));
+            assert!(
+                report.notices.is_empty(),
+                "unresolved body warning must not be duplicated as a notice"
+            );
+            assert_eq!(report.artifacts, [PathBuf::from(PATH)]);
+            assert!(manifest.derived_outputs.keys().all(|key| key == PATH));
+            assert!(!directory.path().join("meshes/actor-idles/clips").exists());
+        }
+    }
+
+    /// A valid native contract with a missing physical project remains subject to asset fail-fast.
+    #[test]
+    fn missing_project_asset_is_unresolved_normally_and_fatal_with_asset_fail_fast() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("skyrim_world.db");
+        let connection = actor_contract_fixture(&[
+            (4, 7, "male", "actors/custom/body.nif"),
+            (5, 8, "male", "actors/neighbor/body.nif"),
+        ]);
+        let identity = PackIdentity::read_sql(&connection).unwrap();
+        let owner = identity.table().id("Fixture.esm").unwrap();
+        for (local, project) in [
+            (7, "actors/custom/missing-project.hkx"),
+            (8, "actors/character/neighbor.hkx"),
+        ] {
+            let key = FormKey::new(owner, local).unwrap();
+            let fields = [
+                (*b"MNAM", Vec::new()),
+                (*b"ANAM", b"actors/custom/skeleton.nif\0".to_vec()),
+                (*b"NAM3", Vec::new()),
+                (*b"MNAM", Vec::new()),
+                (*b"MODL", format!("{project}\0").into_bytes()),
+            ];
+            let record = shared::records::ArchivedRecordData {
+                subrecords: fields
+                    .into_iter()
+                    .map(|(tag, data)| shared::records::ArchivedSubRecord { tag, data })
+                    .collect(),
+            };
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&record).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO records(form_id,record_type,data) VALUES(?1,'RACE',?2)",
+                    rusqlite::params![key.to_sql_i64(), bytes.as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO record_context VALUES(?1,?2,?3,NULL,NULL,?4)",
+                    rusqlite::params![
+                        key.to_sql_i64(),
+                        owner.get(),
+                        local,
+                        record.subrecords.len()
+                    ],
+                )
+                .unwrap();
+            for (ordinal, field) in record.subrecords.iter().enumerate() {
+                connection
+                    .execute(
+                        "INSERT INTO record_field_origins VALUES(?1,?2,?2,?3,1)",
+                        rusqlite::params![key.to_sql_i64(), ordinal, field.tag.as_slice()],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO record_source_fields VALUES(?1,?2,?3,?4)",
+                        rusqlite::params![
+                            key.to_sql_i64(),
+                            ordinal,
+                            field.tag.as_slice(),
+                            &field.data
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        let set = contracts(&connection).unwrap();
+        assert!(
+            set.rejected.is_empty(),
+            "this proof requires valid authored native contracts"
+        );
+        assert_eq!(set.contracts.len(), 1);
+        assert_eq!(
+            set.character_project_bodies, 1,
+            "the neighboring character body retains its existing route"
+        );
+        assert_eq!(
+            set.contracts[0].project.as_deref(),
+            Some("meshes/actors/custom/missing-project.hkx")
+        );
+        assert!(set.contracts[0].skeleton.is_some());
+        connection
+            .backup(
+                rusqlite::MAIN_DB,
+                &database,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
+            .unwrap();
+        drop(connection);
+        let source_snapshot = || {
+            let connection = Connection::open(&database).unwrap();
+            let mut fields = connection.prepare("SELECT record_key,source_ordinal,signature,data FROM record_source_fields ORDER BY record_key,source_ordinal").unwrap();
+            let fields = fields
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let mut records = connection
+                .prepare("SELECT form_id,record_type,data FROM records ORDER BY form_id")
+                .unwrap();
+            let records = records
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let mut parts = connection.prepare("SELECT npc_id,slot,model_path FROM actor_model_parts ORDER BY npc_id,slot,model_path").unwrap();
+            let parts = parts
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (fields, records, parts)
+        };
+        let original_sources = source_snapshot();
+        let missing = directory
+            .path()
+            .join("vfs/meshes/actors/custom/missing-project.hkx");
+        fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        let missing_reason = fs::read(&missing).unwrap_err().to_string();
+        assert!(!missing.exists());
         let mut manifest = ConversionManifest::default();
         let mut report = PipelineReport::default();
         convert(
@@ -1037,20 +1229,23 @@ mod tests {
         .unwrap();
         let catalog: ActorIdleCatalog =
             serde_json::from_slice(&fs::read(directory.path().join(PATH)).unwrap()).unwrap();
-        catalog
-            .validate_for(&PackIdentity::read_sql(&Connection::open(&database).unwrap()).unwrap())
-            .unwrap();
+        catalog.validate_for(&identity).unwrap();
         assert!(catalog.bindings.is_empty());
         assert_eq!(catalog.unresolved.len(), 1);
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|notice| notice.contains("1 unresolved bodies"))
+        assert_eq!(
+            catalog.unresolved[0].race_id.to_string(),
+            "000007:Fixture.esm"
         );
-        assert!(
-            report.notices.is_empty(),
-            "unresolved body warning must not be duplicated as a notice"
+        assert_eq!(catalog.unresolved[0].reason, missing_reason);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("1 unresolved bodies"));
+        assert!(report.notices.is_empty());
+        assert_eq!(report.artifacts, [PathBuf::from(PATH)]);
+        assert!(manifest.derived_outputs.keys().all(|key| key == PATH));
+        assert_eq!(
+            source_snapshot(),
+            original_sources,
+            "source bytes and neighboring RACE remain untouched"
         );
         let error = convert(
             directory.path(),
@@ -1060,7 +1255,19 @@ mod tests {
             &mut manifest,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("invalid authored body path"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("RACE 000007:Fixture.esm male meshes/actors/custom/body.glb"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&missing_reason),
+            "the fatal error must be the actual missing asset: {message}"
+        );
+        assert_eq!(source_snapshot(), original_sources);
+        assert!(!directory.path().join(PATH).exists());
+        assert!(manifest.derived_outputs.is_empty());
+        assert!(!directory.path().join("meshes/actor-idles/clips").exists());
     }
 
     #[test]

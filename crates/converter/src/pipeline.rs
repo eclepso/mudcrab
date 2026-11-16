@@ -7973,10 +7973,13 @@ mod tests {
                 "integration-report.json",
             ];
             let before = paths.map(|path| fs::read(backup.join(path)).unwrap());
+            let record_path = publication_record_path(&output).unwrap();
+            let record_before = fs::read(&record_path).unwrap();
             let error = recover_interrupted_publication(&output).unwrap_err();
             assert!(format!("{error:?}").contains("convert again"), "{error:?}");
             assert!(!output.exists());
             assert!(backup.is_dir());
+            assert_eq!(fs::read(&record_path).unwrap(), record_before);
             for (path, expected) in paths.into_iter().zip(before) {
                 assert_eq!(
                     fs::read(backup.join(path)).unwrap(),
@@ -7988,6 +7991,14 @@ mod tests {
         assert_old_backup_refused();
         assert_eq!(published_manifest(&backup).schema_version, 16);
         assert!(!backup.join("lod-manifest.json").exists());
+        // Retain the refused ownership proof before independently sealing another old layout.
+        fs::rename(
+            publication_record_path(&output).unwrap(),
+            directory
+                .path()
+                .join("schema16-refused-publication-record.json"),
+        )
+        .unwrap();
         // Isolate the old world floor with a current producer and the grass-only layout.
         legacy.schema_version = CONVERTER_SCHEMA_VERSION;
         legacy
@@ -8194,6 +8205,10 @@ mod tests {
         )
         .unwrap();
         plugins.push(valid_plugin);
+        // Cache writers require a fresh destination for each authenticated generation.
+        let staging = directory.path().join("mixed-staging");
+        fs::create_dir_all(staging.join("vfs")).unwrap();
+        overlay_loose_assets(&data, &staging.join("vfs"), &discover(&data).unwrap()).unwrap();
         let (mut cache, identity) = native_lod_fixture(&plugins, &staging);
         let bad_owner = identity.table().id("Skyrim.esm").unwrap();
         for cell in &mut cache.cells {

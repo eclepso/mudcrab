@@ -279,7 +279,7 @@ pub(crate) fn convert_with_dump(
     conversion.warnings.extend(name_warnings);
     phases.insert("native_read".into(), read_started.elapsed().as_secs_f64());
     let localization_started = Instant::now();
-    localize(&mut conversion, &paths, strings, &facts)?;
+    localize(&mut conversion, &paths, strings, &facts, typed.as_mut())?;
     phases.insert(
         "native_localization".into(),
         localization_started.elapsed().as_secs_f64(),
@@ -480,6 +480,7 @@ fn localize(
     paths: &[PathBuf],
     sources: StringSources<'_>,
     facts: &HashMap<FormKey, SourceFact>,
+    mut typed: Option<&mut records::NativeReadResult>,
 ) -> Result<()> {
     let flags = paths
         .iter()
@@ -507,6 +508,19 @@ fn localize(
             .expect("selected native text record");
         let priority = record.source.load_order as usize;
         for (ordinal, (tag, bytes)) in record.source.subrecords.iter().enumerate() {
+            if tag == b"EDID" && !record.runtime_omitted.contains(&ordinal) {
+                let end = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(bytes.len());
+                // EDID is inline text even in localized plugins. Its decoded view must
+                // not fall back to lossy UTF-8 when original Windows-1252 bytes are kept.
+                record
+                    .localized_text
+                    .entry(ordinal)
+                    .or_insert_with(|| Some(records::decode_text(&bytes[..end])));
+                continue;
+            }
             let bank = facts
                 .get(&key)
                 .and_then(|fact| fact.text_fields.get(&ordinal))
@@ -547,6 +561,35 @@ fn localize(
                 let bank_loss = usize::from(
                     readable.is_none() && failed_banks.insert((priority, bank.to_owned())),
                 );
+                if bank_loss != 0
+                    && let Some(read) = typed.as_deref_mut()
+                {
+                    let supplier = conversion
+                        .order
+                        .table()
+                        .entry(conversion.order.plugin_order()[priority])
+                        .expect("authenticated localization supplier");
+                    let reason = table.as_ref().err().map_or_else(
+                        || format!("missing {bank} string table"),
+                        |error| error.to_string(),
+                    );
+                    let context = records::diagnostics::EventContext {
+                        source_record_offset: Some(facts[&key].offset),
+                        source_form_id: Some(record.source.form_id),
+                        record_type: Some(record.source.record_type),
+                        stage: "localization_bank",
+                        field: Some(bank.to_owned()),
+                        action: Some("unresolved"),
+                        ..Default::default()
+                    };
+                    // The adapter summary already counts this loss. Preserve its precise
+                    // contextual event without counting it again as a decoder field loss.
+                    read.diagnostics
+                        .entry(supplier.normalized_name.clone())
+                        .or_default()
+                        .event_log
+                        .append(&context, "adapter", &reason);
+                }
                 let summaries = if id.is_some() && readable.is_some() && !malformed {
                     &mut gaps
                 } else {
@@ -566,7 +609,9 @@ fn localize(
                                 "missing ".to_owned()
                             },
                             id.map_or_else(|| "<malformed>".to_owned(), |id| id.to_string())
-                        ),
+                        ) + &table.as_ref().err().map_or_else(String::new, |error| {
+                            format!("; unreadable {bank} table ({error})")
+                        }),
                     )
                 });
                 entry.0 += 1 + bank_loss;
@@ -1013,6 +1058,39 @@ fn copy_projection(
         });
         let mut unusable = false;
         for (index, (column, required)) in columns.iter().enumerate() {
+            if table == "race_movement_links"
+                && let Some(signature) = match column.as_str() {
+                    "walk_movt_id" => Some(b"WKMV"),
+                    "run_movt_id" => Some(b"RNMV"),
+                    _ => None,
+                }
+                && let Some(handle) = owner
+            {
+                // An authored schema can use this signature for scalar text. Only a
+                // certified native site can make it a movement identity; four text
+                // bytes must never be reinterpreted as a CPU projection index.
+                let original = stage.original(handle)?;
+                let mut key = None;
+                for (ordinal, (tag, _)) in original.canonical_record().subrecords.iter().enumerate()
+                {
+                    let source = original.source_ordinal(ordinal)?;
+                    if tag == signature && !original.runtime_omitted.contains(&source) {
+                        key = original
+                            .links
+                            .iter()
+                            .find(|site| {
+                                site.subrecord == source
+                                    && site.byte_offset == 0
+                                    && site.signature == *signature
+                            })
+                            .and_then(|site| site.key);
+                        break;
+                    }
+                }
+                values[index] =
+                    key.map_or(SqlValue::Null, |key| SqlValue::Integer(key.to_sql_i64()));
+                continue;
+            }
             if identity_column(table, column) {
                 match values[index] {
                     SqlValue::Null => {}

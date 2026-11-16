@@ -250,16 +250,11 @@ async fn names_come_from_the_tables_of_the_configured_language() {
         report.warnings.iter().any(|warning| {
             warning.contains("base.esm: inhouse adapter reported 5 local decode/lookup issues")
                 && warning.contains("CLAS source 00000800 FULL missing localized ID 1")
+                && warning.contains("truncated STRINGS header")
         }),
         "{:?}",
         report.warnings
     );
-    let database = Connection::open(broken_output.join("skyrim_world.db")).unwrap();
-    let bank_errors: usize = database.query_row(
-        "SELECT count(*) FROM record_diagnostics WHERE stage='localization_bank' AND field='strings' AND action='unresolved' AND reason LIKE '%truncated STRINGS header%'",
-        [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(bank_errors, 1);
 }
 
 /// The language changes the database, never the converted assets: it is part of the reader
