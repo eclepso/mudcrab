@@ -1,4 +1,6 @@
 //! Synthetic publication checks for the selectable schema frontend.
+mod common;
+
 use converter::{AssetPipeline, PipelineConfig, config::RecordReader};
 use dummy_content::{Entry, bsa, esm, layout};
 use rusqlite::Connection;
