@@ -114,7 +114,10 @@ fn interpreted_record(
     for (ordinal, field) in record.subrecords.iter().enumerate() {
         if !record.is_runtime_usable(ordinal) {
             if retain_opaque {
-                fields.push(field.clone());
+                fields.push(shared::records::ArchivedSubRecord {
+                    tag: field.tag,
+                    data: field.data.clone(),
+                });
             }
             continue;
         }
