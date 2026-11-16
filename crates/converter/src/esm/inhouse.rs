@@ -2744,6 +2744,7 @@ mod runtime_move_tests {
         let reason = rejected.2.as_deref().unwrap();
         assert!(reason.contains("unusable runtime candidate"));
         assert!(reason.contains("RACE WKMV length"));
+        let named_key = test_named_key(&conn, runtime_id);
         drop(conn);
         let typed = fs::read_to_string(output.join("typed-records.jsonl"))
             .unwrap()
@@ -2754,7 +2755,7 @@ mod runtime_move_tests {
         if !deletion_barrier {
             let row = typed
                 .iter()
-                .find(|row| row["form_id"] == test_named_key(&conn, runtime_id))
+                .find(|row| row["form_id"] == named_key)
                 .unwrap();
             assert_eq!(row["load_order"], 1);
             assert_eq!(

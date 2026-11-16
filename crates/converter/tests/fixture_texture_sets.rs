@@ -1,4 +1,5 @@
 //! Synthetic physical TXST slots exercised through the real exporter and pipeline.
+mod common;
 
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport,
