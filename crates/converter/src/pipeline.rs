@@ -2987,7 +2987,8 @@ fn compose_default_bodies(
                 return Ok(None);
             }
             // Apply sex and slot-matched DefaultRace skin sets to validated skin shapes.
-            // Old catalogs or a missing database keep each NIF's original textures.
+            // Missing optional catalog columns in a current world, or a missing database,
+            // keep each NIF's textures. Earlier world generations require re-conversion.
             let skins = if database.is_file() {
                 compose::default_skin_texture_sets(&database, sex).wrap_err_with(|| {
                     format!("failed to read the default {sex} armature skin texture sets")
@@ -9643,48 +9644,77 @@ mod tests {
             .collect()
     }
 
-    /// A world database holding one female Nord whose `DefaultRace` hands armature carries
-    /// `SkinHandFemale_1`, written with the catalog columns or, when `with_skin_columns` is
-    /// false, as a database from before them.
+    /// A current authenticated world holding one female Nord whose `DefaultRace` hands
+    /// armature carries `SkinHandFemale_1`, optionally without the skin catalog columns.
     fn write_skin_catalog(staging: &Path, with_skin_columns: bool) {
-        let connection = rusqlite::Connection::open(staging.join("skyrim_world.db")).unwrap();
-        let skin_columns = if with_skin_columns {
-            ", armature_race_id INTEGER, skin_texture_set_id INTEGER"
-        } else {
-            ""
-        };
+        // Seal the world through the real writer, including the original plugin hash,
+        // native allocation and record context. Catalog fixtures use that allocation.
+        let source = staging.join("catalog-source");
+        fs::create_dir_all(&source).unwrap();
+        let plugin = source.join("Skyrim.esm");
+        let header = [
+            b"HEDR".as_slice(),
+            &12u16.to_le_bytes(),
+            &1.7f32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &0x800u32.to_le_bytes(),
+        ]
+        .concat();
+        fs::write(
+            &plugin,
+            [
+                b"TES4".as_slice(),
+                &(header.len() as u32).to_le_bytes(),
+                &[0; 16],
+                &header,
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let database = staging.join("skyrim_world.db");
+        EsmParser::convert_plugins(&[plugin], &database).unwrap();
+        shared::world_assets::validate_world_database(&database).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let reader = shared::records::RecordContextReader::new(&connection).unwrap();
+        let identity = reader.identity();
+        let native = |local| identity.runtime_key(local).unwrap().unwrap().to_sql_i64();
         connection
-            .execute_batch(&format!(
-                "CREATE TABLE actor_models (id INTEGER PRIMARY KEY, race_id INTEGER NOT NULL, \
-                 sex TEXT NOT NULL, skin_armo_id INTEGER, head_model TEXT, head_source TEXT, \
-                 resolution TEXT NOT NULL);
-                 CREATE TABLE actor_model_parts (npc_id INTEGER NOT NULL, slot TEXT NOT NULL, \
-                 model_path TEXT NOT NULL{skin_columns}, PRIMARY KEY (npc_id, slot));
-                 CREATE TABLE texture_sets (id INTEGER PRIMARY KEY, editor_id TEXT, \
-                 diffuse_path TEXT, normal_path TEXT, glow_path TEXT, height_path TEXT, \
-                 environment_path TEXT, mask_path TEXT, specular_path TEXT, detail_path TEXT);
-                 INSERT INTO actor_models VALUES (256, 79686, 'female', 3428, NULL, NULL, 'body');
-                 INSERT INTO texture_sets VALUES (257001, 'SkinHandFemale_1', \
+            .execute(
+                "INSERT INTO actor_models(id,race_id,sex,skin_armo_id,resolution) \
+                 VALUES (?1,?2,'female',?3,'body')",
+                rusqlite::params![native(256), native(79686), native(3428)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO texture_sets VALUES (?1, 'SkinHandFemale_1', \
                  'Actors\\Character\\Female\\FemaleHands_1.dds', \
                  'Actors\\Character\\Female\\FemaleHands_1_msn.dds', \
                  'Actors\\Character\\Female\\FemaleHands_1_sk.dds', NULL, NULL, NULL, \
-                 'Actors\\Character\\Female\\FemaleHands_1_S.dds', NULL);"
-            ))
+                 'Actors\\Character\\Female\\FemaleHands_1_S.dds', NULL)",
+                [native(257001)],
+            )
             .unwrap();
         if with_skin_columns {
             connection
                 .execute(
-                    "INSERT INTO actor_model_parts VALUES (256, 'hands', \
-                     'Actors\\Character\\Character Assets\\FemaleHands_1.nif', 25, 257001)",
-                    [],
+                    "INSERT INTO actor_model_parts VALUES (?1, 'hands', \
+                     'Actors\\Character\\Character Assets\\FemaleHands_1.nif', ?2, ?3)",
+                    rusqlite::params![native(256), native(25), native(257001)],
                 )
                 .unwrap();
         } else {
             connection
+                .execute_batch(
+                    "ALTER TABLE actor_model_parts DROP COLUMN armature_race_id;
+                     ALTER TABLE actor_model_parts DROP COLUMN skin_texture_set_id;",
+                )
+                .unwrap();
+            connection
                 .execute(
-                    "INSERT INTO actor_model_parts VALUES (256, 'hands', \
+                    "INSERT INTO actor_model_parts VALUES (?1, 'hands', \
                      'Actors\\Character\\Character Assets\\FemaleHands_1.nif')",
-                    [],
+                    [native(256)],
                 )
                 .unwrap();
         }
@@ -9729,7 +9759,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_default_bodies_keeps_nif_textures_with_an_older_catalog() {
+    fn compose_default_bodies_keeps_nif_textures_without_optional_skin_columns() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path();
         stage_skin_tint_hands(staging);
@@ -9739,6 +9769,44 @@ mod tests {
 
         let female = staging.join(crate::compose::composed_body_path("default", "female"));
         assert_eq!(glb_specular(&female, "femalehands_1.nif"), [(0.0, None)]);
+    }
+
+    #[test]
+    fn compose_default_bodies_refuses_an_old_skin_world_without_changing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_skin_tint_hands(staging);
+        write_skin_catalog(staging, true);
+        let database = staging.join("skyrim_world.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION - 1],
+            )
+            .unwrap();
+        drop(connection);
+        let original = fs::read(&database).unwrap();
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        let error = compose_default_bodies(
+            staging,
+            &staged_sources(staging),
+            true,
+            &mut report,
+            &mut manifest,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("convert again"), "{error:#}");
+        assert_eq!(fs::read(&database).unwrap(), original);
+        assert!(manifest.derived_outputs.is_empty());
+        for sex in ["male", "female"] {
+            assert!(
+                !staging
+                    .join(crate::compose::composed_body_path("default", sex))
+                    .exists()
+            );
+        }
     }
 
     #[test]
