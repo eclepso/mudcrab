@@ -431,6 +431,31 @@ fn publish_clip(
     })
 }
 
+/// Append coverage for a published catalog without altering its retained diagnostics.
+fn report_coverage(
+    catalog: &ActorIdleCatalog,
+    published_clips: usize,
+    character_project_bodies: usize,
+    report: &mut PipelineReport,
+) {
+    let message = format!(
+        "actor idle coverage: {} bound bodies, {} clips, {} unresolved bodies, {} scenes without compatible targets, {} clip issues, {} discovery issues, {character_project_bodies} character-project bodies left to the human/child paths; see {PATH}",
+        catalog.bindings.len(),
+        published_clips,
+        catalog.unresolved.len(),
+        catalog.excluded.len(),
+        catalog.clip_issues.len(),
+        catalog.discovery_issues.len()
+    );
+    log::info!("{message}");
+    if !catalog.unresolved.is_empty()
+        || !catalog.clip_issues.is_empty()
+        || !catalog.discovery_issues.is_empty()
+    {
+        report.warnings.push(message);
+    }
+}
+
 pub(super) fn convert(
     staging: &Path,
     sources: &BTreeMap<PathBuf, PathBuf>,
@@ -740,22 +765,7 @@ pub(super) fn convert(
         ),
     );
     report.artifacts.push(PATH.into());
-    let message = format!(
-        "actor idle coverage: {} bound bodies, {} clips, {} unresolved bodies, {} scenes without compatible targets, {} clip issues, {} discovery issues, {character_project_bodies} character-project bodies left to the human/child paths; see {PATH}",
-        catalog.bindings.len(),
-        published.len(),
-        catalog.unresolved.len(),
-        catalog.excluded.len(),
-        catalog.clip_issues.len(),
-        catalog.discovery_issues.len()
-    );
-    log::info!("{message}");
-    if !catalog.unresolved.is_empty()
-        || !catalog.clip_issues.is_empty()
-        || !catalog.discovery_issues.is_empty()
-    {
-        report.warnings.push(message);
-    }
+    report_coverage(&catalog, published.len(), character_project_bodies, report);
     Ok(())
 }
 
@@ -891,6 +901,179 @@ mod tests {
                 .unwrap();
         }
         connection
+    }
+
+    /// Build an authenticated named catalog with a retained default and excluded neighbor.
+    fn coverage_catalog_fixture() -> (PackIdentity, ActorIdleCatalog) {
+        use shared::actor_idle_catalog::ActorIdleClip;
+
+        let connection = actor_contract_fixture(&[(4, 7, "male", "actors/fixture/body.nif")]);
+        let identity = PackIdentity::read_sql(&connection).unwrap();
+        let owner = identity.table().id("Fixture.esm").unwrap();
+        let race = identity
+            .table()
+            .named(FormKey::new(owner, 7).unwrap())
+            .unwrap();
+        assert_eq!(race.to_string(), "000007:Fixture.esm");
+        let source = "meshes/actors/fixture/animations/default.hkx";
+        let clip = ActorIdleClip {
+            scene: "meshes/actor-idles/clips/published.glb".into(),
+            frame_count: 3,
+            frames_per_second: 30.0,
+            motion_frame: Some(1),
+            bound_tracks: 2,
+            moving_bound_tracks: 1,
+            skipped_tracks: Vec::new(),
+        };
+        let catalog = ActorIdleCatalog {
+            version: VERSION,
+            pack_identity: identity.digest_hex(),
+            bindings: vec![ActorIdleBinding {
+                race_id: race.clone(),
+                sex: "male".into(),
+                body_scene: "meshes/actors/fixture/body.glb".into(),
+                project: "meshes/actors/fixture/project.hkx".into(),
+                skeleton: "meshes/actors/fixture/skeleton.hkx".into(),
+                race_skeleton_nif: "meshes/actors/fixture/skeleton.nif".into(),
+                bound_tracks: clip.bound_tracks,
+                moving_bound_tracks: clip.moving_bound_tracks,
+                skipped_tracks: clip.skipped_tracks.clone(),
+                source: source.into(),
+                scene: clip.scene.clone(),
+                clips: BTreeMap::from([(source.into(), clip)]),
+            }],
+            excluded: vec![UnresolvedIdle {
+                race_id: race,
+                sex: "female".into(),
+                body_scene: "meshes/actors/fixture/attachment.glb".into(),
+                reason: "clip has no bound transform tracks".into(),
+            }],
+            ..Default::default()
+        };
+        catalog.validate_for(&identity).unwrap();
+        (identity, catalog)
+    }
+
+    /// Keep every rejected clip's source, identity and reason visible in the catalog.
+    fn coverage_clip_issue(
+        catalog: &ActorIdleCatalog,
+        not_applicable: bool,
+        identified_as_idle: bool,
+    ) -> shared::actor_idle_catalog::IdleClipIssueFile {
+        let binding = &catalog.bindings[0];
+        shared::actor_idle_catalog::IdleClipIssueFile {
+            race_id: binding.race_id.clone(),
+            sex: binding.sex.clone(),
+            body_scene: binding.body_scene.clone(),
+            source: "meshes/actors/fixture/animations/other.hkx".into(),
+            reason: if not_applicable {
+                "not_standalone: additive graph layer requires an explicit blended base pose".into()
+            } else {
+                "spline bounds [NaN, NaN] are not finite at 0x1234".into()
+            },
+            not_applicable,
+            identified_as_idle,
+        }
+    }
+
+    /// Exercise the production reporting boundary after real catalog authentication.
+    fn assert_catalog_coverage(
+        identity: &PackIdentity,
+        catalog: &ActorIdleCatalog,
+        expected_message: &str,
+        expect_warning: bool,
+    ) {
+        catalog.validate_for(identity).unwrap();
+        let before = serde_json::to_value(catalog).unwrap();
+        let mut report = PipelineReport::default();
+        report.warnings.push("earlier warning".into());
+        report.notices.push("earlier notice".into());
+        report_coverage(catalog, 1, 65, &mut report);
+        catalog.validate_for(identity).unwrap();
+        assert_eq!(serde_json::to_value(catalog).unwrap(), before);
+        assert_eq!(catalog.bindings.len(), 1);
+        assert_eq!(catalog.bindings[0].clips.len(), 1);
+        if expect_warning {
+            assert_eq!(report.warnings, ["earlier warning", expected_message]);
+            assert_eq!(report.notices, ["earlier notice"]);
+        } else {
+            assert_eq!(
+                report.warnings,
+                ["earlier warning"],
+                "optional clip coverage must remain an advisory notice"
+            );
+            assert_eq!(report.notices, ["earlier notice", expected_message]);
+        }
+    }
+
+    /// Existing optional clip coverage must not become new conversion loss.
+    #[test]
+    fn optional_clip_coverage_is_advisory_and_retains_catalog_details() {
+        for (not_applicable, identified_as_idle) in [(true, false), (true, true), (false, false)] {
+            let (identity, mut catalog) = coverage_catalog_fixture();
+            catalog.clip_issues = vec![coverage_clip_issue(
+                &catalog,
+                not_applicable,
+                identified_as_idle,
+            )];
+            assert_catalog_coverage(
+                &identity,
+                &catalog,
+                "actor idle coverage: 1 bound bodies, 1 clips, 0 unresolved bodies, 1 scenes without compatible targets, 1 clip issues, 0 discovery issues, 65 character-project bodies left to the human/child paths; see meshes/actor-idles/catalog.json",
+                false,
+            );
+        }
+    }
+
+    /// An actual identified-idle failure takes precedence over optional coverage.
+    #[test]
+    fn identified_idle_failure_is_a_warning_and_retains_optional_neighbors() {
+        let (identity, mut catalog) = coverage_catalog_fixture();
+        catalog.clip_issues = vec![
+            coverage_clip_issue(&catalog, true, false),
+            coverage_clip_issue(&catalog, false, true),
+        ];
+        assert_catalog_coverage(
+            &identity,
+            &catalog,
+            "actor idle coverage: 1 bound bodies, 1 clips, 0 unresolved bodies, 1 scenes without compatible targets, 2 clip issues, 0 discovery issues, 65 character-project bodies left to the human/child paths; see meshes/actor-idles/catalog.json",
+            true,
+        );
+    }
+
+    /// A lost body remains a warning even when optional clips are also unavailable.
+    #[test]
+    fn unresolved_body_coverage_is_a_warning_and_retains_valid_binding() {
+        let (identity, mut catalog) = coverage_catalog_fixture();
+        catalog.clip_issues = vec![coverage_clip_issue(&catalog, true, false)];
+        catalog.unresolved.push(UnresolvedIdle {
+            race_id: catalog.bindings[0].race_id.clone(),
+            sex: "male".into(),
+            body_scene: "meshes/actors/fixture/missing.glb".into(),
+            reason: "missing effective RACE project".into(),
+        });
+        assert_catalog_coverage(
+            &identity,
+            &catalog,
+            "actor idle coverage: 1 bound bodies, 1 clips, 1 unresolved bodies, 1 scenes without compatible targets, 1 clip issues, 0 discovery issues, 65 character-project bodies left to the human/child paths; see meshes/actor-idles/catalog.json",
+            true,
+        );
+    }
+
+    /// Incomplete authoring discovery cannot be hidden behind clip-only advisories.
+    #[test]
+    fn discovery_loss_coverage_is_a_warning_and_retains_clip_details() {
+        let (identity, mut catalog) = coverage_catalog_fixture();
+        catalog.clip_issues = vec![coverage_clip_issue(&catalog, false, false)];
+        catalog
+            .discovery_issues
+            .push("behavior graph has an unresolved authored reference".into());
+        assert_catalog_coverage(
+            &identity,
+            &catalog,
+            "actor idle coverage: 1 bound bodies, 1 clips, 0 unresolved bodies, 1 scenes without compatible targets, 1 clip issues, 1 discovery issues, 65 character-project bodies left to the human/child paths; see meshes/actor-idles/catalog.json",
+            true,
+        );
     }
 
     #[test]

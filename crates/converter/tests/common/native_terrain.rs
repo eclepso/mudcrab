@@ -155,6 +155,12 @@ pub async fn publish_for_database_cache(reader: RecordReader) -> Publication {
     publish_configured(reader, true, false, false, true).await
 }
 
+/// A valid competing LAND keeps its winner and reports the override as an advisory.
+#[allow(dead_code)]
+pub async fn publish_clean_competing_lands(reader: RecordReader) -> Publication {
+    publish_configured(reader, false, false, true, true).await
+}
+
 async fn publish_configured(
     reader: RecordReader,
     damaged: bool,
