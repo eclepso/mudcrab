@@ -559,8 +559,14 @@ async fn failed_settings_folder_lookup_never_generates_from_install() {
     let fixture = Fixture::new(true);
     fs::remove_dir(&fixture.player).unwrap();
     fs::write(&fixture.player, b"synthetic file in place of folder").unwrap();
-    fixture.publish().await;
+    let report = fixture.publish().await;
     assert!(fixture.manifest().ini_files.is_empty());
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("INI lookup folder is not a directory"))
+    );
 }
 
 /// Edited pack settings survive both ordinary reconversion and metadata rebuild.
@@ -595,19 +601,209 @@ async fn edited_pack_ini_is_kept_and_reported_on_reconversion() {
 /// Account identifiers are removed while portable provenance identifies the source file.
 #[tokio::test]
 async fn captured_inis_omit_account_identifiers() {
-    let fixture = Fixture::new(false);
+    for section in ["[Bethesda.net]", "[ Bethesda.net ]", "[  BETHESDA.NET\t]"] {
+        let fixture = Fixture::new(false);
+        fs::write(
+            fixture.player.join("SkyrimPrefs.ini"),
+            format!("{section}\nuAccountId=123456\n[Display]\nfShadowDistance=4567\n"),
+        )
+        .unwrap();
+        fixture.publish().await;
+        let bytes = fs::read(fixture.config.output_dir.join("ini/SkyrimPrefs.ini")).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("123456"));
+        assert!(String::from_utf8_lossy(&bytes).contains("fShadowDistance=4567"));
+        assert_eq!(
+            fixture.manifest().ini_files["ini/SkyrimPrefs.ini"].sha256,
+            converter::cache::hash_bytes(&bytes)
+        );
+    }
+}
+
+/// A failed MO2 settings lookup preserves a published local edit and skips external replacements.
+#[tokio::test]
+async fn edited_pack_ini_survives_failed_mo2_lookup() {
+    let mut fixture = Fixture::new(true);
+    let profile = fixture.mo2_profile(Some(true), None);
     fs::write(
-        fixture.player.join("SkyrimPrefs.ini"),
-        b"[Bethesda.net]\nuAccountId=123456\n[Display]\nfShadowDistance=4567\n",
+        profile.join("SkyrimPrefs.ini"),
+        b"[Display]\nfShadowDistance=4321\n",
     )
     .unwrap();
     fixture.publish().await;
-    let bytes = fs::read(fixture.config.output_dir.join("ini/SkyrimPrefs.ini")).unwrap();
-    assert!(!String::from_utf8_lossy(&bytes).contains("123456"));
-    assert!(String::from_utf8_lossy(&bytes).contains("fShadowDistance=4567"));
+    let edited = b"[Display]\nfShadowDistance=6789\n";
+    fs::write(
+        fixture.config.output_dir.join("ini/SkyrimPrefs.ini"),
+        edited,
+    )
+    .unwrap();
+    fs::remove_file(profile.join("settings.ini")).unwrap();
+    fs::create_dir(profile.join("settings.ini")).unwrap();
+    let report = fixture.publish().await;
+    fixture.assert_copy(
+        "SkyrimPrefs.ini",
+        Path::new("SkyrimPrefs.ini"),
+        edited,
+        IniOrigin::PackCopy,
+    );
+    assert!(!fixture.config.output_dir.join("ini/Skyrim.ini").exists());
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("could not resolve MO2 profile INIs"))
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("kept edited pack INI SkyrimPrefs.ini"))
+    );
+}
+
+/// Capture opt-out and library defaults preserve a locally edited pack file with a notice.
+#[tokio::test]
+async fn edited_pack_ini_survives_disabled_external_capture() {
+    for explicit_opt_out in [false, true] {
+        let mut fixture = Fixture::new(true);
+        fixture.publish().await;
+        let edited = b"[General]\nuGridsToLoad=11\n";
+        fs::write(fixture.config.output_dir.join("ini/Skyrim.ini"), edited).unwrap();
+        fixture.config.player_ini_dir = None;
+        fixture.config.no_player_ini = explicit_opt_out;
+        let report = fixture.publish().await;
+        fixture.assert_copy(
+            "Skyrim.ini",
+            Path::new("Skyrim.ini"),
+            edited,
+            IniOrigin::PackCopy,
+        );
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("kept edited pack INI Skyrim.ini"))
+        );
+    }
+}
+
+/// Filtering expanding encodings omits oversized output while keeping usable neighboring assets.
+#[tokio::test]
+async fn filtered_ini_expansion_preserves_shared_size_bound() {
+    let text = format!(
+        "[Bethesda.net]\nuAccountId=123456\n[Display]\nfShadowDistance=4321\n;{}\n",
+        "\u{4e00}".repeat(1_500_000)
+    );
+    let mut utf16 = vec![0xff, 0xfe];
+    utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut single_byte =
+        b"[Bethesda.net]\nuAccountId=123456\n[Display]\nfShadowDistance=4321\n;".to_vec();
+    single_byte.extend(std::iter::repeat_n(0xe9, 2_200_000));
+    for bytes in [utf16, single_byte] {
+        assert!(bytes.len() < 4 * 1024 * 1024);
+        let fixture = Fixture::new(false);
+        fs::write(fixture.player.join("SkyrimPrefs.ini"), bytes).unwrap();
+        fs::write(
+            fixture.player.join("Skyrim.ini"),
+            b"[General]\nuGridsToLoad=7\n",
+        )
+        .unwrap();
+        let report = fixture.publish().await;
+        assert!(
+            !fixture
+                .config
+                .output_dir
+                .join("ini/SkyrimPrefs.ini")
+                .exists()
+        );
+        assert!(fixture.config.output_dir.join("ini/Skyrim.ini").is_file());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("filtered INI exceeds the 4 MiB limit"))
+        );
+        assert!(
+            !fixture
+                .manifest()
+                .ini_files
+                .contains_key("ini/SkyrimPrefs.ini")
+        );
+    }
+}
+
+/// Identical reconversion copies stay quiet; missing sources report removal.
+#[tokio::test]
+async fn reconversion_notices_distinguish_unchanged_and_removed_inis() {
+    let fixture = Fixture::new(false);
+    fs::write(
+        fixture.player.join("Skyrim.ini"),
+        b"[General]\nuGridsToLoad=7\n",
+    )
+    .unwrap();
+    fixture.publish().await;
+    let unchanged = fixture.publish().await;
+    assert!(
+        !unchanged
+            .notices
+            .iter()
+            .any(|notice| notice.contains("replaced unedited pack INI Skyrim.ini"))
+    );
+    fs::remove_file(fixture.player.join("Skyrim.ini")).unwrap();
+    let removed = fixture.publish().await;
+    assert!(!fixture.config.output_dir.join("ini/Skyrim.ini").exists());
+    assert!(removed.notices.iter().any(|notice| {
+        notice.contains("removed unedited pack INI Skyrim.ini")
+            && notice.contains("source is absent")
+    }));
+}
+
+/// A missing explicitly selected settings folder reports its template fallback clearly.
+#[tokio::test]
+async fn missing_settings_folder_reports_template_fallback() {
+    let fixture = Fixture::new(true);
+    fs::remove_dir(&fixture.player).unwrap();
+    let report = fixture.publish().await;
+    assert!(report.notices.iter().any(
+        |notice| notice.contains("player settings folder") && notice.contains("does not exist")
+    ));
+    assert_eq!(fixture.manifest().ini_files.len(), 2);
     assert_eq!(
-        fixture.manifest().ini_files["ini/SkyrimPrefs.ini"].sha256,
-        converter::cache::hash_bytes(&bytes)
+        fixture.manifest().ini_files["ini/Skyrim.ini"].origin,
+        IniOrigin::GeneratedFromInstall
+    );
+}
+
+/// Relative Data input retains the confirmed install's template fallback through the CLI.
+#[test]
+fn relative_data_cli_generates_confirmed_install_templates() {
+    let fixture = Fixture::new(true);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_converter"))
+        .current_dir(&fixture.install)
+        .arg("Data")
+        .arg(&fixture.config.output_dir)
+        .arg("--player-ini-dir")
+        .arg(&fixture.player)
+        .args(["--no-lod", "--cpu-jobs", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.manifest().complete);
+    assert_eq!(fixture.manifest().ini_files.len(), 2);
+    fixture.assert_copy(
+        "Skyrim.ini",
+        &fixture.install.join("Skyrim_Default.ini"),
+        b"[General]\nuGridsToLoad=9\n",
+        IniOrigin::GeneratedFromInstall,
+    );
+    fixture.assert_copy(
+        "SkyrimPrefs.ini",
+        &fixture.install.join("High.ini"),
+        b"[Display]\nfShadowDistance=7345\n",
+        IniOrigin::GeneratedFromInstall,
     );
 }
 

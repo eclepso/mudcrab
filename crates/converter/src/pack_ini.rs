@@ -2,7 +2,7 @@
 
 use crate::{PipelineConfig, PipelineReport, cache::ConversionManifest};
 use shared::pack_ini::{
-    FILES, IniOrigin, IniProvenance, decode_ini, read_ini_bytes, readable_path,
+    FILES, IniOrigin, IniProvenance, MAX_INI_BYTES, decode_ini, read_ini_bytes, readable_path,
 };
 use std::{
     fs,
@@ -113,6 +113,16 @@ fn documents_dir() -> std::io::Result<Option<PathBuf>> {
 /// Finds a case-insensitive child through read-only lookup.
 /// Settings-file links are followed for redirected Documents and OneDrive placeholders.
 fn child(folder: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
+    match fs::metadata(folder) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(std::io::Error::other(
+                "INI lookup folder is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+        _ => {}
+    }
     match fs::symlink_metadata(folder.join(name)) {
         Ok(_) => return Ok(Some(folder.join(name))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -164,7 +174,9 @@ fn read_ini(path: &Path, report: &mut PipelineReport) -> std::io::Result<Vec<u8>
         let line = raw.trim();
         if line.starts_with('[') && line.ends_with(']') {
             section = true;
-            private = line.eq_ignore_ascii_case("[Bethesda.net]");
+            private = line[1..line.len() - 1]
+                .trim()
+                .eq_ignore_ascii_case("Bethesda.net");
         } else if section && !line.starts_with([';', '#']) && line.contains('=') && !private {
             settings = true;
         }
@@ -187,7 +199,12 @@ fn read_ini(path: &Path, report: &mut PipelineReport) -> std::io::Result<Vec<u8>
             readable_path(path).display()
         ),
     );
-    // Account filtering emits UTF-8 accepted by the shared reader; unaffected files retain exact bytes.
+    if sanitized.len() as u64 > MAX_INI_BYTES {
+        return Err(std::io::Error::other(
+            "filtered INI exceeds the 4 MiB limit",
+        ));
+    }
+    // Account filtering emits bounded UTF-8; unaffected files retain exact bytes.
     Ok(sanitized.into_bytes())
 }
 
@@ -334,15 +351,27 @@ pub(crate) fn capture(
     if let Err(error) = &profile {
         notice(
             report,
-            format!("could not resolve MO2 profile INIs: {error}; skipping optional settings"),
+            format!(
+                "could not resolve MO2 profile INIs: {error}; skipping external optional settings"
+            ),
         );
-        return;
     }
     let player = if requested {
         player_ini_dir(config)
     } else {
         Ok(None)
     };
+    if let Ok(Some(folder)) = &player
+        && matches!(fs::metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        notice(
+            report,
+            format!(
+                "player settings folder {} does not exist; genuinely absent INIs may use install templates",
+                readable_path(folder).display()
+            ),
+        );
+    }
     let install = install_root(config);
     for (name, template) in FILES.into_iter().zip(["Skyrim_Default.ini", "High.ini"]) {
         let relative = format!("ini/{name}");
@@ -357,9 +386,6 @@ pub(crate) fn capture(
                     readable_path(&destination).display()
                 ),
             );
-            continue;
-        }
-        if !requested {
             continue;
         }
         let old = config.output_dir.join(&relative);
@@ -401,6 +427,17 @@ pub(crate) fn capture(
             }
             continue;
         }
+        if !requested {
+            if old_bytes.is_some() {
+                notice(
+                    report,
+                    format!(
+                        "removed unedited pack INI {name}: external settings capture is disabled"
+                    ),
+                );
+            }
+            continue;
+        }
         let lookup = (|| -> Result<Option<(PathBuf, IniOrigin)>, String> {
             let profile = profile
                 .as_ref()
@@ -427,7 +464,15 @@ pub(crate) fn capture(
         })();
         let (source, origin) = match lookup {
             Ok(Some(source)) => source,
-            Ok(None) => continue,
+            Ok(None) => {
+                if old_bytes.is_some() {
+                    notice(
+                        report,
+                        format!("removed unedited pack INI {name}: its source is absent"),
+                    );
+                }
+                continue;
+            }
             Err(error) => {
                 notice(report, format!("skipping optional INI {name}: {error}"));
                 continue;
@@ -459,7 +504,9 @@ pub(crate) fn capture(
                     },
                 );
                 report.artifacts.push(relative.into());
-                if old_proof.is_some() {
+                if old_bytes.as_ref().is_some_and(|old| {
+                    crate::cache::hash_bytes(old) != crate::cache::hash_bytes(&bytes)
+                }) {
                     notice(
                         report,
                         format!("replaced unedited pack INI {name} from its current source"),
