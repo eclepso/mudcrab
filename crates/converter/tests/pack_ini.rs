@@ -402,12 +402,17 @@ async fn unreadable_mo2_ini_settings_warn_and_conversion_continues() {
 }
 
 /// The source folder is read-only even when a supplied output would overlap it.
-#[test]
-fn player_ini_source_is_protected_from_converter_write_paths() {
+#[tokio::test]
+async fn player_ini_source_is_protected_from_converter_write_paths() {
     let mut fixture = Fixture::new(false);
     let source = fixture.player.join("Skyrim.ini");
     fs::write(&source, b"[General]\nuGridsToLoad=3\n").unwrap();
     fixture.config.output_dir = fixture.player.join("pack");
-    assert!(fixture.config.validate().is_err());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = AssetPipeline::run_async(fixture.config.clone(), tx).await;
+    drain.await.unwrap();
+    let error = result.expect_err("conversion must protect the player settings folder");
+    assert!(error.to_string().contains("overlaps"), "{error}");
     assert_eq!(fs::read(source).unwrap(), b"[General]\nuGridsToLoad=3\n");
 }
