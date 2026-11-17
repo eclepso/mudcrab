@@ -64,13 +64,13 @@ impl Instance {
         let instance_path = fs::canonicalize(path).wrap_err_with(|| {
             format!(
                 "MO2 instance not found: {}",
-                shared::pack_ini::readable_path(&path).display()
+                shared::pack_ini::readable_path(path).display()
             )
         })?;
         ensure!(
             instance_path.is_dir(),
             "MO2 instance is not a directory: {}",
-            shared::pack_ini::readable_path(&path).display()
+            shared::pack_ini::readable_path(path).display()
         );
         let ini = child(&instance_path, "ModOrganizer.ini")?;
         let contents = fs::read_to_string(&ini).wrap_err("reading MO2 ModOrganizer.ini")?;
@@ -482,7 +482,7 @@ fn reject_source_link(path: &Path) -> Result<()> {
     ensure!(
         !is_link,
         "MO2 source symlinks and reparse points are unsupported: {}",
-        shared::pack_ini::readable_path(&path).display()
+        shared::pack_ini::readable_path(path).display()
     );
     Ok(())
 }
@@ -492,7 +492,7 @@ fn optional_child(root: &Path, name: &str) -> Result<Option<PathBuf>> {
     find_child(root, name, false)
 }
 
-// Configured directory paths may traverse junctions; profile and asset children may not.
+/// Finds a child with optional traversal through configured directory junctions.
 fn find_child(root: &Path, name: &str, allow_links: bool) -> Result<Option<PathBuf>> {
     safe_name(name)?;
     let mut found = None;
@@ -506,7 +506,7 @@ fn find_child(root: &Path, name: &str, allow_links: bool) -> Result<Option<PathB
             ensure!(
                 found.is_none(),
                 "case-insensitive path collision in {}: {name}",
-                shared::pack_ini::readable_path(&root).display()
+                shared::pack_ini::readable_path(root).display()
             );
             if !allow_links {
                 reject_source_link(&entry.path())?;
@@ -632,7 +632,7 @@ fn overlay(
     ensure!(
         root.is_dir(),
         "MO2 Data source is not a directory: {}",
-        shared::pack_ini::readable_path(&root).display()
+        shared::pack_ini::readable_path(root).display()
     );
     reject_source_link(root)?;
     let mut layer = BTreeMap::new();
@@ -652,7 +652,7 @@ fn overlay(
         let entry = entry.wrap_err_with(|| {
             format!(
                 "reading MO2 source {}",
-                shared::pack_ini::readable_path(&root).display()
+                shared::pack_ini::readable_path(root).display()
             )
         })?;
         reject_source_link(entry.path())?;
@@ -674,7 +674,7 @@ fn overlay(
             ensure!(
                 layer.insert(key.clone(), entry.into_path()).is_none(),
                 "case-insensitive asset collision in {}: {key}",
-                shared::pack_ini::readable_path(&root).display()
+                shared::pack_ini::readable_path(root).display()
             );
         }
     }

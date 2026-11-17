@@ -151,7 +151,7 @@ async fn publish(data: &Path, output: &Path, reader: RecordReader) -> PipelineRe
     report
 }
 
-/// Run the default reader's real CLI, optionally authenticating an existing asset pack.
+/// Runs the real CLI with isolated settings, optionally authenticating an existing asset pack.
 fn cli(
     data: &Path,
     output: &Path,
@@ -163,6 +163,7 @@ fn cli(
         .arg(data)
         .arg(output)
         .arg("--no-lod")
+        .arg("--no-player-ini")
         .arg("--texture-encoder")
         .arg("cpu")
         .arg("--report-json")

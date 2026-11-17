@@ -101,12 +101,13 @@ pub fn decode_ini(bytes: &[u8]) -> DecodedIni {
         None
     };
     if let Some(little_endian) = utf16 {
-        let mut lossy = (bytes.len() - 2) % 2 != 0;
-        let units = bytes[2..].chunks_exact(2).map(|pair| {
+        let (pairs, remainder) = bytes[2..].as_chunks::<2>();
+        let mut lossy = !remainder.is_empty();
+        let units = pairs.iter().map(|pair| {
             if little_endian {
-                u16::from_le_bytes([pair[0], pair[1]])
+                u16::from_le_bytes(*pair)
             } else {
-                u16::from_be_bytes([pair[0], pair[1]])
+                u16::from_be_bytes(*pair)
             }
         });
         let text = char::decode_utf16(units)
