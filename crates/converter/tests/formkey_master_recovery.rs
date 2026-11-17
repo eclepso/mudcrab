@@ -408,7 +408,7 @@ fn self_selector_publication_keeps_optional_owner_lock_and_diagnostic_id() {
         let conn = Connection::open(path).unwrap();
         assert_eq!(
             common::native_fields(&conn, 0x0100_0870, b"XLOC"),
-            [lock.clone()]
+            std::slice::from_ref(&lock)
         );
         let opaque_sites: usize = conn
             .query_row(
