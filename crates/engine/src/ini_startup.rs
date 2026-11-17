@@ -110,10 +110,10 @@ fn pack_source(path: &Path, bytes: &[u8], manifest: &Manifest) -> String {
         return format!(
             "{kind} ({}; pack copy {})",
             readable_path(&provenance.source).display(),
-            readable_path(&path).display()
+            readable_path(path).display()
         );
     }
-    format!("pack copy ({})", readable_path(&path).display())
+    format!("pack copy ({})", readable_path(path).display())
 }
 
 /// Reports each supported launch value before saved interactive settings, including CLI precedence.
