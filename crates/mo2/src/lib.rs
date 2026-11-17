@@ -34,6 +34,7 @@ pub struct Instance {
     pub overwrite_dir: PathBuf,
     // Classic Skyrim lists active plugins as bare names; SE/VR require stars.
     classic_skyrim: bool,
+    skyrim_se: bool,
     /// MO2's instance default used when a profile has no LocalSettings override.
     profile_local_inis: Option<String>,
 }
@@ -60,12 +61,16 @@ impl Instance {
     ///
     /// Fails on unreadable or invalid configuration, missing directories, unsafe names, or no profiles.
     pub fn open(path: &Path) -> Result<Self> {
-        let instance_path = fs::canonicalize(path)
-            .wrap_err_with(|| format!("MO2 instance not found: {}", path.display()))?;
+        let instance_path = fs::canonicalize(path).wrap_err_with(|| {
+            format!(
+                "MO2 instance not found: {}",
+                shared::pack_ini::readable_path(&path).display()
+            )
+        })?;
         ensure!(
             instance_path.is_dir(),
             "MO2 instance is not a directory: {}",
-            path.display()
+            shared::pack_ini::readable_path(&path).display()
         );
         let ini = child(&instance_path, "ModOrganizer.ini")?;
         let contents = fs::read_to_string(&ini).wrap_err("reading MO2 ModOrganizer.ini")?;
@@ -86,7 +91,7 @@ impl Instance {
                 .keys()
                 .any(|(section, _)| section == "general" || section == "settings"),
             "{} is not an MO2 instance configuration",
-            ini.display()
+            shared::pack_ini::readable_path(&ini).display()
         );
         let value = |key: &str| {
             settings
@@ -134,7 +139,7 @@ impl Instance {
         ensure!(
             !profiles.is_empty(),
             "MO2 instance has no profiles: {}",
-            profiles_dir.display()
+            shared::pack_ini::readable_path(&profiles_dir).display()
         );
         let selected_profile = value("selected_profile").and_then(|selected| {
             let selected = decode_selected_profile(selected)?;
@@ -151,6 +156,7 @@ impl Instance {
             profiles_dir,
             overwrite_dir,
             classic_skyrim: game.eq_ignore_ascii_case("Skyrim"),
+            skyrim_se: game.eq_ignore_ascii_case("Skyrim Special Edition"),
             profile_local_inis: value("profile_local_inis").cloned(),
         })
     }
@@ -167,9 +173,14 @@ impl Instance {
         ensure!(
             path.is_dir(),
             "MO2 profile is not a directory: {}",
-            path.display()
+            shared::pack_ini::readable_path(&path).display()
         );
         Ok(path)
+    }
+
+    /// Identifies the SE/AE game family independently of classic Skyrim and VR.
+    pub fn is_skyrim_se(&self) -> bool {
+        self.skyrim_se
     }
 
     /// Resolves the selected profile's settings folder when MO2 enables local game INIs.
@@ -303,7 +314,7 @@ impl Instance {
                     &mut warnings,
                 )),
                 Err(error) => {
-                    warnings.add(format!("could not read optional loadorder.txt {}: {error}; using plugins.txt order", path.display()));
+                    warnings.add(format!("could not read optional loadorder.txt {}: {error}; using plugins.txt order", shared::pack_ini::readable_path(&path).display()));
                     None
                 }
             },
@@ -471,7 +482,7 @@ fn reject_source_link(path: &Path) -> Result<()> {
     ensure!(
         !is_link,
         "MO2 source symlinks and reparse points are unsupported: {}",
-        path.display()
+        shared::pack_ini::readable_path(&path).display()
     );
     Ok(())
 }
@@ -495,7 +506,7 @@ fn find_child(root: &Path, name: &str, allow_links: bool) -> Result<Option<PathB
             ensure!(
                 found.is_none(),
                 "case-insensitive path collision in {}: {name}",
-                root.display()
+                shared::pack_ini::readable_path(&root).display()
             );
             if !allow_links {
                 reject_source_link(&entry.path())?;
@@ -508,8 +519,12 @@ fn find_child(root: &Path, name: &str, allow_links: bool) -> Result<Option<PathB
 
 /// Finds a required child by case-insensitive name, failing if it is missing, ambiguous, or a link.
 fn child(root: &Path, name: &str) -> Result<PathBuf> {
-    optional_child(root, name)?
-        .ok_or_else(|| color_eyre::eyre::eyre!("MO2 path not found: {}", root.join(name).display()))
+    optional_child(root, name)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "MO2 path not found: {}",
+            shared::pack_ini::readable_path(&root.join(name)).display()
+        )
+    })
 }
 
 /// Expands an MO2 directory setting and resolves existing components case-insensitively.
@@ -543,7 +558,10 @@ fn configured_dir(instance: &Path, base: &Path, value: &str) -> Result<PathBuf> 
                     .to_str()
                     .ok_or_else(|| color_eyre::eyre::eyre!("MO2 directory is not UTF-8"))?;
                 resolved = find_child(&resolved, name, true)?.ok_or_else(|| {
-                    color_eyre::eyre::eyre!("MO2 path not found: {}", resolved.join(name).display())
+                    color_eyre::eyre::eyre!(
+                        "MO2 path not found: {}",
+                        shared::pack_ini::readable_path(&resolved.join(name)).display()
+                    )
                 })?;
             }
             Component::ParentDir => {
@@ -557,7 +575,7 @@ fn configured_dir(instance: &Path, base: &Path, value: &str) -> Result<PathBuf> 
     ensure!(
         resolved.is_dir(),
         "MO2 configured directory does not exist: {}",
-        path.display()
+        shared::pack_ini::readable_path(&path).display()
     );
     Ok(fs::canonicalize(resolved)?)
 }
@@ -614,7 +632,7 @@ fn overlay(
     ensure!(
         root.is_dir(),
         "MO2 Data source is not a directory: {}",
-        root.display()
+        shared::pack_ini::readable_path(&root).display()
     );
     reject_source_link(root)?;
     let mut layer = BTreeMap::new();
@@ -631,7 +649,12 @@ fn overlay(
         })
     {
         ensure!(!cancelled(), "MO2 resolution cancelled");
-        let entry = entry.wrap_err_with(|| format!("reading MO2 source {}", root.display()))?;
+        let entry = entry.wrap_err_with(|| {
+            format!(
+                "reading MO2 source {}",
+                shared::pack_ini::readable_path(&root).display()
+            )
+        })?;
         reject_source_link(entry.path())?;
         if !entry.file_type().is_file() {
             continue;
@@ -651,7 +674,7 @@ fn overlay(
             ensure!(
                 layer.insert(key.clone(), entry.into_path()).is_none(),
                 "case-insensitive asset collision in {}: {key}",
-                root.display()
+                shared::pack_ini::readable_path(&root).display()
             );
         }
     }

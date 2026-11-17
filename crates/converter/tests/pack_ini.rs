@@ -72,6 +72,7 @@ impl Fixture {
             "optional INIs preserve completeness: {report:?}"
         );
         assert!(self.manifest().complete);
+        self.assert_cli_success();
         assert!(
             self.config
                 .output_dir
@@ -80,6 +81,41 @@ impl Fixture {
             "valid neighboring script must survive: {report:?}"
         );
         report
+    }
+
+    /// Checks process success on the same synthetic source, using a separate output destination.
+    fn assert_cli_success(&self) {
+        let output_dir = self.config.output_dir.with_extension("cli");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_converter"));
+        command
+            .arg(&self.config.data_dir)
+            .arg(&output_dir)
+            .args(["--no-lod", "--cpu-jobs", "1"]);
+        if self.config.no_player_ini {
+            command.arg("--no-player-ini");
+        } else if let Some(folder) = &self.config.player_ini_dir {
+            command.arg("--player-ini-dir").arg(folder);
+        } else {
+            command.arg("--no-player-ini");
+        }
+        if let Some(selection) = &self.config.mo2 {
+            command
+                .arg("--mo2-instance")
+                .arg(&selection.instance_path)
+                .arg("--mo2-profile")
+                .arg(&selection.profile);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "optional INIs preserve exit 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            ConversionManifest::load(&output_dir.join("conversion-manifest.json"))
+                .unwrap()
+                .complete
+        );
     }
 
     /// Loads the metadata from the published pack, rather than inspecting staging.
@@ -549,6 +585,11 @@ async fn edited_pack_ini_is_kept_and_reported_on_reconversion() {
             .iter()
             .any(|notice| notice.contains("kept") && notice.contains("Skyrim.ini"))
     );
+    fixture.publish().await;
+    assert_eq!(
+        fs::read(fixture.config.output_dir.join("ini/Skyrim.ini")).unwrap(),
+        edited
+    );
 }
 
 /// Account identifiers are removed while portable provenance identifies the source file.
@@ -593,4 +634,146 @@ fn optional_ini_notice_preserves_cli_exit_zero() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(fixture.manifest().complete);
+}
+
+/// Library defaults omit ambient settings while an explicit opt-out also omits install templates.
+#[tokio::test]
+async fn library_defaults_and_explicit_opt_out_omit_player_inis() {
+    let mut fixture = Fixture::new(true);
+    fs::write(
+        fixture.player.join("Skyrim.ini"),
+        b"[General]\nuGridsToLoad=13\n",
+    )
+    .unwrap();
+    fixture.config.player_ini_dir = None;
+    fixture.publish().await;
+    assert!(fixture.manifest().ini_files.is_empty());
+    fixture.config.player_ini_dir = Some(fixture.player.clone());
+    fixture.publish().await;
+    fixture.config.no_player_ini = true;
+    fixture.publish().await;
+    assert!(fixture.manifest().ini_files.is_empty());
+    assert!(!fixture.config.output_dir.join("ini/Skyrim.ini").exists());
+    assert!(
+        !fixture
+            .config
+            .output_dir
+            .join("ini/SkyrimPrefs.ini")
+            .exists()
+    );
+}
+
+/// Classic and VR MO2 sources stay excluded from SE settings capture even with usable INIs.
+#[tokio::test]
+async fn classic_and_vr_mo2_profiles_never_supply_se_inis() {
+    for game in ["Skyrim", "Skyrim VR"] {
+        let mut fixture = Fixture::new(true);
+        let profile = fixture.mo2_profile(Some(true), None);
+        let instance = &fixture.config.mo2.as_ref().unwrap().instance_path;
+        let settings = fs::read_to_string(instance.join("ModOrganizer.ini"))
+            .unwrap()
+            .replace(
+                "gameName=Skyrim Special Edition",
+                &format!("gameName={game}"),
+            );
+        fs::write(instance.join("ModOrganizer.ini"), settings).unwrap();
+        if game == "Skyrim" {
+            fs::write(profile.join("plugins.txt"), "Neighbor.esp\n").unwrap();
+        }
+        fs::write(profile.join("Skyrim.ini"), b"[General]\nuGridsToLoad=11\n").unwrap();
+        fs::write(
+            fixture.player.join("Skyrim.ini"),
+            b"[General]\nuGridsToLoad=3\n",
+        )
+        .unwrap();
+        let report = fixture.publish().await;
+        assert!(fixture.manifest().ini_files.is_empty());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("not Skyrim SE/AE"))
+        );
+    }
+}
+
+/// Unedited copies refresh from current player settings and report their replacement.
+#[tokio::test]
+async fn reconversion_refreshes_unedited_ini_with_a_notice() {
+    let fixture = Fixture::new(false);
+    fs::write(
+        fixture.player.join("Skyrim.ini"),
+        b"[General]\nuGridsToLoad=3\n",
+    )
+    .unwrap();
+    fixture.publish().await;
+    fs::write(
+        fixture.player.join("Skyrim.ini"),
+        b"[General]\nuGridsToLoad=9\n",
+    )
+    .unwrap();
+    let report = fixture.publish().await;
+    assert_eq!(
+        fs::read(fixture.config.output_dir.join("ini/Skyrim.ini")).unwrap(),
+        b"[General]\nuGridsToLoad=9\n"
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("replaced unedited pack INI Skyrim.ini"))
+    );
+}
+
+/// Real metadata publication retains edits, skips invalid optional settings, and remains complete.
+#[tokio::test]
+async fn metadata_rebuild_optional_ini_notices_preserve_complete_publication() {
+    let fixture = Fixture::new(true);
+    fixture.publish().await;
+    let source = fixture.config.output_dir.clone();
+    fs::write(source.join("ini/Skyrim.ini"), b"invalid settings").unwrap();
+    let edited = b"[Display]\nfShadowDistance=8765\n";
+    fs::write(source.join("ini/SkyrimPrefs.ini"), edited).unwrap();
+    let mut config = fixture.config.clone();
+    config.output_dir = fixture._root.path().join("metadata-pack");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = AssetPipeline::rebuild_metadata_async(config.clone(), &source, tx)
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert!(report.complete, "{report:?}");
+    let manifest =
+        ConversionManifest::load(&config.output_dir.join("conversion-manifest.json")).unwrap();
+    assert!(manifest.complete);
+    assert!(!config.output_dir.join("ini/Skyrim.ini").exists());
+    assert_eq!(
+        fs::read(config.output_dir.join("ini/SkyrimPrefs.ini")).unwrap(),
+        edited
+    );
+    assert_eq!(
+        manifest.ini_files["ini/SkyrimPrefs.ini"].origin,
+        IniOrigin::PackCopy
+    );
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_converter"))
+        .arg(&config.data_dir)
+        .arg(fixture._root.path().join("metadata-cli"))
+        .arg("--reuse-assets")
+        .arg(&source)
+        .args(["--no-lod", "--no-player-ini"])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_manifest = ConversionManifest::load(
+        &fixture
+            ._root
+            .path()
+            .join("metadata-cli/conversion-manifest.json"),
+    )
+    .unwrap();
+    assert!(cli_manifest.complete);
 }

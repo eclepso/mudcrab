@@ -1,69 +1,120 @@
 # Skyrim settings in converted packs
 
 Conversion carries `Skyrim.ini` and `SkyrimPrefs.ini` into the pack's `ini/`
-directory. On Windows, discovery uses the Documents known folder and appends
-`My Games/Skyrim Special Edition`; Windows resolves redirected Documents,
-including OneDrive. Source files are read only. Other platforms can supply the
-`PipelineConfig.player_ini_dir` settings directory; automatic Proton discovery
-remains outside this feature.
+directory. Sources stay read only. `SkyrimCustom.ini` is not carried yet.
 
-When an MO2 profile is selected, its profile-specific INIs take precedence over
-Documents when `[General] LocalSettings` in the profile's `settings.ini` is
-enabled. An absent override follows the instance's `[Settings] profile_local_inis`
-setting, which defaults to true, matching [MO2's profile implementation](https://github.com/ModOrganizer2/modorganizer/blob/master/src/profile.cpp)
-and [instance settings](https://github.com/ModOrganizer2/modorganizer/blob/master/src/settings.cpp).
-An unreadable profile setting produces a warning and skips player-file discovery.
+## Discovery and source selection
 
-Each missing file can use the selected install's template only when the Data
-folder contains `Skyrim.esm` and its parent contains `SkyrimSE.exe`:
+The converter library reads no ambient Documents folder by default.
+`PipelineConfig.player_ini_dir` supplies a settings folder explicitly, and
+`PipelineConfig::discover_player_inis` requests automatic discovery. The CLI and
+launcher request discovery. The CLI also accepts `--player-ini-dir DIR` on every
+platform and `--no-player-ini` to omit capture, including MO2 sources and install
+templates. Those two flags are mutually exclusive. Metadata rebuilds retain
+existing pack settings rather than capturing external settings.
+
+Windows discovery uses the Documents known-folder API, which resolves redirection
+including OneDrive. The selected SE/AE install determines the folder beneath
+`Documents/My Games`:
+
+| Store | Folder | Positive install signal |
+| --- | --- | --- |
+| Steam | `Skyrim Special Edition` | `steam_api64.dll` |
+| GOG | `Skyrim Special Edition GOG` | `Galaxy64.dll` |
+| Epic | `Skyrim Special Edition EPIC` | `EOSSDK-Win64-Shipping.dll` |
+| Microsoft Store | `Skyrim Special Edition MS` | `appxmanifest.xml` |
+
+The [MO2 SE plugin](https://github.com/ModOrganizer2/modorganizer-game_skyrimse/blob/af9b50be81a9f6e91e817b5bc7792e2ae9aec55c/src/gameskyrimse.cpp#L37-L46)
+and its [directory selection](https://github.com/ModOrganizer2/modorganizer-game_skyrimse/blob/af9b50be81a9f6e91e817b5bc7792e2ae9aec55c/src/gameskyrimse.cpp#L128-L135)
+confirm the GOG/Epic signals and folder names.
+[Wrye Bash's SE variants](https://github.com/wrye-bash/wrye-bash/blob/09ab76083e1583ebbf5e28be516d3e98c9327da3/Mopy/bash/game/skyrimse/__init__.py#L412-L444)
+confirm all four folders, including Microsoft Store. Its
+[Store detector](https://github.com/wrye-bash/wrye-bash/blob/09ab76083e1583ebbf5e28be516d3e98c9327da3/Mopy/bash/game/store_mixins.py#L80-L91)
+uses the app manifest. Steam's DLL is used as a positive local signal; portable
+installs can use the explicit folder option.
+
+Discovery requires `Data/Skyrim.esm`, `SkyrimSE.exe`, and exactly one store signal.
+Unknown or conflicting signals produce an advisory notice and no automatic copy
+or template generation. Install folders containing `SkyrimVR.exe` or `TESV.exe`
+and MO2 classic/VR instances are excluded from SE settings discovery. Existing
+folders belonging to another store never select the edition. Automatic
+Linux/Proton discovery remains outside this feature.
+
+For an MO2 selection, `[General] LocalSettings` in the profile's `settings.ini`
+overrides instance `[Settings] profile_local_inis`, which defaults to true.
+See [MO2's profile implementation](https://github.com/ModOrganizer2/modorganizer/blob/4ba22f0d8b6f9e08e44008b8395cd774551b4ebe/src/profile.cpp#L822-L848)
+and [instance defaults](https://github.com/ModOrganizer2/modorganizer/blob/4ba22f0d8b6f9e08e44008b8395cd774551b4ebe/src/settings.cpp#L202-L205).
+Enabled profile settings take precedence per file. A missing profile file falls
+back to the selected edition's Documents file, matching
+[MO2's SE initialization](https://github.com/ModOrganizer2/modorganizer-game_skyrimse/blob/af9b50be81a9f6e91e817b5bc7792e2ae9aec55c/src/gameskyrimse.cpp#L191-L207).
+A failed profile lookup skips capture; an unreadable existing file skips that
+file. Failed lookup stays distinct from successful absence and never permits
+template generation. The converter writes only into staging, including during
+MO2 fallback; MO2's own profile-initialization writes are not performed.
+
+Each successfully absent file can use its corresponding install template when
+`Data/Skyrim.esm` and `SkyrimSE.exe` confirm the selected install:
 
 | Pack file | Install template |
 | --- | --- |
 | `ini/Skyrim.ini` | `Skyrim_Default.ini` |
 | `ini/SkyrimPrefs.ini` | `High.ini` |
 
-The corresponding template must exist and be readable. An existing player file
-is preserved independently of the other file. Unreadable or malformed inputs
-warn and are skipped; they leave usable conversion outputs intact. With neither
-player files nor a confirmed install, conversion writes no INIs.
+The template must exist and be readable. The fixed High preset follows the
+existing RF-LOD-002 policy; retail hardware-dependent first-run choices can
+differ. [DynDOLOD's documentation](https://dyndolod.info/Messages/INI-Files)
+describes retail launcher initialization. Optional input/copy failures are report
+notices, preserving `complete: true` and exit 0 when asset conversion succeeds.
 
-[DynDOLOD's INI documentation](https://dyndolod.info/Messages/INI-Files) describes
-running the retail launcher once to create the default INIs. The install's
-High template supplies an equivalent fixed High preset here, consistent with
-RF-LOD-002's built-in High terrain settings. The retail launcher also applies
-baseline and hardware-dependent settings, so this copy is not byte-identical to
-every first-run launcher output. [Step's game-file reference](https://stepmodifications.org/wiki/SkyrimSE:Game_Files)
-describes the preferences baseline and the preset files.
+## Decoding, privacy and reconversion
 
-`conversion-manifest.json` records `ini_files`, keyed by pack-relative path, with
-the original `source`, exact copied-byte `sha256`, and `origin` (`player_file` or
-`generated_from_install`, or `pack_copy` for retained local edits). This optional metadata extends the existing manifest;
-it changes no mesh, texture, database, or cache format. Normal conversion refreshes
-the copies even when converted assets are reused, removing stale INIs whose
-sources disappeared. Metadata-only rebuilding retains the existing pack settings.
-Windows provenance and INI diagnostics use readable drive/UNC paths with consistent
-separators; paths whose special namespace affects their meaning retain that spelling.
+Both converter and engine accept UTF-8 with or without a BOM, UTF-16 LE/BE with
+a BOM, and otherwise a lossy single-byte mapping that preserves ASCII keys.
+Lossy decoding produces a diagnostic. Reads are bounded to 4 MiB. Unreadable,
+oversized or structurally invalid optional inputs are skipped independently.
 
-The engine loads `ini/Skyrim.ini` followed by `ini/SkyrimPrefs.ini` automatically
-through its existing Skyrim INI reader. Supported keys retain the reader's
-case-insensitive parsing and malformed-scalar warnings.
+`conversion-manifest.json.ini_files` records a settings-folder-relative source
+filename, SHA-256 of the published bytes, and origin (`player_file`,
+`generated_from_install`, or `pack_copy`). Locally owned copies use `ini/<name>`.
+Home paths are omitted from this metadata, including when retaining older
+manifests. The `[Bethesda.net]` account section is removed during capture and
+retention; other files preserve exact bytes. Filtering emits UTF-8 and hashes
+the published bytes. Review other private custom settings before sharing a pack.
+The engine bug-report bundle includes neither the raw INIs nor the conversion
+manifest; it allowlists manifest summary fields instead.
 
-Precedence, from highest to lowest:
+Normal reconversion refreshes unedited copies and reports replacements. An edited
+pack copy is kept and reported, and remains locally owned on later reconversions.
+A metadata rebuild keeps every usable pack copy and reports each retained file.
+Invalid retained files produce nonfatal notices. Missing external sources remove
+unedited copies during normal reconversion. This optional metadata changes no
+mesh, texture, database or cached asset format.
 
-1. Explicit scalar CLI options, wherever they appear in the argument list.
-2. Explicit `--ini` files, in argument order; later files override earlier files.
-3. Pack INIs, in the order above.
-4. Engine defaults (and pack GMST sun settings where applicable).
+## Engine layers and diagnostics
 
-Providing any `--ini` replaces the entire pack INI list. Its omitted keys fall
-back to defaults, even if the explicit file is missing or unreadable. This makes
-an explicit list reproducible independently of the pack's saved player settings.
+The engine layers pack `Skyrim.ini`, then `SkyrimPrefs.ini`. This is MudCrab's
+reader policy; it is not a claim about retail routing of every non-preference key.
+Case-insensitive parsing and malformed-scalar diagnostics remain supported.
 
-Startup diagnostics report supported launch values and their origins: player file,
-generated-from-install, pack copy, `--ini`, CLI, or default. Original file labels
-are used when the pack file's bytes still match its recorded hash; locally edited
-copies and packs lacking INI metadata use the pack-copy label. Sun settings with
-no INI override resolve later from the pack's GMSTs or the retail fallback;
-`--sun-position` reports the explicitly fixed direction separately.
-Saved interactive rendering preferences apply afterward to values with no INI or
-CLI owner; imported INI values and explicit CLI options retain precedence.
+Precedence, highest first:
+
+1. Explicit scalar CLI options.
+2. Explicit `--ini` files in argument order, with later files taking precedence.
+3. The player's saved in-game settings.
+4. Pack INIs.
+5. Built-in defaults (and pack GMST sun settings where applicable).
+
+Any explicit `--ini` list replaces the pack file list. Omitted keys use saved
+menu settings where supported, otherwise defaults, including when an explicit
+file is unreadable. Pack values seed the interactive settings menu; a saved menu
+change survives the next interactive launch. Explicit INI and CLI keys remain
+launch owned. Automated runs retain the existing behavior of using launch
+configuration without loading interactive preferences.
+
+Per-key source diagnostics run after saved settings are applied, naming player
+file, generated-from-install, pack copy, saved in-game settings, `--ini`, or CLI.
+Default-only values remain in the source map and are silent at startup. Original
+file labels require a matching hash of the raw published bytes. Sun values with
+no override resolve later from pack GMSTs or the retail fallback.
+`--sun-position` identifies the explicit fixed direction separately.
+`--always-active` sets true only; an explicit INI can set `bAlwaysActive=0`.

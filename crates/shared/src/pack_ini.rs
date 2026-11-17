@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Pack settings apply in retail order: the general file, then preferences.
+/// MudCrab layers the general settings file, then preferences.
 pub const FILES: [&str; 2] = ["Skyrim.ini", "SkyrimPrefs.ini"];
 
 /// The original input behind a verified copy of a pack INI.
@@ -15,7 +15,7 @@ pub enum IniOrigin {
     PackCopy,
 }
 
-/// The original path and SHA-256 of the exact bytes copied into the pack.
+/// A settings-folder-relative source and SHA-256 of the published bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IniProvenance {
     pub source: PathBuf,
@@ -80,6 +80,74 @@ pub fn readable_path(path: &Path) -> PathBuf {
     {
         path.to_owned()
     }
+}
+
+/// Maximum accepted INI size, enforced while reading as well as before allocating.
+pub const MAX_INI_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Decoded settings text and whether a tolerant decoding path replaced source characters.
+pub struct DecodedIni {
+    pub text: String,
+    pub lossy: bool,
+}
+
+/// Decodes Unicode BOMs and UTF-8, then preserves ASCII through a single-byte fallback.
+pub fn decode_ini(bytes: &[u8]) -> DecodedIni {
+    let utf16 = if bytes.starts_with(&[0xff, 0xfe]) {
+        Some(true)
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(little_endian) = utf16 {
+        let mut lossy = (bytes.len() - 2) % 2 != 0;
+        let units = bytes[2..].chunks_exact(2).map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        });
+        let text = char::decode_utf16(units)
+            .map(|result| {
+                result.unwrap_or_else(|_| {
+                    lossy = true;
+                    char::REPLACEMENT_CHARACTER
+                })
+            })
+            .collect();
+        return DecodedIni { text, lossy };
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(text) => DecodedIni {
+            text: text.to_owned(),
+            lossy: false,
+        },
+        Err(_) => DecodedIni {
+            text: bytes.iter().map(|byte| char::from(*byte)).collect(),
+            lossy: true,
+        },
+    }
+}
+
+/// Reads bounded raw bytes so parsing and provenance hashing share the same input.
+pub fn read_ini_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_INI_BYTES {
+        return Err(std::io::Error::other(
+            "INI must be a regular file of at most 4 MiB",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INI_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INI_BYTES {
+        return Err(std::io::Error::other("INI exceeds the 4 MiB limit"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

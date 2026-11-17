@@ -313,7 +313,10 @@ pub fn actuate_effects(
             Effect::Begin(mut config) => {
                 let (tx, rx) = crossbeam_channel::unbounded();
                 match source.apply(&mut config) {
-                    Ok(()) => handle.cancellation = Some(runner::spawn(*config, tx)),
+                    Ok(()) => {
+                        config.discover_player_inis();
+                        handle.cancellation = Some(runner::spawn(*config, tx));
+                    }
                     Err(reason) => {
                         let _ = tx.send(RunMessage::Failed(state::FailureReport::before_start(
                             reason,

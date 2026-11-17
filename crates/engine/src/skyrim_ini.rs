@@ -41,11 +41,24 @@ impl SkyrimIni {
             .map(|(section, key)| format!("{section}.{key}"))
     }
 
-    /// Reads `path` over the values already read and returns the exact text consumed.
+    /// Reads bounded Skyrim-compatible text over the values already read.
     pub fn merge_file(&mut self, path: &Path) -> std::io::Result<String> {
-        let text = std::fs::read_to_string(path)?;
+        let bytes = shared::pack_ini::read_ini_bytes(path)?;
+        Ok(self.merge_bytes(&bytes, path))
+    }
+
+    /// Decodes copied bytes and reports lossy text while retaining supported ASCII settings.
+    pub(crate) fn merge_bytes(&mut self, bytes: &[u8], path: &Path) -> String {
+        let decoded = shared::pack_ini::decode_ini(bytes);
+        if decoded.lossy {
+            eprintln!(
+                "warning: INI {} uses lossy text decoding; ASCII settings remain available",
+                shared::pack_ini::readable_path(path).display()
+            );
+        }
+        let text = decoded.text;
         self.merge_str(&text);
-        Ok(text)
+        text
     }
 
     /// Reads INI text over the values already read. Sections and keys are
@@ -215,7 +228,7 @@ mod tests {
         config
     }
 
-    /// Explicit values layer by key; bad values cannot poison authored settings.
+    /// Valid explicit values layer by key while malformed values preserve authored settings.
     #[test]
     fn sun_ini_overrides_validate_and_layer_without_aborting() {
         let mut ini = SkyrimIni::default();

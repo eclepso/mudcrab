@@ -840,6 +840,7 @@ pub(crate) fn prepare_settings(config: &mut EngineConfig) -> (RenderingSettings,
     prepare_settings_at(config, preferences_path())
 }
 
+/// Layers saved menu values over pack defaults, then retains explicit launch-owned values.
 pub(crate) fn prepare_settings_at(
     config: &mut EngineConfig,
     path: Option<PathBuf>,
@@ -873,6 +874,7 @@ pub(crate) fn prepare_settings_at(
                                     && raw.get("occlusion_culling").is_none()
                             });
                         settings.retain_explicit_launch_values(config);
+                        crate::ini_startup::record_saved_sources(config);
                         if settings.color_grade
                             == crate::color_pipeline::SceneGradeMode::RecordSrgb.index()
                             && config.image_space_selection().ok().flatten().is_none()
@@ -2420,6 +2422,7 @@ mod tests {
         );
     }
 
+    /// Valid explicit keys own their settings while malformed keys retain saved values and sources.
     #[test]
     fn only_valid_explicit_ini_keys_override_saved_values() {
         let directory = tempfile::tempdir().unwrap();
@@ -2443,6 +2446,15 @@ mod tests {
         assert_eq!(loaded.lod_multiplier, 3.0);
         assert_eq!(loaded.lod_level0_distance, 45_000.0);
         assert_eq!((loaded.stream_radius, loaded.unload_radius), (4, 5));
+        assert!(config.ini_value_sources["terrainmanager.fsplitdistancemult"].starts_with("--ini"));
+        assert_eq!(
+            config.ini_value_sources["terrainmanager.fblocklevel0distance"],
+            "saved in-game settings"
+        );
+        assert_eq!(
+            config.ini_value_sources["general.ugridstoload"],
+            "saved in-game settings"
+        );
     }
 
     #[test]

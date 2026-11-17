@@ -183,7 +183,7 @@ pub enum WaterDepthSource {
 pub struct EngineConfig {
     /// Accepted INI values and their origins, with explicit CLI overrides applied at startup.
     pub ini_value_sources: std::collections::BTreeMap<String, String>,
-    /// Explicit launch options. Saved interactive settings defer to these and imported INIs.
+    /// Explicit launch options and explicit INI keys override saved interactive settings.
     pub settings_overrides: Vec<String>,
     pub assets_dir: PathBuf,
     /// Explicit local report destination. `None` uses the per-user application-data directory.
@@ -1550,7 +1550,7 @@ impl EngineConfig {
         }
         config.check_visual_profile()?;
         config.drop_jump_the_run_would_overwrite();
-        ini_startup::report(&mut config);
+        ini_startup::record_cli_sources(&mut config);
         Ok(ConfigAction::Run(Box::new(config)))
     }
 

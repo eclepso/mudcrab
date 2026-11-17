@@ -128,11 +128,13 @@ struct AssetDirectoryReadLock {
     _guard: shared::asset_lock::AssetLock,
 }
 
+/// Starts the engine after resolving saved interactive preferences and explicit launch settings.
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
     let mut preferences = config
         .interactive_world_physics()
         .then(|| crate::settings::prepare_settings(&mut config));
+    crate::ini_startup::report(&mut config);
     // A saved profile can disagree with an explicit launch option the parser already accepted.
     config.check_visual_profile()?;
     config.image_space_selection()?;

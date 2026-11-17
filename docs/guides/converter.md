@@ -134,3 +134,16 @@ portable directory flushing remains a Windows limitation.
 Compatibility changes also apply to physical Data-folder conversion: BodySlide/Outfit Studio resources under `CalienteTools` are excluded as authoring data, the manifest records `excluded_inputs`, and unsupported NIF versions are rejected explicitly. Particle-size parsing and dynamic-shape recovery restore geometry that was previously omitted.
 
 Dynamic head, hair, and eye meshes now produce geometry. The [PR #154 review](https://github.com/Mudcrab-Team/mudcrab/pull/154#issuecomment-5987129687) reports total GLB size increasing from 209 MB to 451 MB; these are reviewer-provided measurements, not a benchmark reproduced here. The script snapshot delta came from instruction dispatch chunking, not the Mudcrab header rename, which was already in `main`.
+
+## Player INI settings
+
+The CLI and launcher discover optional SE/AE player settings for the selected
+store edition. Use `--player-ini-dir DIR` to select a settings folder explicitly,
+or `--no-player-ini` to omit capture. Library callers opt in through
+`PipelineConfig::discover_player_inis` or `player_ini_dir`.
+Optional INI problems are notices and preserve otherwise complete conversion.
+Saved in-game menu choices take precedence over pack settings on later launches;
+explicit `--ini` and scalar CLI options take precedence over saved choices.
+See [pack INI policy](../specs/engine/pack-ini.md) for store folders, MO2 fallback,
+reconversion retention, decoding, privacy and provenance. `SkyrimCustom.ini` is
+not carried yet.

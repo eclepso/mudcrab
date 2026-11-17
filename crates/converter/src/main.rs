@@ -30,6 +30,8 @@ struct Cli {
     plugins_file: Option<PathBuf>,
     skyrim_ccc_file: Option<PathBuf>,
     skyrim_ini_file: Option<PathBuf>,
+    player_ini_dir: Option<PathBuf>,
+    no_player_ini: bool,
     reuse_assets: Option<PathBuf>,
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
@@ -65,6 +67,9 @@ impl Cli {
         config.plugins_file = self.plugins_file.clone();
         config.skyrim_ccc_file = self.skyrim_ccc_file.clone();
         config.skyrim_ini_file = self.skyrim_ini_file.clone();
+        config.player_ini_dir = self.player_ini_dir.clone();
+        config.no_player_ini = self.no_player_ini;
+        config.discover_player_inis();
         config.record_reader = self.record_reader;
         config.schema_addons = self.schema_addons.clone();
         config.fail_fast = self.fail_fast;
@@ -546,6 +551,15 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
         cli.output.display(),
         staging.display()
     );
+    if cli.no_player_ini {
+        command.push_str(" --no-player-ini");
+    }
+    if let Some(folder) = &cli.player_ini_dir {
+        command.push_str(&format!(
+            " --player-ini-dir \"{}\"",
+            shared::pack_ini::readable_path(folder).display()
+        ));
+    }
     if let Some(selection) = &cli.mo2 {
         command.push_str(&format!(
             " --mo2-instance \"{}\" --mo2-profile \"{}\"",
@@ -974,6 +988,8 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut plugins_file = None;
     let mut skyrim_ccc_file = None;
     let mut skyrim_ini_file = None;
+    let mut player_ini_dir = None;
+    let mut no_player_ini = false;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
     let mut ingestion_sync = IngestionSync::Archive;
@@ -1002,6 +1018,12 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         match argument.to_str() {
+            Some("--player-ini-dir") => {
+                player_ini_dir = Some(next_path_value(&mut args, "--player-ini-dir")?);
+            }
+            Some("--no-player-ini") => {
+                no_player_ini = true;
+            }
             Some("--mo2-instance") => {
                 mo2_instance = Some(PathBuf::from(next_value(&mut args, "--mo2-instance")?));
             }
@@ -1206,7 +1228,12 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             None
         }
     };
+    if player_ini_dir.is_some() && no_player_ini {
+        bail!("--player-ini-dir cannot be combined with --no-player-ini");
+    }
     Ok(Cli {
+        player_ini_dir,
+        no_player_ini,
         mo2,
         data: positional.remove(0),
         output: positional
@@ -1303,6 +1330,7 @@ fn usage() -> &'static str {
                  [--ingestion-sync per-file|archive|none] [--extract-all-archive-files]
                  [--schema-addon JSON]
                  [--mo2-instance DIR] [--mo2-profile NAME]
+                 [--player-ini-dir DIR | --no-player-ini]
                  [--merged-terrain] [--terrain-default-texture white|skyrim-ini]
                  [--terrain-ini FILE] [--terrain-allow-downscale]
                  [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
@@ -1353,6 +1381,11 @@ in load_order; selection_warnings contains Creation fallback warnings separately
 failed asset conversions. Archive companions match an exact plugin stem or a following
 space, dash or underscore. The longest installed owner must survive selection; unowned
 archives are admitted outside MO2 and excluded in MO2.
+
+Optional settings capture discovers the selected SE/AE store edition's Documents INIs.
+--player-ini-dir <DIR> supplies an explicit settings folder (also on other platforms).
+--no-player-ini omits settings capture, including MO2 and install templates.
+Optional INI problems are notices and preserve an otherwise complete conversion.
 
 MO2 and --plugins-file selections cannot be combined. Automatic discovery applies
 when neither selection is supplied.
@@ -1481,6 +1514,36 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Settings options preserve explicit folder selection, opt-out, and resume commands.
+    #[test]
+    fn ini_capture_options_are_explicit_and_resume_stable() {
+        let cli = parse_cli(args(&["Data", "--player-ini-dir", "synthetic-settings"])).unwrap();
+        assert_eq!(
+            cli.pipeline_config().player_ini_dir,
+            Some(PathBuf::from("synthetic-settings"))
+        );
+        assert!(
+            resume_command("converter", &cli, Path::new("staging"))
+                .contains("--player-ini-dir \"synthetic-settings\"")
+        );
+        let disabled = parse_cli(args(&["Data", "--no-player-ini"])).unwrap();
+        assert!(disabled.pipeline_config().no_player_ini);
+        assert!(
+            resume_command("converter", &disabled, Path::new("staging"))
+                .contains("--no-player-ini")
+        );
+        assert!(
+            parse_cli(args(&[
+                "Data",
+                "--player-ini-dir",
+                "synthetic",
+                "--no-player-ini"
+            ]))
+            .is_err()
+        );
+        assert!(parse_cli(args(&["Data", "--player-ini-dir"])).is_err());
+    }
 
     /// Verifies MO2 profile defaults, invalid selections, and selection retention in resume commands.
     #[test]
@@ -2112,6 +2175,8 @@ mod tests {
             plugins_file: None,
             skyrim_ccc_file: None,
             skyrim_ini_file: None,
+            player_ini_dir: None,
+            no_player_ini: false,
             reuse_assets: None,
             report_json: None,
             cpu_jobs: None,

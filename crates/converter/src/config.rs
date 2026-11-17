@@ -76,10 +76,16 @@ pub struct PipelineConfig {
     /// Explicit General sTestFile settings; no ambient profile is read.
     #[serde(default)]
     pub skyrim_ini_file: Option<PathBuf>,
-    /// Player settings folder; absent resolves Windows Documents through the known-folder API.
+    /// Explicit player settings folder; absent leaves ambient Documents unread by default.
     /// MO2 profile-specific settings take precedence over this folder when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_ini_dir: Option<PathBuf>,
+    /// A failed front-end settings lookup remains distinct from a successfully absent file.
+    #[serde(skip)]
+    pub(crate) player_ini_error: Option<String>,
+    /// Omits optional settings capture, including MO2 files and install templates.
+    #[serde(default)]
+    pub no_player_ini: bool,
     /// Explicit per-worldspace LOD origins for custom worlds, keyed by
     /// worldspace editor id: `[grid_x, grid_y]`. Installed worlds read
     /// `lodsettings/<WorldspaceEDID>.lod` instead; a world with neither gets
@@ -178,6 +184,20 @@ impl PipelineConfig {
         ))
     }
 
+    /// Requests ambient settings discovery explicitly, as used by the CLI and launcher.
+    pub fn discover_player_inis(&mut self) {
+        if self.no_player_ini || self.player_ini_dir.is_some() {
+            return;
+        }
+        match crate::pack_ini::discover_player_ini_dir(&self.data_dir) {
+            Ok(path) => {
+                self.player_ini_dir = Some(path);
+                self.player_ini_error = None;
+            }
+            Err(error) => self.player_ini_error = Some(error.to_string()),
+        }
+    }
+
     /// A configuration with the default settings for converting `data_dir` into `output_dir`.
     pub fn new(data_dir: impl Into<PathBuf>, output_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -193,6 +213,8 @@ impl PipelineConfig {
             skyrim_ccc_file: None,
             skyrim_ini_file: None,
             player_ini_dir: None,
+            player_ini_error: None,
+            no_player_ini: false,
             lod_origins: BTreeMap::new(),
             no_lod: false,
             merged_terrain: false,
@@ -303,14 +325,11 @@ impl PipelineConfig {
         // none of them may be, hold, or sit inside the game data.
         let data = std::fs::canonicalize(&self.data_dir)?;
         let mut sources = vec![data.clone()];
-        if let Some(player_ini_dir) = crate::pack_ini::player_ini_dir(self) {
-            match resolve_path(&player_ini_dir) {
-                Ok(path) => sources.push(path),
-                Err(error) => log::warn!(
-                    "could not resolve optional player INI folder {}: {error:#}",
-                    player_ini_dir.display()
-                ),
-            }
+        // The caller resolves requested discovery once before validation; supplied paths stay protected.
+        if let Some(player_ini_dir) = &self.player_ini_dir
+            && let Ok(path) = resolve_path(player_ini_dir)
+        {
+            sources.push(path);
         }
         if let Some(selection) = &self.mo2 {
             color_eyre::eyre::ensure!(
@@ -338,9 +357,20 @@ impl PipelineConfig {
             for source in &sources {
                 color_eyre::eyre::ensure!(
                     !(resolved.starts_with(source) || source.starts_with(&resolved)),
-                    "the {role} {} overlaps the Skyrim Data directory or MO2 source {}; choose a folder outside it that does not contain it",
-                    path.display(),
-                    source.display()
+                    "the {role} {} overlaps the {} {}; choose a separate folder",
+                    shared::pack_ini::readable_path(&path).display(),
+                    if self
+                        .player_ini_dir
+                        .as_ref()
+                        .and_then(|p| resolve_path(p).ok())
+                        .as_ref()
+                        == Some(source)
+                    {
+                        "player settings folder"
+                    } else {
+                        "Skyrim Data directory or MO2 source"
+                    },
+                    shared::pack_ini::readable_path(source).display()
                 );
             }
         }

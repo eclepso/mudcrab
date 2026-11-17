@@ -3,7 +3,7 @@
 use crate::{config::EngineConfig, skyrim_ini::SkyrimIni};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use shared::pack_ini::{FILES, IniOrigin, IniProvenance, readable_path};
+use shared::pack_ini::{FILES, IniOrigin, IniProvenance, read_ini_bytes, readable_path};
 use std::{collections::BTreeMap, fs, path::Path};
 
 /// The optional part of the conversion manifest needed to identify copied settings.
@@ -13,7 +13,7 @@ struct Manifest {
     ini_files: BTreeMap<String, IniProvenance>,
 }
 
-/// Loads pack files in retail order, or replaces them with the explicit `--ini` list.
+/// Loads pack files in Mudcrab's documented order, or replaces them with the explicit `--ini` list.
 /// CLI parsing applies explicit scalar options after this function, independent of argument order.
 pub(crate) fn load(config: &mut EngineConfig, args: &[String]) {
     let explicit = args.iter().any(|argument| argument == "--ini");
@@ -41,8 +41,8 @@ pub(crate) fn load(config: &mut EngineConfig, args: &[String]) {
     let mut ini = SkyrimIni::default();
     let mut sources = BTreeMap::new();
     for path in paths {
-        let text = match ini.merge_file(&path) {
-            Ok(text) => text,
+        let bytes = match read_ini_bytes(&path) {
+            Ok(bytes) => bytes,
             Err(error) => {
                 if explicit || error.kind() != std::io::ErrorKind::NotFound {
                     eprintln!(
@@ -53,10 +53,11 @@ pub(crate) fn load(config: &mut EngineConfig, args: &[String]) {
                 continue;
             }
         };
+        let text = ini.merge_bytes(&bytes, &path);
         let source = if explicit {
             format!("--ini ({})", readable_path(&path).display())
         } else {
-            pack_source(&path, text.as_bytes(), &manifest)
+            pack_source(&path, &bytes, &manifest)
         };
         let mut file = SkyrimIni::default();
         file.merge_str(&text);
@@ -64,7 +65,12 @@ pub(crate) fn load(config: &mut EngineConfig, args: &[String]) {
             sources.insert(key, source.clone());
         }
     }
+    let existing_overrides = config.settings_overrides.len();
     ini.apply(config);
+    if !explicit {
+        // Pack settings seed menu values; explicit INIs retain launch ownership.
+        config.settings_overrides.truncate(existing_overrides);
+    }
     for (key, source) in &mut config.ini_value_sources {
         if let Some(found) = sources.get(key) {
             source.clone_from(found);
@@ -116,8 +122,8 @@ fn pack_source(path: &Path, bytes: &[u8], manifest: &Manifest) -> String {
     format!("pack copy ({})", readable_path(path).display())
 }
 
-/// Reports each supported launch value before saved interactive settings, including CLI precedence.
-pub(crate) fn report(config: &mut EngineConfig) {
+/// Records explicit CLI ownership and fills supported keys with their default source.
+pub(crate) fn record_cli_sources(config: &mut EngineConfig) {
     for (flag, key) in [
         ("--always-active", "general.balwaysactive"),
         ("--stream-radius", "general.ugridstoload"),
@@ -132,6 +138,47 @@ pub(crate) fn report(config: &mut EngineConfig) {
                 .insert(key.into(), format!("CLI ({flag})"));
         }
     }
+    for (key, _) in setting_values(config) {
+        config
+            .ini_value_sources
+            .entry(key)
+            .or_insert_with(|| "default".into());
+    }
+}
+
+/// Marks menu-owned INI values as saved preferences after a valid settings file loads.
+pub(crate) fn record_saved_sources(config: &mut EngineConfig) {
+    for (key, owner) in [
+        ("general.ugridstoload", "ini:stream-radius"),
+        (
+            "terrainmanager.fblocklevel0distance",
+            "ini:fBlockLevel0Distance",
+        ),
+        (
+            "terrainmanager.fblocklevel1distance",
+            "ini:fBlockLevel1Distance",
+        ),
+        (
+            "terrainmanager.fblockmaximumdistance",
+            "ini:fBlockMaximumDistance",
+        ),
+        (
+            "terrainmanager.fsplitdistancemult",
+            "ini:fSplitDistanceMult",
+        ),
+    ] {
+        if !config.settings_overrides.iter().any(|flag| {
+            flag == owner || (key == "general.ugridstoload" && flag == "--stream-radius")
+        }) {
+            config
+                .ini_value_sources
+                .insert(key.into(), "saved in-game settings".into());
+        }
+    }
+}
+
+/// Lists supported values after the relevant startup layers have applied.
+fn setting_values(config: &EngineConfig) -> Vec<(String, String)> {
     let lod = config.terrain_lod;
     let mut values = vec![
         (
@@ -172,12 +219,17 @@ pub(crate) fn report(config: &mut EngineConfig) {
             },
         ));
     }
-    for (key, value) in values {
-        let source = config
-            .ini_value_sources
-            .entry(key.clone())
-            .or_insert_with(|| "default".into());
-        eprintln!("INI launch setting {key}={value}; source={source}");
+    values
+}
+
+/// Reports effective non-default sources after saved interactive settings and CLI precedence.
+pub(crate) fn report(config: &mut EngineConfig) {
+    record_cli_sources(config);
+    for (key, value) in setting_values(config) {
+        let source = &config.ini_value_sources[&key];
+        if source != "default" {
+            eprintln!("INI launch setting {key}={value}; source={source}");
+        }
     }
     if let Some(position) = config.sun_position {
         eprintln!("sun direction={position:?}; source=CLI (--sun-position)");
@@ -189,7 +241,7 @@ mod tests {
     use super::*;
     use crate::config::ConfigAction;
 
-    /// Parses an isolated synthetic pack without depending on the working directory.
+    /// Parses settings from an explicitly selected synthetic pack.
     fn start(pack: &Path, options: &[&str]) -> EngineConfig {
         let args = ["--assets".to_owned(), pack.display().to_string()]
             .into_iter()
@@ -365,6 +417,29 @@ mod tests {
         .unwrap();
         let config = start(directory.path(), &[]);
         assert_eq!(config.stream_radius, 5);
+        assert!(config.ini_value_sources["general.ugridstoload"].starts_with("player file"));
+    }
+
+    /// The engine verifies a manifest serialized by the converter using its published hash helper.
+    #[test]
+    fn ini_converter_manifest_hash_matches_engine_loader() {
+        let directory = pack();
+        let bytes = b"[General]\nuGridsToLoad=13\n";
+        fs::write(directory.path().join("ini/SkyrimPrefs.ini"), bytes).unwrap();
+        let mut manifest = converter::cache::ConversionManifest::default();
+        manifest.ini_files.insert(
+            "ini/SkyrimPrefs.ini".into(),
+            IniProvenance {
+                source: "SkyrimPrefs.ini".into(),
+                sha256: converter::cache::hash_bytes(bytes),
+                origin: IniOrigin::PlayerFile,
+            },
+        );
+        manifest
+            .save(&directory.path().join("conversion-manifest.json"))
+            .unwrap();
+        let config = start(directory.path(), &[]);
+        assert_eq!(config.stream_radius, 6);
         assert!(config.ini_value_sources["general.ugridstoload"].starts_with("player file"));
     }
 }
