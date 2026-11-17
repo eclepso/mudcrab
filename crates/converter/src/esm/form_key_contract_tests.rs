@@ -431,15 +431,15 @@ fn oracle_word(record: &RawRecord, tag: &[u8; 4]) -> u32 {
 fn old_scalar_conversion_route_refuses_disk_publication() {
     let (directory, paths, _) = record_oracle_fixture();
     let database = directory.path().join("old-scalar.db");
-    let error = super::EsmParser::convert_legacy_plugins_report(
+    let Err(error) = super::EsmParser::convert_legacy_plugins_report(
         &paths,
         &database,
         super::inhouse::StringSources::default_language(
             super::inhouse::StringRoots::PluginLooseFirst(directory.path()),
         ),
-    )
-    .err()
-    .expect("old scalar route must not publish a native world");
+    ) else {
+        panic!("old scalar route must not publish a native world");
+    };
     assert!(
         format!("{error:#}").contains("no authenticated native source context"),
         "{error:#}"

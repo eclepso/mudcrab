@@ -226,8 +226,8 @@ pub(crate) fn insert(
             )
             .unwrap();
         if field.tag == *b"IMSP" {
-            for (word_index, word) in field.data.chunks_exact(4).enumerate() {
-                let raw = u32::from_le_bytes(word.try_into().unwrap());
+            for (word_index, word) in field.data.as_chunks::<4>().0.iter().enumerate() {
+                let raw = u32::from_le_bytes(*word);
                 let target = shared::records::source_key(identity, supplier, raw).unwrap();
                 connection
                     .execute(

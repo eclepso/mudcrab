@@ -1149,8 +1149,10 @@ fn native_named_history_decodes_beyond_full_slot_limit_and_guards_source_hash() 
 #[test]
 fn native_notices_do_not_filter_on_plugin_filename_text() {
     let mut result = NativeReadResult::default();
-    let mut diagnostic = PluginDiagnostics::default();
-    diagnostic.compatibility_headers = 1;
+    let mut diagnostic = PluginDiagnostics {
+        compatibility_headers: 1,
+        ..Default::default()
+    };
     diagnostic
         .first_by_category
         .insert("compatibility".into(), "source header".into());

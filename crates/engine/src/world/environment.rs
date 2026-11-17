@@ -529,13 +529,12 @@ fn read_rows<T>(
         }
         Ok(result)
     });
-    if rows.is_ok() {
-        if let Err(error) =
+    if rows.is_ok()
+        && let Err(error) =
             crate::world::database::report_runtime_capacity(connection, table, identity_columns)
-        {
-            warn!("environment: {table} identity inspection failed ({error}); table refused");
-            return Vec::new();
-        }
+    {
+        warn!("environment: {table} identity inspection failed ({error}); table refused");
+        return Vec::new();
     }
     rows.unwrap_or_else(|error| {
         info!("environment: no usable `{table}` table ({error}); built-in lighting stays");
