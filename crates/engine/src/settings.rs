@@ -3268,14 +3268,85 @@ mod tests {
         assert!(!saved_file.take_metal_drawing_default());
     }
 
+    /// Ignored future values preserve valid preferences and conservative backend-default handling.
     #[test]
     fn unknown_out_of_range_number_does_not_panic_or_enable_metal_default() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         std::fs::write(&path, r#"{"version":1,"hud":false,"x":1e999}"#).unwrap();
-        let (settings, mut file) = prepare_settings_at(&mut EngineConfig::default(), Some(path));
+        let loaded = std::panic::catch_unwind(|| {
+            prepare_settings_at(&mut EngineConfig::default(), Some(path))
+        });
+        assert!(
+            loaded.is_ok(),
+            "ignored future number preserves usable settings"
+        );
+        let (settings, mut file) = loaded.unwrap();
         assert!(!settings.hud);
         assert!(!file.take_metal_drawing_default());
+    }
+
+    /// Unknown unrepresentable numbers leave ownership limited to the grid/LOD keys actually saved.
+    #[test]
+    fn ini_saved_key_ownership_tolerates_ignored_out_of_range_numbers() {
+        for saved_multiplier in [None, Some(3.5)] {
+            let directory = tempfile::tempdir().unwrap();
+            let pack = directory.path().join("pack");
+            std::fs::create_dir_all(pack.join("ini")).unwrap();
+            let ini = pack.join("ini/Skyrim.ini");
+            std::fs::write(
+                &ini,
+                "[General]\nuGridsToLoad=7\n[TerrainManager]\nfSplitDistanceMult=2.25\n",
+            )
+            .unwrap();
+            let path = directory.path().join("settings.json");
+            let optional = saved_multiplier
+                .map(|value| format!(",\"lod_multiplier\":{value}"))
+                .unwrap_or_default();
+            std::fs::write(
+                &path,
+                format!("{{\"version\":1,\"hud\":false,\"future\":1e999{optional}}}"),
+            )
+            .unwrap();
+            let args = ["--assets".into(), pack.display().to_string()];
+            let loaded = std::panic::catch_unwind(|| {
+                prepare_settings_at(&mut launch(&args), Some(path.clone()))
+            });
+            assert!(
+                loaded.is_ok(),
+                "ownership scan tolerates ignored future numbers"
+            );
+            let (settings, mut file) = loaded.unwrap();
+            assert!(!settings.hud);
+            assert_eq!(settings.stream_radius, 3);
+            assert_eq!(settings.lod_multiplier, saved_multiplier.unwrap_or(2.25));
+            assert_eq!(
+                file.ini_menu_owned,
+                if saved_multiplier.is_some() {
+                    1 << 4
+                } else {
+                    0
+                }
+            );
+            assert!(!file.take_metal_drawing_default());
+            file.save(&settings);
+            assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(saved.get("stream_radius").is_none());
+            assert_eq!(
+                saved.get("lod_multiplier").is_some(),
+                saved_multiplier.is_some()
+            );
+            std::fs::write(
+                &ini,
+                "[General]\nuGridsToLoad=13\n[TerrainManager]\nfSplitDistanceMult=1.75\n",
+            )
+            .unwrap();
+            let (reloaded, _) = prepare_settings_at(&mut launch(&args), Some(path));
+            assert_eq!(reloaded.stream_radius, 6);
+            assert_eq!(reloaded.lod_multiplier, saved_multiplier.unwrap_or(1.75));
+        }
     }
 
     #[test]
