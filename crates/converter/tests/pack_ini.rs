@@ -120,7 +120,10 @@ impl Fixture {
             settings.push_str(&format!("[Settings]\nprofile_local_inis={enabled}\n"));
         }
         fs::write(instance.join("ModOrganizer.ini"), settings).unwrap();
-        fs::write(profile.join("plugins.txt"), "").unwrap();
+        let mut plugin = b"TES4".to_vec();
+        plugin.extend_from_slice(&[0; 20]);
+        fs::write(self.config.data_dir.join("Neighbor.esp"), plugin).unwrap();
+        fs::write(profile.join("plugins.txt"), "*Neighbor.esp\n").unwrap();
         fs::write(profile.join("modlist.txt"), "").unwrap();
         if let Some(enabled) = profile_setting {
             fs::write(
