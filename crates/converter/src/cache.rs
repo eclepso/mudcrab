@@ -366,6 +366,9 @@ impl IngestionJournal {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversionManifest {
     pub schema_version: u32,
+    /// Optional runtime settings, with original paths and hashes of their pack copies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ini_files: BTreeMap<String, shared::pack_ini::IniProvenance>,
     /// Metadata-only rebuilds do not upgrade the retained mesh cache contract.
     /// Absent means the meshes follow `schema_version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

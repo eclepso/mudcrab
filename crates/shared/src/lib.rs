@@ -8,6 +8,7 @@ pub mod coordinates;
 pub mod creature_idle;
 pub mod extensions;
 pub mod lod;
+pub mod pack_ini;
 pub mod plugin_selection;
 pub mod records;
 pub mod streaming_costs;

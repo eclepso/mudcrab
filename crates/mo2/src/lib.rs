@@ -34,6 +34,8 @@ pub struct Instance {
     pub overwrite_dir: PathBuf,
     // Classic Skyrim lists active plugins as bare names; SE/VR require stars.
     classic_skyrim: bool,
+    /// MO2's instance default used when a profile has no LocalSettings override.
+    profile_local_inis: Option<String>,
 }
 
 /// Winning asset paths, installed-plugin inventory and active plugin order, keyed by Data-relative paths.
@@ -149,6 +151,7 @@ impl Instance {
             profiles_dir,
             overwrite_dir,
             classic_skyrim: game.eq_ignore_ascii_case("Skyrim"),
+            profile_local_inis: value("profile_local_inis").cloned(),
         })
     }
 
@@ -167,6 +170,37 @@ impl Instance {
             path.display()
         );
         Ok(path)
+    }
+
+    /// Resolves the selected profile's settings folder when MO2 enables local game INIs.
+    /// QSettings stores the root `LocalSettings` value in `settings.ini`'s `[General]` section.
+    pub fn profile_ini_dir(&self, profile: &str) -> Result<Option<PathBuf>> {
+        let profile = self.profile_dir(profile)?;
+        let mut enabled = self
+            .profile_local_inis
+            .as_deref()
+            .map(parse_local_settings)
+            .transpose()?
+            .unwrap_or(true);
+        let Some(settings) = optional_child(&profile, "settings.ini")? else {
+            return Ok(enabled.then_some(profile));
+        };
+        let text = fs::read_to_string(settings).wrap_err("reading MO2 profile INI settings")?;
+        let mut general = true;
+        for line in lines(&text) {
+            if let Some(section) = line
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                general = section.eq_ignore_ascii_case("General");
+            } else if let Some((key, value)) = line.split_once('=')
+                && general
+                && key.trim().eq_ignore_ascii_case("LocalSettings")
+            {
+                enabled = parse_local_settings(value)?;
+            }
+        }
+        Ok(enabled.then_some(profile))
     }
 
     /// Instance/profile files that determine selection, for converter cache provenance.
@@ -330,6 +364,15 @@ impl Instance {
             notices,
             selection_warnings,
         })
+    }
+}
+
+/// Reads MO2's serialized checkbox values while reporting an invalid profile preference.
+fn parse_local_settings(value: &str) -> Result<bool> {
+    match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => bail!("invalid MO2 LocalSettings value: {other:?}"),
     }
 }
 

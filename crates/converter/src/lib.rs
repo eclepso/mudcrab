@@ -19,6 +19,7 @@ pub mod lod;
 pub mod material;
 pub mod mesh;
 mod metadata;
+mod pack_ini;
 pub mod pipeline;
 pub mod progress;
 pub mod reader_diff;

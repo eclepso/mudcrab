@@ -622,6 +622,7 @@ impl AssetPipeline {
             // The authoritative reader replaces this proof when plugins are converted.
             record_data_complete: Some(true),
             configuration_hash: expected_configuration.clone(),
+            ini_files: Default::default(),
             schema_addons: config.schemas()?.identities().to_vec(),
             asset_configuration_hashes: ["nif", "dds", "pex"]
                 .into_iter()
@@ -1796,6 +1797,7 @@ impl AssetPipeline {
         .await;
         interrupt(cancellation)?;
         let manifest_save_started = Instant::now();
+        crate::pack_ini::capture(config, staging, &mut report, &mut manifest);
         report.inputs_by_kind = manifest.inputs_by_kind.clone();
         // The new pack starts without capability declarations, but the pack it replaces may have
         // carried some. Offer each to the refresh: one whose payload is still valid in staging is

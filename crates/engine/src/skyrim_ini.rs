@@ -2,7 +2,7 @@
 //!
 //! Skyrim reads its view distances from `Skyrim.ini` and `SkyrimPrefs.ini`, and
 //! mod managers, LOD generators and players tune the same keys. `--ini <path>`
-//! reads files in that format so a load order's tuned values carry over: files
+//! replaces the automatically loaded pack INIs with files in that format: files
 //! apply in the order given, later files override earlier ones, and explicit
 //! command-line options override every file. Keys without an engine consumer
 //! are ignored, as Skyrim ignores keys it does not know.
@@ -34,10 +34,18 @@ pub struct SkyrimIni {
 }
 
 impl SkyrimIni {
-    /// Reads `path` over the values already read, as Skyrim layers its INI files.
-    pub fn merge_file(&mut self, path: &Path) -> std::io::Result<()> {
-        self.merge_str(&std::fs::read_to_string(path)?);
-        Ok(())
+    /// Lists merged keys so startup diagnostics can retain their file origins.
+    pub(crate) fn key_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.values
+            .keys()
+            .map(|(section, key)| format!("{section}.{key}"))
+    }
+
+    /// Reads `path` over the values already read and returns the exact text consumed.
+    pub fn merge_file(&mut self, path: &Path) -> std::io::Result<String> {
+        let text = std::fs::read_to_string(path)?;
+        self.merge_str(&text);
+        Ok(text)
     }
 
     /// Reads INI text over the values already read. Sections and keys are
@@ -78,8 +86,10 @@ impl SkyrimIni {
     pub fn apply(&self, config: &mut EngineConfig) {
         if let Some(raw) = self.get("General", "bAlwaysActive") {
             match raw {
-                "0" => config.always_active = false,
-                "1" => config.always_active = true,
+                "0" | "1" => {
+                    config.always_active = raw == "1";
+                    record_source(&mut config.ini_value_sources, "General", "bAlwaysActive");
+                }
                 _ => eprintln!("warning: ignoring bAlwaysActive={raw:?}; expected 0 or 1"),
             }
         }
@@ -92,6 +102,7 @@ impl SkyrimIni {
                     config.stream_radius = (grids - 1) / 2;
                     config.unload_radius = config.stream_radius + 1;
                     config.settings_overrides.push("ini:stream-radius".into());
+                    record_source(&mut config.ini_value_sources, "General", "uGridsToLoad");
                 }
                 _ => eprintln!(
                     "warning: ignoring uGridsToLoad={raw:?}; expected an odd whole number from 1 to {}",
@@ -103,6 +114,7 @@ impl SkyrimIni {
             match raw.parse::<f32>() {
                 Ok(value) if value.is_finite() && value >= MIN_SUN_SHADOW_DISTANCE => {
                     config.sun_shadow_distance_limit = Some(value);
+                    record_source(&mut config.ini_value_sources, "Display", "fShadowDistance");
                 }
                 _ => eprintln!(
                     "warning: ignoring fShadowDistance={raw:?}; expected at least {MIN_SUN_SHADOW_DISTANCE} Creation units"
@@ -115,7 +127,8 @@ impl SkyrimIni {
             };
             match raw.parse::<f32>() {
                 Ok(value) if crate::sun::SunSettings::valid(index, value) => {
-                    config.sun_settings_overrides[index] = Some(value)
+                    config.sun_settings_overrides[index] = Some(value);
+                    record_source(&mut config.ini_value_sources, "Sky", key);
                 }
                 _ => eprintln!(
                     "warning: ignoring [Sky] {key}={raw:?}; unusable sun-path value, retaining the pack's GMST"
@@ -136,11 +149,24 @@ impl SkyrimIni {
                 Ok(value) if value.is_finite() && value > 0.0 => {
                     *setting = value;
                     config.settings_overrides.push(format!("ini:{key}"));
+                    record_source(&mut config.ini_value_sources, "TerrainManager", key);
                 }
                 _ => eprintln!("warning: ignoring {key}={raw:?}; expected a positive number"),
             }
         }
     }
+}
+
+/// Marks a validated value for the startup loader to attach its original file source.
+fn record_source(
+    sources: &mut std::collections::BTreeMap<String, String>,
+    section: &str,
+    key: &str,
+) {
+    sources.insert(
+        format!("{section}.{key}").to_ascii_lowercase(),
+        "INI".into(),
+    );
 }
 
 #[cfg(test)]

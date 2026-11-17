@@ -1,6 +1,6 @@
 use crate::{
     color_pipeline::{SCENE_GRADE_VALUES, SceneGradeMode, SceneVisualPreset},
-    skyrim_ini::SkyrimIni,
+    ini_startup,
     tone_mapping::SceneToneMapMode,
     visual_profile::{VISUAL_PROFILE_VALUES, VisualProfile},
     world::components::CELL_SIZE,
@@ -181,7 +181,9 @@ pub enum WaterDepthSource {
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
-    /// Explicit launch options. Saved interactive settings defer to these and to `--ini`.
+    /// Accepted INI values and their origins, with explicit CLI overrides applied at startup.
+    pub ini_value_sources: std::collections::BTreeMap<String, String>,
+    /// Explicit launch options. Saved interactive settings defer to these and imported INIs.
     pub settings_overrides: Vec<String>,
     pub assets_dir: PathBuf,
     /// Explicit local report destination. `None` uses the per-user application-data directory.
@@ -355,6 +357,7 @@ impl Default for EngineConfig {
     /// Start with the standard engine settings and optional profiling diagnostics disabled.
     fn default() -> Self {
         Self {
+            ini_value_sources: Default::default(),
             settings_overrides: Vec::new(),
             assets_dir: PathBuf::from("modern_assets"),
             bug_report_dir: None,
@@ -494,7 +497,7 @@ Assets and start position:
   --lights                              place a point light for each streamed LIGH reference
 
 Streaming:
-  --ini <file>                        layer Skyrim INI settings; CLI options override files
+  --ini <file>                        replace pack INIs; repeat to layer files; CLI options win
   --stream-radius <cells>               cells streamed around the camera (default: 2)
   --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
   --max-unloads-per-frame <count>       cells despawned per frame; 0 despawns all at once (default: 2)
@@ -920,20 +923,7 @@ impl EngineConfig {
             return Ok(ConfigAction::Version);
         }
         let mut config = Self::default();
-        let mut ini = SkyrimIni::default();
-        for pair in args.windows(2) {
-            if pair[0] == "--ini" {
-                let path = PathBuf::from(take_raw(
-                    "--ini",
-                    "a Skyrim INI file path",
-                    Some(pair[1].clone()),
-                )?);
-                if let Err(error) = ini.merge_file(&path) {
-                    eprintln!("warning: ignoring --ini {}: {error}", path.display());
-                }
-            }
-        }
-        ini.apply(&mut config);
+        ini_startup::load(&mut config, &args);
         config.settings_overrides.extend(
             args.iter()
                 .filter(|argument| argument.starts_with("--"))
@@ -1560,6 +1550,7 @@ impl EngineConfig {
         }
         config.check_visual_profile()?;
         config.drop_jump_the_run_would_overwrite();
+        ini_startup::report(&mut config);
         Ok(ConfigAction::Run(Box::new(config)))
     }
 

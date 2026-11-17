@@ -23,6 +23,7 @@ mod focus_pause;
 pub mod frame_budget;
 pub mod hdr_probe;
 pub mod indirect_metrics;
+pub mod ini_startup;
 pub mod lights;
 mod live_console;
 mod matched_route;

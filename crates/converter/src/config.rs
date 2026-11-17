@@ -76,6 +76,10 @@ pub struct PipelineConfig {
     /// Explicit General sTestFile settings; no ambient profile is read.
     #[serde(default)]
     pub skyrim_ini_file: Option<PathBuf>,
+    /// Player settings folder; absent resolves Windows Documents through the known-folder API.
+    /// MO2 profile-specific settings take precedence over this folder when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player_ini_dir: Option<PathBuf>,
     /// Explicit per-worldspace LOD origins for custom worlds, keyed by
     /// worldspace editor id: `[grid_x, grid_y]`. Installed worlds read
     /// `lodsettings/<WorldspaceEDID>.lod` instead; a world with neither gets
@@ -188,6 +192,7 @@ impl PipelineConfig {
             runtime_schemas: None,
             skyrim_ccc_file: None,
             skyrim_ini_file: None,
+            player_ini_dir: None,
             lod_origins: BTreeMap::new(),
             no_lod: false,
             merged_terrain: false,
@@ -298,6 +303,15 @@ impl PipelineConfig {
         // none of them may be, hold, or sit inside the game data.
         let data = std::fs::canonicalize(&self.data_dir)?;
         let mut sources = vec![data.clone()];
+        if let Some(player_ini_dir) = crate::pack_ini::player_ini_dir(self) {
+            match resolve_path(&player_ini_dir) {
+                Ok(path) => sources.push(path),
+                Err(error) => log::warn!(
+                    "could not resolve optional player INI folder {}: {error:#}",
+                    player_ini_dir.display()
+                ),
+            }
+        }
         if let Some(selection) = &self.mo2 {
             color_eyre::eyre::ensure!(
                 self.plugins_file.is_none(),

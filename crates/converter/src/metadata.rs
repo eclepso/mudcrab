@@ -999,6 +999,7 @@ async fn rebuild_into(
     manifest.schema_addons = config.schemas()?.identities().to_vec();
     // No archive extraction cache is copied by this route.
     manifest.archives.clear();
+    crate::pack_ini::retain(source, staging, &mut report, manifest);
     report
         .warnings
         .extend(crate::extensions::refresh_manifest_with_notices(
