@@ -76,6 +76,9 @@ pub(crate) fn load(config: &mut EngineConfig, args: &[String]) {
             source.clone_from(found);
         }
     }
+    if !explicit {
+        crate::settings::clamp_pack_menu_values(config);
+    }
 }
 
 /// Reads optional provenance; older packs and edited copies remain usable.
@@ -146,30 +149,12 @@ pub(crate) fn record_cli_sources(config: &mut EngineConfig) {
     }
 }
 
-/// Marks menu-owned INI values as saved preferences after a valid settings file loads.
-pub(crate) fn record_saved_sources(config: &mut EngineConfig) {
-    for (key, owner) in [
-        ("general.ugridstoload", "ini:stream-radius"),
-        (
-            "terrainmanager.fblocklevel0distance",
-            "ini:fBlockLevel0Distance",
-        ),
-        (
-            "terrainmanager.fblocklevel1distance",
-            "ini:fBlockLevel1Distance",
-        ),
-        (
-            "terrainmanager.fblockmaximumdistance",
-            "ini:fBlockMaximumDistance",
-        ),
-        (
-            "terrainmanager.fsplitdistancemult",
-            "ini:fSplitDistanceMult",
-        ),
-    ] {
-        if !config.settings_overrides.iter().any(|flag| {
-            flag == owner || (key == "general.ugridstoload" && flag == "--stream-radius")
-        }) {
+/// Marks only explicitly saved INI menu groups after a valid settings file loads.
+pub(crate) fn record_saved_sources(config: &mut EngineConfig, owned: u8) {
+    for (group, key) in crate::settings::INI_MENU_KEYS.into_iter().enumerate() {
+        if owned & (1 << group) != 0
+            && !crate::settings::ini_menu_launch_owned(group, &config.settings_overrides)
+        {
             config
                 .ini_value_sources
                 .insert(key.into(), "saved in-game settings".into());
@@ -441,5 +426,36 @@ mod tests {
         let config = start(directory.path(), &[]);
         assert_eq!(config.stream_radius, 6);
         assert!(config.ini_value_sources["general.ugridstoload"].starts_with("player file"));
+    }
+
+    /// Huge pack grids become bounded configuration values before any streaming grid is allocated.
+    #[test]
+    fn ini_pack_huge_grid_is_bounded_while_explicit_launch_values_keep_their_rules() {
+        let directory = pack();
+        fs::write(
+            directory.path().join("ini/SkyrimPrefs.ini"),
+            "[General]\nuGridsToLoad=2000001\n[TerrainManager]\nfSplitDistanceMult=4.5\n",
+        )
+        .unwrap();
+        let bounded = start(directory.path(), &[]);
+        assert_eq!((bounded.stream_radius, bounded.unload_radius), (16, 17));
+        assert_eq!(bounded.terrain_lod.split_distance_mult, 4.0);
+        assert!(bounded.ini_value_sources["general.ugridstoload"].contains("clamped pack INI"));
+        let path = directory.path().join("explicit.ini");
+        fs::write(
+            &path,
+            "[General]\nuGridsToLoad=35\n[TerrainManager]\nfSplitDistanceMult=4.5\n",
+        )
+        .unwrap();
+        let explicit = start(directory.path(), &["--ini", path.to_str().unwrap()]);
+        assert_eq!((explicit.stream_radius, explicit.unload_radius), (17, 18));
+        assert_eq!(explicit.terrain_lod.split_distance_mult, 4.5);
+        assert!(!explicit.ini_value_sources["general.ugridstoload"].contains("clamped"));
+        let cli = start(directory.path(), &["--stream-radius", "18"]);
+        assert_eq!((cli.stream_radius, cli.unload_radius), (18, 19));
+        assert_eq!(
+            cli.ini_value_sources["general.ugridstoload"],
+            "CLI (--stream-radius)"
+        );
     }
 }

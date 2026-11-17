@@ -210,6 +210,8 @@ pub struct SettingSpec {
     pub requires: Option<fn(&RenderingSettings) -> bool>,
     pub read: fn(&RenderingSettings) -> f64,
     pub write: fn(&mut RenderingSettings, f64),
+    /// The logical imported INI field whose menu edits are persisted independently.
+    ini_menu_group: Option<usize>,
 }
 
 macro_rules! toggle {
@@ -220,6 +222,7 @@ macro_rules! toggle {
             group: $group,
             kind: SettingKind::Toggle,
             requires: None,
+            ini_menu_group: None,
             read: |s| u8::from(s.$field) as f64,
             write: |s, value| s.$field = value != 0.0,
         }
@@ -229,7 +232,7 @@ macro_rules! number {
     ($page:ident, $group:literal, $label:literal, $field:ident $( [$index:literal] )?; $min:expr, $max:expr, $step:expr) => { SettingSpec {
         label: $label, page: SettingsPage::$page, group: $group,
         kind: SettingKind::Number { min: $min, max: $max, step: $step },
-        requires: None,
+        requires: None, ini_menu_group: None,
         read: |s| s.$field $( [$index] )? as f64, write: |s, value| s.$field $( [$index] )? = value as _,
     } };
 }
@@ -245,6 +248,7 @@ macro_rules! grade_number {
                 step: $step,
             },
             requires: None,
+            ini_menu_group: None,
             read: |s| s.$field as f64,
             write: |s, value| {
                 s.$field = value as f32;
@@ -261,13 +265,14 @@ macro_rules! choice {
             group: $group,
             kind: SettingKind::Choice($choices),
             requires: None,
+            ini_menu_group: None,
             read: |s| s.$field as f64,
             write: |s, value| s.$field = value as usize,
         }
     };
 }
 
-/// One inventory supplies UI controls and saved-file validation.
+/// One inventory supplies UI controls, saved-file validation and pack-seed bounds.
 pub static SETTING_SPECS: &[SettingSpec] = &[
     toggle!("Point lights", "Point lights", point_lights),
     number!(Graphics, "Point lights", "Enabled point-light budget", point_light_budget; 0.0, 256.0, 8.0)
@@ -374,12 +379,12 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
         "Diagnostic fallbacks (new loads)",
         diagnostic_asset_fallbacks
     ),
-    number!(Streaming, "Range", "Full-detail radius (cells)", stream_radius; 0.0, 16.0, 1.0),
-    number!(Streaming, "Range", "Unload radius (cells)", unload_radius; 0.0, 32.0, 1.0),
-    number!(Streaming, "Terrain level of detail", "Object LOD level-4 distance (units; unused until object LOD lands)", lod_level0_distance; 0.0, 1_000_000.0, 5000.0),
-    number!(Streaming, "Terrain level of detail", "Object LOD level-8 distance (units; unused until object LOD lands)", lod_level1_distance; 0.0, 1_000_000.0, 5000.0),
-    number!(Streaming, "Terrain level of detail", "Terrain LOD outer reach (units, times the split multiplier)", lod_maximum_distance; 0.0, 1_000_000.0, 10_000.0),
-    number!(Streaming, "Terrain level of detail", "Terrain LOD split multiplier", lod_multiplier; 0.0, 4.0, 0.25),
+    number!(Streaming, "Range", "Full-detail radius (cells)", stream_radius; 0.0, 16.0, 1.0).ini_menu_group(0),
+    number!(Streaming, "Range", "Unload radius (cells)", unload_radius; 0.0, 32.0, 1.0).ini_menu_group(0),
+    number!(Streaming, "Terrain level of detail", "Object LOD level-4 distance (units; unused until object LOD lands)", lod_level0_distance; 0.0, 1_000_000.0, 5000.0).ini_menu_group(1),
+    number!(Streaming, "Terrain level of detail", "Object LOD level-8 distance (units; unused until object LOD lands)", lod_level1_distance; 0.0, 1_000_000.0, 5000.0).ini_menu_group(2),
+    number!(Streaming, "Terrain level of detail", "Terrain LOD outer reach (units, times the split multiplier)", lod_maximum_distance; 0.0, 1_000_000.0, 10_000.0).ini_menu_group(3),
+    number!(Streaming, "Terrain level of detail", "Terrain LOD split multiplier", lod_multiplier; 0.0, 4.0, 0.25).ini_menu_group(4),
     number!(Streaming, "Per-frame budgets", "Cell commits per frame", cell_commits; 1.0, 64.0, 1.0),
     number!(Streaming, "Per-frame budgets", "Cell commit budget (ms)", commit_ms; 0.5, 100.0, 0.5),
     number!(Streaming, "Per-frame budgets", "Cell unloads per frame (0 = unlimited)", cell_unloads; 0.0, 128.0, 1.0),
@@ -389,6 +394,14 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
 ];
 
 impl SettingSpec {
+    /// Identifies a pack-seeded field using the same bounds as its menu control.
+    const fn ini_menu_group(self, group: usize) -> Self {
+        Self {
+            ini_menu_group: Some(group),
+            ..self
+        }
+    }
+
     const fn when(self, requires: fn(&RenderingSettings) -> bool) -> Self {
         Self {
             requires: Some(requires),
@@ -703,15 +716,112 @@ fn grade_source_is_launch_owned(overrides: &[String]) -> bool {
     .any(|flag| overrides.iter().any(|value| value == flag))
 }
 
+/// JSON keys for the five independent imported settings. The grid owns its derived unload radius.
+const INI_MENU_FIELDS: [&[&str]; 5] = [
+    &["stream_radius", "unload_radius"],
+    &["lod_level0_distance"],
+    &["lod_level1_distance"],
+    &["lod_maximum_distance"],
+    &["lod_multiplier"],
+];
+
+/// Supported INI key names in the same order as the independently saved menu groups.
+pub(crate) const INI_MENU_KEYS: [&str; 5] = [
+    "general.ugridstoload",
+    "terrainmanager.fblocklevel0distance",
+    "terrainmanager.fblocklevel1distance",
+    "terrainmanager.fblockmaximumdistance",
+    "terrainmanager.fsplitdistancemult",
+];
+
+/// Binds pack seeds to their menu bounds before startup can build streaming cells.
+pub(crate) fn clamp_pack_menu_values(config: &mut EngineConfig) {
+    let mut menu = RenderingSettings::default();
+    menu.take_launch_values(config);
+    for spec in SETTING_SPECS {
+        let Some(group) = spec.ini_menu_group else {
+            continue;
+        };
+        let key = INI_MENU_KEYS[group];
+        let Some(source) = config.ini_value_sources.get_mut(key) else {
+            continue;
+        };
+        let SettingKind::Number { min, max, .. } = spec.kind else {
+            continue;
+        };
+        let before = (spec.read)(&menu);
+        let bounded = before.clamp(min, max);
+        if before != bounded {
+            (spec.write)(&mut menu, bounded);
+            if group == 0 {
+                menu.unload_radius = menu.stream_radius + 1;
+            }
+            let message = format!(
+                "clamped pack INI {key} ({}) from {before} to {bounded}; menu range {min}..={max}",
+                spec.label
+            );
+            eprintln!("notice: {message}");
+            source.push_str(&format!("; {message}"));
+        }
+    }
+    config.stream_radius = menu.stream_radius;
+    config.unload_radius = menu.unload_radius;
+    config.terrain_lod.block_level0_distance = menu.lod_level0_distance;
+    config.terrain_lod.block_level1_distance = menu.lod_level1_distance;
+    config.terrain_lod.block_maximum_distance = menu.lod_maximum_distance;
+    config.terrain_lod.split_distance_mult = menu.lod_multiplier;
+}
+
+/// Identifies saved choices by key presence, preserving the meaning of older full settings files.
+fn saved_ini_menu_groups(value: &serde_json::Value) -> u8 {
+    INI_MENU_FIELDS
+        .iter()
+        .enumerate()
+        .fold(0, |mask, (group, fields)| {
+            mask | if fields.iter().any(|field| value.get(*field).is_some()) {
+                1 << group
+            } else {
+                0
+            }
+        })
+}
+
+/// Copies one logical imported setting, preserving the grid's unload coverage as a pair.
+fn copy_ini_menu_group(target: &mut RenderingSettings, source: &RenderingSettings, group: usize) {
+    for spec in SETTING_SPECS
+        .iter()
+        .filter(|spec| spec.ini_menu_group == Some(group))
+    {
+        (spec.write)(target, (spec.read)(source));
+    }
+}
+
+/// Recognizes explicit file and scalar ownership for one imported menu setting.
+pub(crate) fn ini_menu_launch_owned(group: usize, overrides: &[String]) -> bool {
+    let owner = [
+        "ini:stream-radius",
+        "ini:fBlockLevel0Distance",
+        "ini:fBlockLevel1Distance",
+        "ini:fBlockMaximumDistance",
+        "ini:fSplitDistanceMult",
+    ][group];
+    overrides
+        .iter()
+        .any(|flag| flag == owner || (group == 0 && flag == "--stream-radius"))
+}
+
 #[derive(Resource)]
 pub struct SettingsFile {
     pub path: Option<PathBuf>,
     pub status: String,
-    /// The preferences the file held before explicit launch options replaced them in the running
-    /// settings. A save writes these values back for the fields those options own.
+    /// Stored preferences used to preserve pre-launch choices for explicit launch-owned fields.
     stored: RenderingSettings,
     /// The explicit launch options from the run that loaded `stored`.
     launch_overrides: Vec<String>,
+    /// Effective values shown when the menu was prepared or last saved successfully.
+    ini_menu_baseline: RenderingSettings,
+    /// Only saved or subsequently edited grid/LOD groups own the next launch's values.
+    ini_menu_owned: u8,
     preserve_unavailable_record_mode: bool,
     unavailable_record_mode_replaced: bool,
     /// The Metal drawing default applies only when no saved setting owns this choice.
@@ -744,6 +854,8 @@ impl SettingsFile {
             status: "Changes apply now. This preview does not save preferences.".into(),
             stored: RenderingSettings::default(),
             launch_overrides: Vec::new(),
+            ini_menu_baseline: RenderingSettings::default(),
+            ini_menu_owned: 0,
             preserve_unavailable_record_mode: false,
             unavailable_record_mode_replaced: false,
             metal_drawing_default_available: true,
@@ -782,16 +894,39 @@ impl SettingsFile {
         };
     }
 
+    /// Saves explicit menu changes and preserves dynamic pack seeds for untouched grid/LOD groups.
     pub fn save(&mut self, settings: &RenderingSettings) {
+        let mut owned = self.ini_menu_owned;
+        for spec in SETTING_SPECS {
+            if let Some(group) = spec.ini_menu_group
+                && !ini_menu_launch_owned(group, &self.launch_overrides)
+                && (spec.read)(settings) != (spec.read)(&self.ini_menu_baseline)
+            {
+                owned |= 1 << group;
+            }
+        }
+        let persisted = self.persisted(settings);
         self.status = match self.path.as_ref() {
             Some(path) => match save_settings_with_drawing_ownership(
                 path,
-                &self.persisted(settings),
+                &persisted,
                 self.metal_drawing_auto_unowned,
+                owned,
             ) {
-                Ok(()) if self.launch_overrides.iter().any(|flag| flag == "--start-shot") =>
-                    "Settings saved. IO-thread changes apply after restart. Save preserves the pre-launch FOV, window mode, and window size.".into(),
-                Ok(()) => "Settings saved. IO-thread changes apply after restart.".into(),
+                Ok(()) => {
+                    self.stored = persisted;
+                    self.ini_menu_baseline = settings.clone();
+                    self.ini_menu_owned = owned;
+                    if self
+                        .launch_overrides
+                        .iter()
+                        .any(|flag| flag == "--start-shot")
+                    {
+                        "Settings saved. IO-thread changes apply after restart. Save preserves the pre-launch FOV, window mode, and window size.".into()
+                    } else {
+                        "Settings saved. IO-thread changes apply after restart.".into()
+                    }
+                }
                 Err(error) => format!("Could not save settings: {error}"),
             },
             None => "Saving is unavailable for this session.".into(),
@@ -840,7 +975,7 @@ pub(crate) fn prepare_settings(config: &mut EngineConfig) -> (RenderingSettings,
     prepare_settings_at(config, preferences_path())
 }
 
-/// Layers saved menu values over pack defaults, then retains explicit launch-owned values.
+/// Layers explicitly saved menu fields over current pack defaults and retains launch-owned values.
 pub(crate) fn prepare_settings_at(
     config: &mut EngineConfig,
     path: Option<PathBuf>,
@@ -853,6 +988,8 @@ pub(crate) fn prepare_settings_at(
         status: "Changes apply now. Choose Save to keep them across runs.".into(),
         stored: RenderingSettings::default(),
         launch_overrides: config.settings_overrides.clone(),
+        ini_menu_baseline: settings.clone(),
+        ini_menu_owned: 0,
         preserve_unavailable_record_mode: false,
         unavailable_record_mode_replaced: false,
         metal_drawing_default_available: no_preferences_path,
@@ -867,14 +1004,21 @@ pub(crate) fn prepare_settings_at(
                 match saved {
                     Ok(saved) => {
                         file.stored = saved.clone();
+                        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+                            .expect("validated settings retain their JSON object");
+                        file.ini_menu_owned = saved_ini_menu_groups(&raw);
+                        let launch = settings;
                         settings = saved;
+                        for group in 0..INI_MENU_FIELDS.len() {
+                            if file.ini_menu_owned & (1 << group) == 0 {
+                                copy_ini_menu_group(&mut settings, &launch, group);
+                            }
+                        }
                         file.metal_drawing_default_available =
-                            serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|raw| {
-                                raw.get("indirect_drawing").is_none()
-                                    && raw.get("occlusion_culling").is_none()
-                            });
+                            raw.get("indirect_drawing").is_none()
+                                && raw.get("occlusion_culling").is_none();
                         settings.retain_explicit_launch_values(config);
-                        crate::ini_startup::record_saved_sources(config);
+                        crate::ini_startup::record_saved_sources(config, file.ini_menu_owned);
                         if settings.color_grade
                             == crate::color_pipeline::SceneGradeMode::RecordSrgb.index()
                             && config.image_space_selection().ok().flatten().is_none()
@@ -907,18 +1051,24 @@ pub(crate) fn prepare_settings_at(
     {
         config.visual_profile = profile;
     }
+    file.ini_menu_baseline = settings.clone();
     (settings, file)
 }
 
+/// Writes a legacy full preference file for compatibility fixtures.
 #[cfg(test)]
+/// Writes a legacy full-settings fixture with every imported menu group explicitly owned.
 fn save_settings(path: &Path, settings: &RenderingSettings) -> Result<(), String> {
-    save_settings_with_drawing_ownership(path, settings, false)
+    save_settings_with_drawing_ownership(path, settings, false, 0b1_1111)
 }
 
+/// Publishes validated preferences with explicit ownership for dynamic menu and drawing choices.
+/// Writes validated preferences, omitting automatic drawing and untouched imported menu fields.
 fn save_settings_with_drawing_ownership(
     path: &Path,
     settings: &RenderingSettings,
     omit_automatic_drawing: bool,
+    ini_menu_owned: u8,
 ) -> Result<(), String> {
     settings.validate()?;
     let mut value = serde_json::to_value(settings).map_err(|e| e.to_string())?;
@@ -928,6 +1078,16 @@ fn save_settings_with_drawing_ownership(
             .expect("settings serialize as an object");
         object.remove("indirect_drawing");
         object.remove("occlusion_culling");
+    }
+    let object = value
+        .as_object_mut()
+        .expect("settings serialize as an object");
+    for (group, fields) in INI_MENU_FIELDS.iter().enumerate() {
+        if ini_menu_owned & (1 << group) == 0 {
+            for field in *fields {
+                object.remove(*field);
+            }
+        }
     }
     let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
     let parent = path.parent().ok_or("settings path has no parent")?;
@@ -2322,6 +2482,8 @@ mod tests {
                 status: String::new(),
                 stored: RenderingSettings::default(),
                 launch_overrides: Vec::new(),
+                ini_menu_baseline: RenderingSettings::default(),
+                ini_menu_owned: 0,
                 preserve_unavailable_record_mode: false,
                 unavailable_record_mode_replaced: false,
                 metal_drawing_default_available: false,
@@ -2420,6 +2582,163 @@ mod tests {
             next.ini_value_sources["general.ugridstoload"],
             "CLI (--stream-radius)"
         );
+    }
+
+    /// Pack values enter the valid menu ranges before an unrelated Save and reload.
+    #[test]
+    fn ini_pack_out_of_range_seeds_allow_unrelated_save_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack = directory.path().join("pack");
+        std::fs::create_dir_all(pack.join("ini")).unwrap();
+        std::fs::write(pack.join("ini/SkyrimPrefs.ini"), "[General]\nuGridsToLoad=35\n[TerrainManager]\nfBlockLevel0Distance=1000001\nfBlockLevel1Distance=2000002\nfBlockMaximumDistance=3000003\nfSplitDistanceMult=4.5\n").unwrap();
+        let path = directory.path().join("settings.json");
+        let args = ["--assets".into(), pack.display().to_string()];
+        let mut config = launch(&args);
+        assert_eq!((config.stream_radius, config.unload_radius), (16, 17));
+        let (mut menu, mut file) = prepare_settings_at(&mut config, Some(path.clone()));
+        menu.validate().unwrap();
+        assert_eq!(menu.lod_level0_distance, 1_000_000.0);
+        assert_eq!(menu.lod_level1_distance, 1_000_000.0);
+        assert_eq!(menu.lod_maximum_distance, 1_000_000.0);
+        assert_eq!(menu.lod_multiplier, 4.0);
+        assert!(config.ini_value_sources["general.ugridstoload"].contains("clamped pack INI"));
+        assert!(
+            config.ini_value_sources["terrainmanager.fsplitdistancemult"]
+                .contains("clamped pack INI")
+        );
+        menu.hud = !menu.hud;
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for fields in INI_MENU_FIELDS {
+            for field in fields {
+                assert!(saved.get(*field).is_none(), "{field} remains pack owned");
+            }
+        }
+        let mut next = launch(&args);
+        let (reloaded, _) = prepare_settings_at(&mut next, Some(path));
+        assert_eq!(reloaded, menu);
+        assert!(next.ini_value_sources["general.ugridstoload"].contains("clamped pack INI"));
+    }
+
+    /// Only edited INI menu fields become saved choices, while other keys follow later pack edits.
+    #[test]
+    fn ini_menu_save_keeps_untouched_values_following_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack = directory.path().join("pack");
+        std::fs::create_dir_all(pack.join("ini")).unwrap();
+        let ini = pack.join("ini/SkyrimPrefs.ini");
+        std::fs::write(&ini, "[General]\nuGridsToLoad=7\n[TerrainManager]\nfBlockLevel0Distance=41000\nfSplitDistanceMult=2.25\n").unwrap();
+        let path = directory.path().join("settings.json");
+        let args = ["--assets".into(), pack.display().to_string()];
+        let (mut menu, mut file) = prepare_settings_at(&mut launch(&args), Some(path.clone()));
+        menu.lod_multiplier = 3.5;
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["lod_multiplier"], 3.5);
+        for key in [
+            "stream_radius",
+            "unload_radius",
+            "lod_level0_distance",
+            "lod_level1_distance",
+            "lod_maximum_distance",
+        ] {
+            assert!(saved.get(key).is_none(), "{key} stays dynamic");
+        }
+        std::fs::write(&ini, "[General]\nuGridsToLoad=11\n[TerrainManager]\nfBlockLevel0Distance=65000\nfSplitDistanceMult=1.25\n").unwrap();
+        let mut next = launch(&args);
+        let (mut reloaded, mut file) = prepare_settings_at(&mut next, Some(path.clone()));
+        assert_eq!((reloaded.stream_radius, reloaded.unload_radius), (5, 6));
+        assert_eq!(reloaded.lod_level0_distance, 65_000.0);
+        assert_eq!(reloaded.lod_multiplier, 3.5);
+        assert_eq!(
+            next.ini_value_sources["terrainmanager.fsplitdistancemult"],
+            "saved in-game settings"
+        );
+        assert!(
+            next.ini_value_sources["terrainmanager.fblocklevel0distance"].starts_with("pack copy")
+        );
+        assert!(next.ini_value_sources["general.ugridstoload"].starts_with("pack copy"));
+        reloaded.hud = !reloaded.hud;
+        file.save(&reloaded);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        std::fs::write(&ini, "[General]\nuGridsToLoad=13\n[TerrainManager]\nfBlockLevel0Distance=70000\nfSplitDistanceMult=1.5\n").unwrap();
+        let (again, _) = prepare_settings_at(&mut launch(&args), Some(path));
+        assert_eq!(
+            (
+                again.stream_radius,
+                again.lod_level0_distance,
+                again.lod_multiplier
+            ),
+            (6, 70_000.0, 3.5)
+        );
+        assert_eq!(again.hud, reloaded.hud);
+    }
+
+    /// Editing the grid persists its coupled radii while untouched LOD values keep following the pack.
+    #[test]
+    fn ini_menu_grid_edit_persists_its_unload_coverage_pair() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack = directory.path().join("pack");
+        std::fs::create_dir_all(pack.join("ini")).unwrap();
+        let ini = pack.join("ini/Skyrim.ini");
+        std::fs::write(
+            &ini,
+            "[General]\nuGridsToLoad=7\n[TerrainManager]\nfSplitDistanceMult=2\n",
+        )
+        .unwrap();
+        let path = directory.path().join("settings.json");
+        let args = ["--assets".into(), pack.display().to_string()];
+        let (mut menu, mut file) = prepare_settings_at(&mut launch(&args), Some(path.clone()));
+        menu.stream_radius = 5;
+        menu.unload_radius = 6;
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["stream_radius"], 5);
+        assert_eq!(saved["unload_radius"], 6);
+        assert!(saved.get("lod_multiplier").is_none());
+        std::fs::write(
+            &ini,
+            "[General]\nuGridsToLoad=3\n[TerrainManager]\nfSplitDistanceMult=3\n",
+        )
+        .unwrap();
+        let (reloaded, _) = prepare_settings_at(&mut launch(&args), Some(path));
+        assert_eq!((reloaded.stream_radius, reloaded.unload_radius), (5, 6));
+        assert_eq!(reloaded.lod_multiplier, 3.0);
+    }
+
+    /// A failed write leaves field ownership unchanged, so a later unrelated Save stays dynamic.
+    #[test]
+    fn ini_menu_failed_save_preserves_dynamic_field_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("blocked");
+        std::fs::write(&parent, b"synthetic blocked settings parent").unwrap();
+        let path = parent.join("settings.json");
+        let mut config = EngineConfig::default();
+        config.terrain_lod.split_distance_mult = 2.25;
+        let (mut menu, mut file) = prepare_settings_at(&mut config, Some(path.clone()));
+        menu.lod_multiplier = 3.5;
+        file.save(&menu);
+        assert!(
+            file.status.starts_with("Could not save settings"),
+            "{}",
+            file.status
+        );
+        assert_eq!(file.ini_menu_owned, 0);
+        assert_eq!(file.ini_menu_baseline.lod_multiplier, 2.25);
+        std::fs::remove_file(&parent).unwrap();
+        menu.lod_multiplier = 2.25;
+        menu.hud = !menu.hud;
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(saved.get("lod_multiplier").is_none());
     }
 
     /// Valid explicit keys own their settings while malformed keys retain saved values and sources.
@@ -2588,6 +2907,8 @@ mod tests {
             status: String::new(),
             stored: RenderingSettings::default(),
             launch_overrides: Vec::new(),
+            ini_menu_baseline: RenderingSettings::default(),
+            ini_menu_owned: 0,
             preserve_unavailable_record_mode: false,
             unavailable_record_mode_replaced: false,
             metal_drawing_default_available: false,

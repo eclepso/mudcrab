@@ -10,8 +10,9 @@ The converter library reads no ambient Documents folder by default.
 `PipelineConfig::discover_player_inis` requests automatic discovery. The CLI and
 launcher request discovery. The CLI also accepts `--player-ini-dir DIR` on every
 platform and `--no-player-ini` to omit capture, including MO2 sources and install
-templates. Those two flags are mutually exclusive. Metadata rebuilds retain
-existing pack settings rather than capturing external settings.
+templates. Existing edited pack copies stay locally owned even when external
+capture is disabled. Those two flags are mutually exclusive. Metadata rebuilds
+retain existing pack settings rather than capturing external settings.
 
 Windows discovery uses the Documents known-folder API, which resolves redirection
 including OneDrive. The selected SE/AE install determines the folder beneath
@@ -47,8 +48,8 @@ and [instance defaults](https://github.com/ModOrganizer2/modorganizer/blob/4ba22
 Enabled profile settings take precedence per file. A missing profile file falls
 back to the selected edition's Documents file, matching
 [MO2's SE initialization](https://github.com/ModOrganizer2/modorganizer-game_skyrimse/blob/af9b50be81a9f6e91e817b5bc7792e2ae9aec55c/src/gameskyrimse.cpp#L191-L207).
-A failed profile lookup skips capture; an unreadable existing file skips that
-file. Failed lookup stays distinct from successful absence and never permits
+A failed profile lookup skips external capture and templates; a readable edited
+pack copy is retained first. An unreadable existing source file skips that file. Failed lookup stays distinct from successful absence and never permits
 template generation. The converter writes only into staging, including during
 MO2 fallback; MO2's own profile-initialization writes are not performed.
 
@@ -79,12 +80,19 @@ filename, SHA-256 of the published bytes, and origin (`player_file`,
 Home paths are omitted from this metadata, including when retaining older
 manifests. The `[Bethesda.net]` account section is removed during capture and
 retention; other files preserve exact bytes. Filtering emits UTF-8 and hashes
-the published bytes. Review other private custom settings before sharing a pack.
+the published bytes; expanded filtered output above 4 MiB is omitted with an
+advisory notice. Account section names are trimmed inside the brackets just as
+the engine parser trims them. Review other private custom settings before
+sharing a pack.
 The engine bug-report bundle includes neither the raw INIs nor the conversion
 manifest; it allowlists manifest summary fields instead.
 
-Normal reconversion refreshes unedited copies and reports replacements. An edited
-pack copy is kept and reported, and remains locally owned on later reconversions.
+Normal reconversion refreshes unedited copies and reports changed-byte
+replacements. Identical copies stay quiet. Missing sources and disabled external
+capture produce notices when removing an unedited copy. A missing selected
+settings folder produces a notice before the genuine-absence template fallback.
+An edited pack copy is kept and reported, and remains locally owned on later
+reconversions.
 A metadata rebuild keeps every usable pack copy and reports each retained file.
 Invalid retained files produce nonfatal notices. Missing external sources remove
 unedited copies during normal reconversion. This optional metadata changes no
@@ -106,9 +114,19 @@ Precedence, highest first:
 
 Any explicit `--ini` list replaces the pack file list. Omitted keys use saved
 menu settings where supported, otherwise defaults, including when an explicit
-file is unreadable. Pack values seed the interactive settings menu; a saved menu
-change survives the next interactive launch. Explicit INI and CLI keys remain
-launch owned. Automated runs retain the existing behavior of using launch
+file is unreadable. Pack values seed the interactive settings menu. Pack-imported
+grid and LOD values are clamped to the menu's own bounds before startup uses them, with a
+source diagnostic when clamped. Stream radius is at most 16, unload radius at
+most 32, LOD distances at most 1,000,000 and the split multiplier at most 4.
+Explicit INI and CLI values retain their existing launch-owned limits.
+
+Saving persists only the grid/LOD fields changed in the menu; untouched fields
+keep following the current pack INIs across launches. Stream and unload radii
+persist together as one logical grid setting because their validation is coupled.
+The four LOD values persist independently. Existing settings files retain the
+choices for fields already present; omitted fields follow the current pack.
+A saved menu change survives the next interactive launch. Explicit INI and CLI
+keys remain launch owned. Automated runs retain the existing behavior of using launch
 configuration without loading interactive preferences.
 
 Per-key source diagnostics run after saved settings are applied, naming player

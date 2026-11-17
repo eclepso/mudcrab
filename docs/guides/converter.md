@@ -142,7 +142,10 @@ store edition. Use `--player-ini-dir DIR` to select a settings folder explicitly
 or `--no-player-ini` to omit capture. Library callers opt in through
 `PipelineConfig::discover_player_inis` or `player_ini_dir`.
 Optional INI problems are notices and preserve otherwise complete conversion.
-Saved in-game menu choices take precedence over pack settings on later launches;
+Saved in-game menu choices take precedence over pack settings on later launches.
+Untouched grid/LOD fields continue following updated pack INIs; pack seed values
+are bounded to the menu ranges. Readable edited pack copies are retained even
+when external lookup fails or capture is disabled;
 explicit `--ini` and scalar CLI options take precedence over saved choices.
 See [pack INI policy](../specs/engine/pack-ini.md) for store folders, MO2 fallback,
 reconversion retention, decoding, privacy and provenance. `SkyrimCustom.ini` is
