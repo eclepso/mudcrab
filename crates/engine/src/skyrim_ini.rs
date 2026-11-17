@@ -174,6 +174,39 @@ mod tests {
     use super::*;
     use shared::lod::LodTier;
 
+    /// UTF-16 byte order marks and single-byte comments preserve supported ASCII settings.
+    #[test]
+    fn ini_file_decodes_utf16_and_single_byte_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.ini");
+        let text = "[General]\nuGridsToLoad=11\n[TerrainManager]\nfSplitDistanceMult=2.75\n";
+        let mut little = vec![0xff, 0xfe];
+        little.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut big = vec![0xfe, 0xff];
+        big.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+        let mut single = b"; caf\xe9\n".to_vec();
+        single.extend_from_slice(text.as_bytes());
+        for bytes in [little, big, single] {
+            std::fs::write(&path, bytes).unwrap();
+            let mut ini = SkyrimIni::default();
+            ini.merge_file(&path)
+                .expect("Skyrim-compatible text decodes");
+            let mut config = EngineConfig::default();
+            ini.apply(&mut config);
+            assert_eq!(config.stream_radius, 5);
+            assert_eq!(config.terrain_lod.split_distance_mult, 2.75);
+        }
+    }
+
+    /// Oversized files leave the engine's startup settings available through defaults.
+    #[test]
+    fn ini_file_size_limit_rejects_oversized_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.ini");
+        std::fs::write(&path, vec![b';'; 4 * 1024 * 1024 + 1]).unwrap();
+        assert!(SkyrimIni::default().merge_file(&path).is_err());
+    }
+
     fn apply(text: &str) -> EngineConfig {
         let mut ini = SkyrimIni::default();
         ini.merge_str(text);

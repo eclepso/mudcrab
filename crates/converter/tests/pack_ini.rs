@@ -68,6 +68,11 @@ impl Fixture {
         drain.await.unwrap();
         let report = result.expect("optional INIs leave conversion usable");
         assert!(
+            report.complete,
+            "optional INIs preserve completeness: {report:?}"
+        );
+        assert!(self.manifest().complete);
+        assert!(
             self.config
                 .output_dir
                 .join("scripts/neighbor.luau")
@@ -95,8 +100,12 @@ impl Fixture {
         );
         let provenance = self.manifest().ini_files[&relative].clone();
         assert_eq!(
-            fs::canonicalize(&provenance.source).unwrap(),
-            fs::canonicalize(source).unwrap()
+            provenance.source.file_name().unwrap(),
+            source.file_name().unwrap()
+        );
+        assert!(
+            provenance.source.is_relative(),
+            "settings provenance stays portable"
         );
         #[cfg(windows)]
         assert!(
@@ -243,7 +252,7 @@ async fn missing_install_writes_no_inis_and_reconversion_drops_stale_copies() {
     );
 }
 
-/// Templates alone cannot substitute for the installed game's executable.
+/// Generation requires the installed game's executable alongside the templates.
 #[tokio::test]
 async fn templates_without_the_game_executable_write_no_inis() {
     let fixture = Fixture::new(true);
@@ -275,7 +284,7 @@ async fn a_missing_template_only_skips_its_corresponding_ini() {
     assert_eq!(fixture.manifest().ini_files.len(), 1);
 }
 
-/// The executable and templates cannot substitute for the existing Data-folder detection signal.
+/// Generation requires the existing Data-folder detection signal as well as the executable.
 #[tokio::test]
 async fn templates_without_skyrim_data_write_no_inis() {
     let fixture = Fixture::new(true);
@@ -297,9 +306,10 @@ async fn unreadable_player_ini_warns_and_keeps_the_other_copy() {
     .unwrap();
     let report = fixture.publish().await;
     assert!(
-        report.warnings.iter().any(|warning| warning
-            .contains("skipping unreadable or invalid INI")
-            && warning.contains("Skyrim.ini")),
+        report.notices.iter().any(
+            |warning| warning.contains("skipping unreadable or invalid INI")
+                && warning.contains("Skyrim.ini")
+        ),
         "{report:?}"
     );
     assert!(!fixture.config.output_dir.join("ini/Skyrim.ini").exists());
@@ -311,7 +321,7 @@ async fn unreadable_player_ini_warns_and_keeps_the_other_copy() {
     );
 }
 
-/// Bad encoding and structurally invalid files stay out of the pack without aborting conversion.
+/// Structurally invalid files stay out of the pack while usable assets publish.
 #[tokio::test]
 async fn malformed_player_inis_warn_and_skip() {
     let fixture = Fixture::new(false);
@@ -324,7 +334,7 @@ async fn malformed_player_inis_warn_and_skip() {
     let report = fixture.publish().await;
     assert_eq!(
         report
-            .warnings
+            .notices
             .iter()
             .filter(|warning| warning.contains("skipping unreadable or invalid INI"))
             .count(),
@@ -384,8 +394,8 @@ async fn mo2_local_settings_follow_the_instance_default() {
             &profile
         };
         assert_eq!(
-            fs::canonicalize(&fixture.manifest().ini_files["ini/Skyrim.ini"].source).unwrap(),
-            fs::canonicalize(expected.join("Skyrim.ini")).unwrap()
+            fs::read(fixture.config.output_dir.join("ini/Skyrim.ini")).unwrap(),
+            fs::read(expected.join("Skyrim.ini")).unwrap()
         );
         #[cfg(windows)]
         assert!(
@@ -412,7 +422,7 @@ async fn unreadable_mo2_ini_settings_warn_and_conversion_continues() {
     let report = fixture.publish().await;
     assert!(
         report
-            .warnings
+            .notices
             .iter()
             .any(|warning| warning.contains("could not resolve MO2 profile INIs")),
         "{report:?}"
@@ -433,5 +443,154 @@ async fn player_ini_source_is_protected_from_converter_write_paths() {
     drain.await.unwrap();
     let error = result.expect_err("conversion must protect the player settings folder");
     assert!(error.to_string().contains("overlaps"), "{error}");
+    assert!(
+        error.to_string().contains("player settings folder"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(r"\\?\"), "{error}");
     assert_eq!(fs::read(source).unwrap(), b"[General]\nuGridsToLoad=3\n");
+}
+
+/// Skyrim encodings retain ASCII settings and exact-byte hashes, including single-byte comments.
+#[tokio::test]
+async fn tolerated_ini_encodings_preserve_settings_and_complete_conversion() {
+    let text = "[General]\nuGridsToLoad=7\n; comment\n";
+    let mut encodings = vec![
+        text.as_bytes().to_vec(),
+        [b"\xef\xbb\xbf".as_slice(), text.as_bytes()].concat(),
+    ];
+    encodings.push(
+        [
+            vec![0xff, 0xfe],
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ]
+        .concat(),
+    );
+    encodings.push(
+        [
+            vec![0xfe, 0xff],
+            text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        ]
+        .concat(),
+    );
+    encodings.push(b"[General]\nuGridsToLoad=7\n; caf\xe9\n".to_vec());
+    for bytes in encodings {
+        let fixture = Fixture::new(false);
+        fs::write(fixture.player.join("Skyrim.ini"), &bytes).unwrap();
+        let report = fixture.publish().await;
+        fixture.assert_copy(
+            "Skyrim.ini",
+            &fixture.player.join("Skyrim.ini"),
+            &bytes,
+            IniOrigin::PlayerFile,
+        );
+        if bytes.contains(&0xe9) {
+            assert!(report.notices.iter().any(|notice| notice.contains("lossy")));
+        }
+    }
+}
+
+/// Failed profile configuration lookup preserves absence rather than generating replacement values.
+#[tokio::test]
+async fn failed_mo2_lookup_never_generates_from_install() {
+    let mut fixture = Fixture::new(true);
+    let profile = fixture.mo2_profile(None, None);
+    fs::create_dir(profile.join("settings.ini")).unwrap();
+    fixture.publish().await;
+    assert!(fixture.manifest().ini_files.is_empty());
+}
+
+/// MO2 initializes an absent profile file from Documents independently of its neighbor.
+#[tokio::test]
+async fn missing_mo2_profile_ini_falls_back_per_file_to_documents() {
+    let mut fixture = Fixture::new(true);
+    let profile = fixture.mo2_profile(Some(true), None);
+    fs::write(profile.join("Skyrim.ini"), b"[General]\nuGridsToLoad=11\n").unwrap();
+    let bytes = b"[Display]\nfShadowDistance=3123\n";
+    fs::write(fixture.player.join("SkyrimPrefs.ini"), bytes).unwrap();
+    fixture.publish().await;
+    fixture.assert_copy(
+        "SkyrimPrefs.ini",
+        &fixture.player.join("SkyrimPrefs.ini"),
+        bytes,
+        IniOrigin::PlayerFile,
+    );
+}
+
+/// An explicit unreadable settings folder preserves lookup failure for both files.
+#[tokio::test]
+async fn failed_settings_folder_lookup_never_generates_from_install() {
+    let fixture = Fixture::new(true);
+    fs::remove_dir(&fixture.player).unwrap();
+    fs::write(&fixture.player, b"synthetic file in place of folder").unwrap();
+    fixture.publish().await;
+    assert!(fixture.manifest().ini_files.is_empty());
+}
+
+/// Edited pack settings survive both ordinary reconversion and metadata rebuild.
+#[tokio::test]
+async fn edited_pack_ini_is_kept_and_reported_on_reconversion() {
+    let fixture = Fixture::new(true);
+    fixture.publish().await;
+    let edited = b"[General]\nuGridsToLoad=15\n";
+    fs::write(fixture.config.output_dir.join("ini/Skyrim.ini"), edited).unwrap();
+    let report = fixture.publish().await;
+    assert_eq!(
+        fs::read(fixture.config.output_dir.join("ini/Skyrim.ini")).unwrap(),
+        edited
+    );
+    assert_eq!(
+        fixture.manifest().ini_files["ini/Skyrim.ini"].origin,
+        IniOrigin::PackCopy
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("kept") && notice.contains("Skyrim.ini"))
+    );
+}
+
+/// Account identifiers are removed while portable provenance identifies the source file.
+#[tokio::test]
+async fn captured_inis_omit_account_identifiers() {
+    let fixture = Fixture::new(false);
+    fs::write(
+        fixture.player.join("SkyrimPrefs.ini"),
+        b"[Bethesda.net]\nuAccountId=123456\n[Display]\nfShadowDistance=4567\n",
+    )
+    .unwrap();
+    fixture.publish().await;
+    let bytes = fs::read(fixture.config.output_dir.join("ini/SkyrimPrefs.ini")).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("123456"));
+    assert!(String::from_utf8_lossy(&bytes).contains("fShadowDistance=4567"));
+    assert_eq!(
+        fixture.manifest().ini_files["ini/SkyrimPrefs.ini"].sha256,
+        converter::cache::hash_bytes(&bytes)
+    );
+}
+
+/// Optional-INI diagnostics preserve the converter process success status as well as the manifest.
+#[test]
+fn optional_ini_notice_preserves_cli_exit_zero() {
+    let fixture = Fixture::new(false);
+    fs::write(fixture.player.join("Skyrim.ini"), b"invalid settings").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_converter"))
+        .args([
+            fixture.config.data_dir.as_os_str(),
+            fixture.config.output_dir.as_os_str(),
+        ])
+        .arg("--player-ini-dir")
+        .arg(&fixture.player)
+        .arg("--no-lod")
+        .arg("--cpu-jobs")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.manifest().complete);
 }

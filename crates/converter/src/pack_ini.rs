@@ -361,8 +361,37 @@ mod tests {
         );
         assert_eq!(
             manifest.ini_files["ini/SkyrimPrefs.ini"].source,
-            source.join("ini/SkyrimPrefs.ini")
+            PathBuf::from("ini/SkyrimPrefs.ini")
         );
         assert!(report.warnings.is_empty());
+    }
+
+    /// Optional retained-file failures preserve the metadata completion decision.
+    #[test]
+    fn metadata_retain_invalid_ini_is_nonfatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let staging = directory.path().join("staging");
+        fs::create_dir_all(source.join("ini")).unwrap();
+        fs::write(source.join("ini/Skyrim.ini"), b"invalid settings").unwrap();
+        fs::write(
+            source.join("ini/SkyrimPrefs.ini"),
+            b"[Display]\nfShadowDistance=4321\n",
+        )
+        .unwrap();
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        retain(&source, &staging, &mut report, &mut manifest);
+        assert!(
+            crate::pipeline::conversion_is_complete(&report),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("metadata rebuild"))
+        );
+        assert!(staging.join("ini/SkyrimPrefs.ini").is_file());
     }
 }

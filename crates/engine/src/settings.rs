@@ -2348,6 +2348,78 @@ mod tests {
         }
     }
 
+    /// Menu edits to pack-seeded grid and LOD values survive Save and the next launch.
+    #[test]
+    fn ini_pack_menu_edits_survive_save_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack = directory.path().join("pack");
+        std::fs::create_dir_all(pack.join("ini")).unwrap();
+        std::fs::write(
+            pack.join("ini/SkyrimPrefs.ini"),
+            "[General]\nuGridsToLoad=7\n[TerrainManager]\nfBlockLevel0Distance=41000\nfBlockLevel1Distance=82000\nfBlockMaximumDistance=310000\nfSplitDistanceMult=2.25\n",
+        )
+        .unwrap();
+        let settings_path = directory.path().join("settings.json");
+        let args = ["--assets".into(), pack.display().to_string()];
+        let mut first = launch(&args);
+        let (mut menu, mut file) = prepare_settings_at(&mut first, Some(settings_path.clone()));
+        assert_eq!(menu.stream_radius, 3);
+        assert_eq!(menu.lod_multiplier, 2.25);
+        menu.stream_radius = 5;
+        menu.unload_radius = 6;
+        menu.lod_level0_distance = 52_000.0;
+        menu.lod_level1_distance = 94_000.0;
+        menu.lod_maximum_distance = 360_000.0;
+        menu.lod_multiplier = 3.5;
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+
+        let mut next = launch(&args);
+        let (restored, _) = prepare_settings_at(&mut next, Some(settings_path.clone()));
+        assert_eq!(restored, menu, "saved menu edits remain the running values");
+        for key in [
+            "general.ugridstoload",
+            "terrainmanager.fblocklevel0distance",
+            "terrainmanager.fblocklevel1distance",
+            "terrainmanager.fblockmaximumdistance",
+            "terrainmanager.fsplitdistancemult",
+        ] {
+            assert_eq!(next.ini_value_sources[key], "saved in-game settings");
+        }
+        assert_eq!(next.stream_radius, 5);
+        assert_eq!(next.terrain_lod.split_distance_mult, 3.5);
+
+        let explicit = directory.path().join("explicit.ini");
+        std::fs::write(
+            &explicit,
+            "[General]\nuGridsToLoad=3\n[TerrainManager]\nfSplitDistanceMult=1.75\n",
+        )
+        .unwrap();
+        let explicit_args = [
+            args[0].clone(),
+            args[1].clone(),
+            "--ini".into(),
+            explicit.display().to_string(),
+        ];
+        let mut next = launch(&explicit_args);
+        let (restored, _) = prepare_settings_at(&mut next, Some(settings_path.clone()));
+        assert_eq!(restored.stream_radius, 1);
+        assert_eq!(restored.lod_multiplier, 1.75);
+        assert_eq!(restored.lod_level0_distance, 52_000.0);
+        assert!(next.ini_value_sources["general.ugridstoload"].starts_with("--ini"));
+        let cli_args = explicit_args
+            .into_iter()
+            .chain(["--stream-radius".into(), "2".into()])
+            .collect::<Vec<_>>();
+        let mut next = launch(&cli_args);
+        let (restored, _) = prepare_settings_at(&mut next, Some(settings_path));
+        assert_eq!(restored.stream_radius, 2);
+        assert_eq!(
+            next.ini_value_sources["general.ugridstoload"],
+            "CLI (--stream-radius)"
+        );
+    }
+
     #[test]
     fn only_valid_explicit_ini_keys_override_saved_values() {
         let directory = tempfile::tempdir().unwrap();
