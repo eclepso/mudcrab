@@ -60,8 +60,11 @@ fn object(bytes: &mut Vec<u8>, word: u32, alias: i16, padding: u16) -> usize {
     offset
 }
 
+/// Byte offset, original source word, and independently expected named reference.
+type VmadSite = (usize, u32, Option<&'static str>);
+
 /// The physical sites are authored independently, not recovered by searching equal words.
-fn vmad() -> (Vec<u8>, Vec<(usize, u32, Option<&'static str>)>) {
+fn vmad() -> (Vec<u8>, Vec<VmadSite>) {
     let mut bytes = [5u16.to_le_bytes(), 2u16.to_le_bytes(), 1u16.to_le_bytes()].concat();
     text(&mut bytes, b"Probe");
     bytes.push(0xA5);
@@ -90,7 +93,7 @@ struct Fixture {
     _root: tempfile::TempDir,
     output: PathBuf,
     vmad: Vec<u8>,
-    sites: Vec<(usize, u32, Option<&'static str>)>,
+    sites: Vec<VmadSite>,
 }
 
 /// Explicit supplier order Zulu/Alpha/Patch/Light differs from alphabetic owner allocation.
