@@ -772,13 +772,16 @@ pub(crate) fn clamp_pack_menu_values(config: &mut EngineConfig) {
     config.terrain_lod.split_distance_mult = menu.lod_multiplier;
 }
 
+/// Saved field names whose ignored values can include future, unrepresentable JSON numbers.
+type SavedSettingFields = std::collections::BTreeMap<String, serde::de::IgnoredAny>;
+
 /// Identifies saved choices by key presence, preserving the meaning of older full settings files.
-fn saved_ini_menu_groups(value: &serde_json::Value) -> u8 {
+fn saved_ini_menu_groups(saved_fields: &SavedSettingFields) -> u8 {
     INI_MENU_FIELDS
         .iter()
         .enumerate()
         .fold(0, |mask, (group, fields)| {
-            mask | if fields.iter().any(|field| value.get(*field).is_some()) {
+            mask | if fields.iter().any(|field| saved_fields.contains_key(*field)) {
                 1 << group
             } else {
                 0
@@ -1010,13 +1013,16 @@ pub(crate) fn prepare_settings_at(
             Ok(bytes) => {
                 let saved = serde_json::from_slice::<RenderingSettings>(&bytes)
                     .map_err(|e| e.to_string())
-                    .and_then(|s| s.validate().map(|()| s));
+                    .and_then(|s| s.validate().map(|()| s))
+                    .and_then(|saved| {
+                        serde_json::from_slice::<SavedSettingFields>(&bytes)
+                            .map(|fields| (saved, fields))
+                            .map_err(|error| error.to_string())
+                    });
                 match saved {
-                    Ok(saved) => {
+                    Ok((saved, fields)) => {
                         file.stored = saved.clone();
-                        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-                            .expect("validated settings retain their JSON object");
-                        file.ini_menu_owned = saved_ini_menu_groups(&raw);
+                        file.ini_menu_owned = saved_ini_menu_groups(&fields);
                         let launch = settings;
                         settings = saved;
                         for group in 0..INI_MENU_FIELDS.len() {
@@ -1024,9 +1030,12 @@ pub(crate) fn prepare_settings_at(
                                 copy_ini_menu_group(&mut settings, &launch, group);
                             }
                         }
+                        // Preserve conservative backend selection for unsupported numeric metadata.
                         file.metal_drawing_default_available =
-                            raw.get("indirect_drawing").is_none()
-                                && raw.get("occlusion_culling").is_none();
+                            serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|raw| {
+                                raw.get("indirect_drawing").is_none()
+                                    && raw.get("occlusion_culling").is_none()
+                            });
                         settings.retain_explicit_launch_values(config);
                         crate::ini_startup::record_saved_sources(config, file.ini_menu_owned);
                         if settings.color_grade
