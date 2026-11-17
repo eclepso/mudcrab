@@ -149,7 +149,7 @@ pub async fn publish(reader: RecordReader, damaged: bool, lod: bool) -> Publicat
     publish_configured(reader, damaged, lod, true, false).await
 }
 
-/// A cacheable broken-mod run includes a winner warning and an accepted compatibility notice.
+/// A cacheable broken-mod run includes winner and compatibility advisories beside real losses.
 #[allow(dead_code)]
 pub async fn publish_for_database_cache(reader: RecordReader) -> Publication {
     publish_configured(reader, true, false, false, true).await
@@ -247,7 +247,7 @@ async fn publish_configured(
     let mut selected_cell = Vec::new();
     if cache_findings {
         // Different LAND identities share a cell. Native source order keeps the following
-        // Zulu-owned override; both conversion and cache selection report this dropped one.
+        // Zulu-owned override; publication retains an advisory for the dropped one.
         selected_cell.extend(land(0x0200_0804, 4.5));
     }
     selected_cell.extend(record(b"LAND", 0x0100_0800, 0, &fields));

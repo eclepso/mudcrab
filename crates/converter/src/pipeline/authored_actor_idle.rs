@@ -448,11 +448,14 @@ fn report_coverage(
         catalog.discovery_issues.len()
     );
     log::info!("{message}");
-    if !catalog.unresolved.is_empty()
-        || !catalog.clip_issues.is_empty()
-        || !catalog.discovery_issues.is_empty()
-    {
+    let lost_idle = catalog
+        .clip_issues
+        .iter()
+        .any(|issue| issue.identified_as_idle && !issue.not_applicable);
+    if !catalog.unresolved.is_empty() || lost_idle || !catalog.discovery_issues.is_empty() {
         report.warnings.push(message);
+    } else if !catalog.clip_issues.is_empty() {
+        report.notices.push(message);
     }
 }
 

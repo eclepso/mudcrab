@@ -467,6 +467,10 @@ pub fn build_form_key_merged_terrain(
     let meshes_started = Instant::now();
     let (selected, land_warnings) =
         crate::esm::cell_cache::native_land_winners(conversion, source_offsets)?;
+    let land_warnings = land_warnings
+        .into_iter()
+        .map(crate::esm::cell_cache::LandDiagnostic::into_message)
+        .collect::<Vec<_>>();
     let mut placed = Vec::new();
     let mut skipped_cells = Vec::new();
     let mut stats = CellStats::default();

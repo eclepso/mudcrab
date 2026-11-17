@@ -333,7 +333,7 @@ fn assert_notices_once(expected: &[String], actual: &[String]) {
     assert_findings_once(expected, &record_notices);
 }
 
-/// The shared winner warning exercises source and cache reporting. Frontend admission rejects
+/// The shared winner advisory exercises source and cache reporting. Frontend admission rejects
 /// the malformed geometry first, so this does not generate a cache-only LAND build error.
 #[tokio::test]
 async fn both_readers_warm_broken_mod_cache_retains_neighbors_and_findings_once() {
@@ -356,9 +356,15 @@ async fn both_readers_warm_broken_mod_cache_retains_neighbors_and_findings_once(
             "the accepted FF self header must retain its notice"
         );
         assert!(
-            warnings
+            notices
                 .iter()
                 .any(|line| line.contains("dropped LAND 000804:Patch.esp"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|line| !line.contains("dropped LAND 000804:Patch.esp")),
+            "a normal override must stay advisory in the cached findings"
         );
         assert!(
             warnings

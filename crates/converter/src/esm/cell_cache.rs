@@ -191,6 +191,21 @@ pub(crate) fn form_key_field(
 
 type NativeLandWinners = Vec<(shared::form_key::FormKey, shared::form_key::FormKey)>;
 
+/// Replacing a LAND is advisory; omitting an ambiguous group loses runtime terrain.
+pub(crate) enum LandDiagnostic {
+    Replaced(String),
+    Omitted(String),
+}
+
+impl LandDiagnostic {
+    /// Keep terrain-stage messages in their original selection order and wording.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Replaced(message) | Self::Omitted(message) => message,
+        }
+    }
+}
+
 /// Keep SQL physical-link outcomes and runtime caches consistent with final live LTEX winners.
 /// Source words and source-preserved caches retain the original owner/local identity.
 pub(crate) fn recover_runtime_land_links(
@@ -269,7 +284,7 @@ fn texture_loss_warnings(
 pub(crate) fn native_land_winners(
     conversion: &super::form_key_merge::FormKeyConversion,
     source_offsets: &HashMap<shared::form_key::FormKey, u64>,
-) -> Result<(NativeLandWinners, Vec<String>)> {
+) -> Result<(NativeLandWinners, Vec<LandDiagnostic>)> {
     use shared::form_key::FormKey;
     let identity = conversion.order.pack_identity()?;
     let mut groups = HashMap::<FormKey, Vec<FormKey>>::new();
@@ -291,7 +306,7 @@ pub(crate) fn native_land_winners(
             .expect("allocated CELL owner")
     });
     let mut chosen = Vec::new();
-    let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
     for (cell, mut lands) in groups {
         lands.sort_by_key(|key| {
             (
@@ -315,15 +330,15 @@ pub(crate) fn native_land_winners(
             .filter_map(|key| source_offsets.get(key).copied())
             .collect::<std::collections::HashSet<_>>();
         if tied.len() > 1 && positions.len() != tied.len() {
-            warnings.push(format!("warning: skipped ambiguous LAND group for CELL {} from source priority {supplier}: native record positions are absent or repeated",identity.table().named(cell)?));
+            diagnostics.push(LandDiagnostic::Omitted(format!("warning: skipped ambiguous LAND group for CELL {} from source priority {supplier}: native record positions are absent or repeated",identity.table().named(cell)?)));
             continue;
         }
         for dropped in lands.into_iter().filter(|key| *key != kept) {
-            warnings.push(format!("warning: CELL {}: LAND {} from source priority {supplier} wins; dropped LAND {} from source priority {}",identity.table().named(cell)?,identity.table().named(kept)?,identity.table().named(dropped)?,conversion.records[&dropped].source.load_order));
+            diagnostics.push(LandDiagnostic::Replaced(format!("warning: CELL {}: LAND {} from source priority {supplier} wins; dropped LAND {} from source priority {}",identity.table().named(cell)?,identity.table().named(kept)?,identity.table().named(dropped)?,conversion.records[&dropped].source.load_order)));
         }
         chosen.push((cell, kept));
     }
-    Ok((chosen, warnings))
+    Ok((chosen, diagnostics))
 }
 
 /// Build both cell cache generations directly from native FormKey winners.
@@ -336,7 +351,14 @@ pub fn write_form_key_cell_cache(
 ) -> Result<(usize, Vec<String>)> {
     use shared::form_key::FormKey;
     let identity = conversion.order.pack_identity()?;
-    let (ordered, mut warnings) = native_land_winners(conversion, source_offsets)?;
+    let (ordered, findings) = native_land_winners(conversion, source_offsets)?;
+    let mut warnings = findings
+        .into_iter()
+        .filter_map(|finding| match finding {
+            LandDiagnostic::Omitted(message) => Some(message),
+            LandDiagnostic::Replaced(_) => None,
+        })
+        .collect::<Vec<_>>();
     let mut cells = Vec::new();
     let mut unavailable = BTreeMap::<u32, (usize, FormKey)>::new();
     for (cell_key, land_key) in ordered {

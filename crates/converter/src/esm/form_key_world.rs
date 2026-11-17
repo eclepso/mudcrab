@@ -1,5 +1,6 @@
 //! Production FormKey world generation. Native evidence and scalar projection are separate.
 use super::{
+    cell_cache::LandDiagnostic,
     form_key_merge::{FormKeyConversion, FormKeyRecord},
     form_key_projection::ProjectionStage,
     form_keys::FormKeyOrder,
@@ -349,9 +350,14 @@ pub(crate) fn convert_with_dump(
     let texture_warnings =
         super::cell_cache::recover_runtime_land_links(&mut conversion, &offsets)?;
     conversion.warnings.extend(texture_warnings);
-    let (land_winners, land_warnings) =
+    let (land_winners, land_findings) =
         super::cell_cache::native_land_winners(&conversion, &offsets)?;
-    conversion.warnings.extend(land_warnings);
+    for finding in land_findings {
+        match finding {
+            LandDiagnostic::Omitted(message) => conversion.warnings.push(message),
+            LandDiagnostic::Replaced(message) => conversion.notices.push(message),
+        }
+    }
     let mut stage = ProjectionStage::build(&conversion)?;
     let selected_lands = land_winners
         .iter()
