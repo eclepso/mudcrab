@@ -146,19 +146,19 @@ fn cell(word: u32, x: i32, y: i32, land_word: u32, offset: f32) -> Vec<u8> {
 
 /// Source priority Zulu/Alpha/Patch, allocation Alpha/Patch/Zulu, MAST Alpha/Zulu.
 pub async fn publish(reader: RecordReader, damaged: bool, lod: bool) -> Publication {
-    publish_configured(reader, damaged, lod, true, false).await
+    publish_configured(reader, damaged, lod, true, false, true).await
 }
 
 /// A cacheable broken-mod run includes winner and compatibility advisories beside real losses.
 #[allow(dead_code)]
 pub async fn publish_for_database_cache(reader: RecordReader) -> Publication {
-    publish_configured(reader, true, false, false, true).await
+    publish_configured(reader, true, false, false, true, true).await
 }
 
 /// A valid competing LAND keeps its winner and reports the override as an advisory.
 #[allow(dead_code)]
 pub async fn publish_clean_competing_lands(reader: RecordReader) -> Publication {
-    publish_configured(reader, false, false, true, true).await
+    publish_configured(reader, false, false, true, true, false).await
 }
 
 async fn publish_configured(
@@ -167,6 +167,7 @@ async fn publish_configured(
     lod: bool,
     merged_terrain: bool,
     cache_findings: bool,
+    retain_opaque_field: bool,
 ) -> Publication {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
@@ -228,10 +229,16 @@ async fn publish_configured(
         sub(b"VNML", &[1, 2, 126].repeat(33 * 33)),
         sub(b"VHGT", &heights(3.5)),
         assignment(b"BTXT", 0x855, 0),
-        sub(
-            b"ZZZZ",
-            &[0x855u32.to_le_bytes(), [0x31, 0x72, 0xb4, 0xe9]].concat(),
-        ),
+        // Source-preservation cases retain an unknown field. A clean-completeness
+        // case must not deliberately trigger the typed reader's layout warning.
+        if retain_opaque_field {
+            sub(
+                b"ZZZZ",
+                &[0x855u32.to_le_bytes(), [0x31, 0x72, 0xb4, 0xe9]].concat(),
+            )
+        } else {
+            Vec::new()
+        },
         assignment(b"ATXT", 0x855, 2),
         weight(5, 0.25),
         assignment(b"ATXT", 0x855, 2),
