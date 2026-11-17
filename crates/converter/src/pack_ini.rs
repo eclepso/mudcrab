@@ -119,7 +119,15 @@ fn child(folder: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
                 "INI lookup folder is not a directory",
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match fs::symlink_metadata(folder) {
+                Ok(_) => Err(std::io::Error::other(
+                    "INI lookup folder entry exists but its target could not be resolved",
+                )),
+                Err(entry_error) if entry_error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(entry_error) => Err(entry_error),
+            };
+        }
         Err(error) => return Err(error),
         _ => {}
     }
@@ -362,7 +370,7 @@ pub(crate) fn capture(
         Ok(None)
     };
     if let Ok(Some(folder)) = &player
-        && matches!(fs::metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && matches!(fs::symlink_metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     {
         notice(
             report,

@@ -569,6 +569,27 @@ async fn failed_settings_folder_lookup_never_generates_from_install() {
     );
 }
 
+/// An existing directory link with a missing target remains a failed lookup rather than absence.
+#[cfg(unix)]
+#[tokio::test]
+async fn broken_settings_folder_link_never_generates_from_install() {
+    let fixture = Fixture::new(true);
+    fs::remove_dir(&fixture.player).unwrap();
+    std::os::unix::fs::symlink(
+        fixture._root.path().join("missing-settings-target"),
+        &fixture.player,
+    )
+    .unwrap();
+    let report = fixture.publish().await;
+    assert!(fixture.manifest().ini_files.is_empty());
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("target could not be resolved"))
+    );
+}
+
 /// Edited pack settings survive both ordinary reconversion and metadata rebuild.
 #[tokio::test]
 async fn edited_pack_ini_is_kept_and_reported_on_reconversion() {
