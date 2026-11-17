@@ -820,6 +820,8 @@ pub struct SettingsFile {
     launch_overrides: Vec<String>,
     /// Effective values shown when the menu was prepared or last saved successfully.
     ini_menu_baseline: RenderingSettings,
+    /// Current pack/default seeds and explicit launch values used when restoring inherited settings.
+    ini_menu_launch: RenderingSettings,
     /// Only saved or subsequently edited grid/LOD groups own the next launch's values.
     ini_menu_owned: u8,
     preserve_unavailable_record_mode: bool,
@@ -855,6 +857,7 @@ impl SettingsFile {
             stored: RenderingSettings::default(),
             launch_overrides: Vec::new(),
             ini_menu_baseline: RenderingSettings::default(),
+            ini_menu_launch: RenderingSettings::default(),
             ini_menu_owned: 0,
             preserve_unavailable_record_mode: false,
             unavailable_record_mode_replaced: false,
@@ -878,19 +881,25 @@ impl SettingsFile {
         }
     }
 
+    /// Restores default sources, re-arming inherited grid/LOD values and automatic drawing.
     pub(crate) fn restore_defaults(&mut self, settings: &mut RenderingSettings) {
         self.note_grade_mode_selection();
         self.metal_drawing_default_available = true;
         self.metal_drawing_auto_unowned = true;
         *settings = RenderingSettings::default();
+        for group in 0..INI_MENU_FIELDS.len() {
+            copy_ini_menu_group(settings, &self.ini_menu_launch, group);
+        }
+        self.ini_menu_owned = 0;
+        self.ini_menu_baseline = settings.clone();
         self.status = if self
             .launch_overrides
             .iter()
             .any(|flag| flag == "--start-shot")
         {
-            "Defaults restored for this session. Save preserves the pre-launch FOV, window mode, and window size.".into()
+            "Defaults restored for this session. Grid and LOD settings follow the pack after Save. Save preserves the pre-launch FOV, window mode, and window size.".into()
         } else {
-            "Defaults restored for this session. Choose Save to keep them.".into()
+            "Defaults restored for this session. Save makes grid and LOD settings follow the pack again.".into()
         };
     }
 
@@ -989,6 +998,7 @@ pub(crate) fn prepare_settings_at(
         stored: RenderingSettings::default(),
         launch_overrides: config.settings_overrides.clone(),
         ini_menu_baseline: settings.clone(),
+        ini_menu_launch: settings.clone(),
         ini_menu_owned: 0,
         preserve_unavailable_record_mode: false,
         unavailable_record_mode_replaced: false,
@@ -1572,6 +1582,7 @@ mod tests {
             .save(&settings);
     }
 
+    /// Restoring sources explains pack inheritance and preserves explicit capture framing on Save.
     #[test]
     fn start_shot_reset_reports_preserved_framing() {
         let mut file = SettingsFile::session_only();
@@ -1579,7 +1590,7 @@ mod tests {
         file.restore_defaults(&mut settings);
         assert_eq!(
             file.status,
-            "Defaults restored for this session. Choose Save to keep them."
+            "Defaults restored for this session. Save makes grid and LOD settings follow the pack again."
         );
         file.apply_start_shot(&mut settings, 60.0, (1920, 1080));
         file.restore_defaults(&mut settings);
@@ -2483,6 +2494,7 @@ mod tests {
                 stored: RenderingSettings::default(),
                 launch_overrides: Vec::new(),
                 ini_menu_baseline: RenderingSettings::default(),
+                ini_menu_launch: RenderingSettings::default(),
                 ini_menu_owned: 0,
                 preserve_unavailable_record_mode: false,
                 unavailable_record_mode_replaced: false,
@@ -2712,6 +2724,112 @@ mod tests {
         assert_eq!(reloaded.lod_multiplier, 3.0);
     }
 
+    /// Restore defaults releases legacy saved grid/LOD choices and reload follows the current pack.
+    #[test]
+    fn ini_restore_defaults_rearms_legacy_grid_and_lod_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack = directory.path().join("pack");
+        std::fs::create_dir_all(pack.join("ini")).unwrap();
+        let ini = pack.join("ini/SkyrimPrefs.ini");
+        std::fs::write(&ini, "[General]\nuGridsToLoad=7\n[TerrainManager]\nfBlockLevel0Distance=41000\nfBlockLevel1Distance=82000\nfBlockMaximumDistance=210000\nfSplitDistanceMult=2.25\n").unwrap();
+        let path = directory.path().join("settings.json");
+        let legacy = RenderingSettings {
+            stream_radius: 5,
+            unload_radius: 6,
+            lod_level0_distance: 57_000.0,
+            lod_level1_distance: 99_000.0,
+            lod_maximum_distance: 340_000.0,
+            lod_multiplier: 3.5,
+            ..default()
+        };
+        save_settings(&path, &legacy).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let args = ["--assets".into(), pack.display().to_string()];
+        let (mut menu, mut file) = prepare_settings_at(&mut launch(&args), Some(path.clone()));
+        assert_eq!(file.ini_menu_owned, 0b1_1111);
+        assert_eq!(menu.lod_multiplier, 3.5);
+        file.restore_defaults(&mut menu);
+        assert_eq!(file.ini_menu_owned, 0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "Restore stays session-local until Save"
+        );
+        assert_eq!((menu.stream_radius, menu.unload_radius), (3, 4));
+        assert_eq!(
+            (
+                menu.lod_level0_distance,
+                menu.lod_level1_distance,
+                menu.lod_maximum_distance,
+                menu.lod_multiplier
+            ),
+            (41_000.0, 82_000.0, 210_000.0, 2.25)
+        );
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for fields in INI_MENU_FIELDS {
+            for field in fields {
+                assert!(saved.get(*field).is_none(), "{field} returns to the pack");
+            }
+        }
+        std::fs::write(&ini, "[General]\nuGridsToLoad=13\n[TerrainManager]\nfBlockLevel0Distance=61000\nfBlockLevel1Distance=132000\nfBlockMaximumDistance=420000\nfSplitDistanceMult=1.75\n").unwrap();
+        let mut next = launch(&args);
+        let (reloaded, _) = prepare_settings_at(&mut next, Some(path));
+        assert_eq!((reloaded.stream_radius, reloaded.unload_radius), (6, 7));
+        assert_eq!(
+            (
+                reloaded.lod_level0_distance,
+                reloaded.lod_level1_distance,
+                reloaded.lod_maximum_distance,
+                reloaded.lod_multiplier
+            ),
+            (61_000.0, 132_000.0, 420_000.0, 1.75)
+        );
+        for key in INI_MENU_KEYS {
+            assert!(
+                next.ini_value_sources[key].starts_with("pack copy"),
+                "{key}"
+            );
+        }
+    }
+
+    /// Menu edits made after Restore defaults acquire ownership independently of released groups.
+    #[test]
+    fn ini_restore_defaults_keeps_subsequent_menu_edit_owned() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack = directory.path().join("pack");
+        std::fs::create_dir_all(pack.join("ini")).unwrap();
+        let ini = pack.join("ini/Skyrim.ini");
+        std::fs::write(
+            &ini,
+            "[General]\nuGridsToLoad=7\n[TerrainManager]\nfSplitDistanceMult=2.25\n",
+        )
+        .unwrap();
+        let path = directory.path().join("settings.json");
+        save_settings(&path, &RenderingSettings::default()).unwrap();
+        let args = ["--assets".into(), pack.display().to_string()];
+        let (mut menu, mut file) = prepare_settings_at(&mut launch(&args), Some(path.clone()));
+        file.restore_defaults(&mut menu);
+        menu.lod_multiplier = 3.25;
+        file.save(&menu);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["lod_multiplier"], 3.25);
+        assert!(saved.get("stream_radius").is_none());
+        assert!(saved.get("unload_radius").is_none());
+        std::fs::write(
+            &ini,
+            "[General]\nuGridsToLoad=13\n[TerrainManager]\nfSplitDistanceMult=1.5\n",
+        )
+        .unwrap();
+        let (reloaded, _) = prepare_settings_at(&mut launch(&args), Some(path));
+        assert_eq!((reloaded.stream_radius, reloaded.unload_radius), (6, 7));
+        assert_eq!(reloaded.lod_multiplier, 3.25);
+    }
+
     /// A failed write leaves field ownership unchanged, so a later unrelated Save stays dynamic.
     #[test]
     fn ini_menu_failed_save_preserves_dynamic_field_ownership() {
@@ -2908,6 +3026,7 @@ mod tests {
             stored: RenderingSettings::default(),
             launch_overrides: Vec::new(),
             ini_menu_baseline: RenderingSettings::default(),
+            ini_menu_launch: RenderingSettings::default(),
             ini_menu_owned: 0,
             preserve_unavailable_record_mode: false,
             unavailable_record_mode_replaced: false,

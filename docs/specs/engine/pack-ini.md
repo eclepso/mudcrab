@@ -125,6 +125,12 @@ keep following the current pack INIs across launches. Stream and unload radii
 persist together as one logical grid setting because their validation is coupled.
 The four LOD values persist independently. Existing settings files retain the
 choices for fields already present; omitted fields follow the current pack.
+A settings file written before this change contains all five groups and therefore
+keeps all five saved choices. Choose **Restore defaults**, then **Save**, to
+release those saved choices and follow the pack INIs again. Restore defaults
+reseeds grid/LOD controls from the current pack/default or explicit launch values,
+matching the automatic Metal drawing default re-arming. Later menu edits can
+still save an individual grid/LOD choice.
 A saved menu change survives the next interactive launch. Explicit INI and CLI
 keys remain launch owned. Automated runs retain the existing behavior of using launch
 configuration without loading interactive preferences.
