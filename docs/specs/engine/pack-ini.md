@@ -41,6 +41,8 @@ the original `source`, exact copied-byte `sha256`, and `origin` (`player_file` o
 it changes no mesh, texture, database, or cache format. Normal conversion refreshes
 the copies even when converted assets are reused, removing stale INIs whose
 sources disappeared. Metadata-only rebuilding retains the existing pack settings.
+Windows provenance and INI diagnostics use readable drive/UNC paths with consistent
+separators; paths whose special namespace affects their meaning retain that spelling.
 
 The engine loads `ini/Skyrim.ini` followed by `ini/SkyrimPrefs.ini` automatically
 through its existing Skyrim INI reader. Supported keys retain the reader's

@@ -1,7 +1,7 @@
 //! Read-only discovery and staged publication of the player's Skyrim settings.
 
 use crate::{PipelineConfig, PipelineReport, cache::ConversionManifest};
-use shared::pack_ini::{FILES, IniOrigin, IniProvenance};
+use shared::pack_ini::{FILES, IniOrigin, IniProvenance, readable_path};
 use std::{
     fs,
     io::Write,
@@ -141,15 +141,16 @@ pub(crate) fn retain(
         let copied = (|| -> std::io::Result<IniProvenance> {
             let bytes = read_ini(&input)?;
             let sha256 = crate::cache::hash_bytes(&bytes);
-            let provenance = previous
+            let mut provenance = previous
                 .get(&relative)
                 .filter(|entry| entry.sha256 == sha256)
                 .cloned()
                 .unwrap_or_else(|| IniProvenance {
-                    source: input.clone(),
+                    source: readable_path(&input),
                     sha256,
                     origin: IniOrigin::PackCopy,
                 });
+            provenance.source = readable_path(&provenance.source);
             let destination = staging.join(&relative);
             fs::create_dir_all(destination.parent().expect("pack INIs have a parent"))?;
             let mut temporary = tempfile::NamedTempFile::new_in(destination.parent().unwrap())?;
@@ -168,7 +169,7 @@ pub(crate) fn retain(
                 report,
                 format!(
                     "skipping optional pack INI {} during metadata rebuild: {error}",
-                    input.display()
+                    readable_path(&input).display()
                 ),
             ),
         }
@@ -209,7 +210,7 @@ pub(crate) fn capture(
                 report,
                 format!(
                     "skipping optional INIs: settings output is not a regular directory: {}",
-                    output.display()
+                    readable_path(&output).display()
                 ),
             );
             return;
@@ -219,7 +220,7 @@ pub(crate) fn capture(
                 report,
                 format!(
                     "could not inspect optional settings output {}: {error}",
-                    output.display()
+                    readable_path(&output).display()
                 ),
             );
             return;
@@ -236,7 +237,7 @@ pub(crate) fn capture(
                 report,
                 format!(
                     "could not refresh optional INI {}: {error}",
-                    destination.display()
+                    readable_path(&destination).display()
                 ),
             );
             continue;
@@ -276,7 +277,7 @@ pub(crate) fn capture(
                     report,
                     format!(
                         "skipping unreadable or invalid INI {}: {error}",
-                        source.display()
+                        readable_path(&source).display()
                     ),
                 );
                 continue;
@@ -297,7 +298,7 @@ pub(crate) fn capture(
                 manifest.ini_files.insert(
                     relative.clone(),
                     IniProvenance {
-                        source,
+                        source: readable_path(&source),
                         sha256: crate::cache::hash_bytes(&bytes),
                         origin,
                     },
@@ -306,7 +307,10 @@ pub(crate) fn capture(
             }
             Err(error) => warn(
                 report,
-                format!("could not copy optional INI {}: {error}", source.display()),
+                format!(
+                    "could not copy optional INI {}: {error}",
+                    readable_path(&source).display()
+                ),
             ),
         }
     }

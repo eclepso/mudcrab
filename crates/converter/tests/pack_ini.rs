@@ -94,7 +94,15 @@ impl Fixture {
             bytes
         );
         let provenance = self.manifest().ini_files[&relative].clone();
-        assert_eq!(provenance.source, source);
+        assert_eq!(
+            fs::canonicalize(&provenance.source).unwrap(),
+            fs::canonicalize(source).unwrap()
+        );
+        #[cfg(windows)]
+        assert!(
+            !provenance.source.to_string_lossy().starts_with(r"\\?\"),
+            "INI provenance uses a readable Windows path"
+        );
         assert_eq!(provenance.sha256, converter::cache::hash_bytes(bytes));
         assert_eq!(provenance.origin, origin);
     }
@@ -376,8 +384,16 @@ async fn mo2_local_settings_follow_the_instance_default() {
             &profile
         };
         assert_eq!(
-            fixture.manifest().ini_files["ini/Skyrim.ini"].source,
-            expected.join("Skyrim.ini")
+            fs::canonicalize(&fixture.manifest().ini_files["ini/Skyrim.ini"].source).unwrap(),
+            fs::canonicalize(expected.join("Skyrim.ini")).unwrap()
+        );
+        #[cfg(windows)]
+        assert!(
+            !fixture.manifest().ini_files["ini/Skyrim.ini"]
+                .source
+                .to_string_lossy()
+                .starts_with(r"\\?\"),
+            "INI provenance uses a readable Windows path"
         );
     }
 }

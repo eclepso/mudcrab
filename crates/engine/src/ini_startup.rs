@@ -3,7 +3,7 @@
 use crate::{config::EngineConfig, skyrim_ini::SkyrimIni};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use shared::pack_ini::{FILES, IniOrigin, IniProvenance};
+use shared::pack_ini::{FILES, IniOrigin, IniProvenance, readable_path};
 use std::{collections::BTreeMap, fs, path::Path};
 
 /// The optional part of the conversion manifest needed to identify copied settings.
@@ -45,13 +45,16 @@ pub(crate) fn load(config: &mut EngineConfig, args: &[String]) {
             Ok(text) => text,
             Err(error) => {
                 if explicit || error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("warning: ignoring INI {}: {error}", path.display());
+                    eprintln!(
+                        "warning: ignoring INI {}: {error}",
+                        readable_path(&path).display()
+                    );
                 }
                 continue;
             }
         };
         let source = if explicit {
-            format!("--ini ({})", path.display())
+            format!("--ini ({})", readable_path(&path).display())
         } else {
             pack_source(&path, text.as_bytes(), &manifest)
         };
@@ -82,7 +85,7 @@ fn read_manifest(assets: &Path) -> Manifest {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
                     "warning: ignoring INI provenance {}: {error}",
-                    path.display()
+                    readable_path(&path).display()
                 );
             }
             Manifest::default()
@@ -106,11 +109,11 @@ fn pack_source(path: &Path, bytes: &[u8], manifest: &Manifest) -> String {
         };
         return format!(
             "{kind} ({}; pack copy {})",
-            provenance.source.display(),
-            path.display()
+            readable_path(&provenance.source).display(),
+            readable_path(&path).display()
         );
     }
-    format!("pack copy ({})", path.display())
+    format!("pack copy ({})", readable_path(&path).display())
 }
 
 /// Reports each supported launch value before saved interactive settings, including CLI precedence.
@@ -304,7 +307,7 @@ mod tests {
             files.insert(
                 key,
                 IniProvenance {
-                    source: name.into(),
+                    source: fs::canonicalize(directory.path().join(format!("ini/{name}"))).unwrap(),
                     origin,
                     sha256: format!("{:x}", Sha256::digest(bytes)),
                 },
@@ -319,6 +322,14 @@ mod tests {
         assert!(config.ini_value_sources["general.balwaysactive"].starts_with("player file"));
         assert!(
             config.ini_value_sources["general.ugridstoload"].starts_with("generated-from-install")
+        );
+        #[cfg(windows)]
+        assert!(
+            config
+                .ini_value_sources
+                .values()
+                .all(|source| !source.contains(r"\\?\")),
+            "INI diagnostics use readable Windows paths"
         );
         fs::write(
             directory.path().join("ini/SkyrimPrefs.ini"),
