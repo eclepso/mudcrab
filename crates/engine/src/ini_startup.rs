@@ -340,4 +340,31 @@ mod tests {
         assert_eq!(edited.stream_radius, 5);
         assert!(edited.ini_value_sources["general.ugridstoload"].starts_with("pack copy"));
     }
+
+    /// Provenance hashes describe the copied bytes for each supported text encoding.
+    #[test]
+    fn ini_pack_encoded_bytes_preserve_provenance_hash() {
+        let directory = pack();
+        let text = "[General]\nuGridsToLoad=11\n";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(directory.path().join("ini/SkyrimPrefs.ini"), &bytes).unwrap();
+        fs::write(
+            directory.path().join("conversion-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "ini_files": {
+                    "ini/SkyrimPrefs.ini": {
+                        "source": "SkyrimPrefs.ini",
+                        "origin": "player_file",
+                        "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = start(directory.path(), &[]);
+        assert_eq!(config.stream_radius, 5);
+        assert!(config.ini_value_sources["general.ugridstoload"].starts_with("player file"));
+    }
 }
